@@ -26,7 +26,8 @@
     "packages/app",
     "apps/*",
     "examples/*",
-    "e2e"
+    "e2e",
+    "web"
   ],
   "type": "module",
   "scripts": {

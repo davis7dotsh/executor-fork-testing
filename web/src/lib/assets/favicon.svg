@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Executor</title>
+  <rect width="64" height="64" rx="16" fill="#121824"/>
+  <path d="M17 18h30v8H25v8h18v8H25v4h22v8H17z" fill="#91a0ff"/>
+  <circle cx="47" cy="22" r="5" fill="#55d6a5"/>
+</svg>

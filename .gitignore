@@ -16,7 +16,7 @@ coverage
 *.lcov
 
 # logs
-logs
+/logs/
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
@@ -115,3 +115,8 @@ scratch/
 # Throwaway UX prototype (not part of the app)
 ux-demo/
 
+
+
+# Added by cargo
+
+/target
