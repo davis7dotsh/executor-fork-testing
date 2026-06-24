@@ -3,14 +3,18 @@ import { Schema } from "effect";
 import {
   ApiError,
   bulkSetToolModes,
+  createMcpHttpSource,
+  createMcpStdioSource,
   createOpenApiSource,
   createToken,
   decideApproval,
   deleteOpenApiCredentials,
   getApproval,
   getOpenApiCredentials,
+  getSourceCredentials,
   getBootstrap,
   listApprovals,
+  listMcpStdioTemplates,
   listRequestLogs,
   listSources,
   listTokens,
@@ -18,6 +22,8 @@ import {
   loginAdmin,
   previewOpenApiSource,
   putOpenApiCredentials,
+  putMcpHttpCredentials,
+  putMcpStdioCredentials,
   refreshOpenApiSource,
   setSourceMode,
 } from "./api";
@@ -325,6 +331,37 @@ describe("dashboard API client", () => {
     });
   });
 
+  it("strips nested private source configuration before it enters browser state", async () => {
+    const secret = "nested-source-secret";
+    const result = await listSources(async () =>
+      Response.json({
+        sources: [
+          {
+            ...sourceFixture(),
+            kind: "mcp_http",
+            configuration: {
+              endpoint: "https://mcp.example.test/mcp",
+              allowPrivateNetwork: false,
+              sessionId: secret,
+              query: `token=${secret}`,
+              headers: { authorization: secret },
+              env: { TOKEN: secret },
+              stderr: secret,
+              command: secret,
+            },
+          },
+        ],
+        catalogRevision: 12,
+      }),
+    );
+
+    expect(result.ok && result.value.sources[0]?.configuration).toEqual({
+      endpoint: "https://mcp.example.test/mcp",
+      allowPrivateNetwork: false,
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
   it("sends source and current-page bulk revisions exactly once", async () => {
     const bodies: unknown[] = [];
     await setSourceMode("source/1", "ask", 7, async (input, init) => {
@@ -469,7 +506,9 @@ describe("dashboard API client", () => {
           schemes: { bearerAuth: { type: "bearer", token: secret } },
         },
       },
-      async (_input, init) => {
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources");
+        expect(init?.method).toBe("POST");
         body = decodeJson(String(init?.body));
         return Response.json({ ...sourceFixture(), credentials: secret }, { status: 201 });
       },
@@ -478,6 +517,198 @@ describe("dashboard API client", () => {
     expect(JSON.stringify(body)).toContain(secret);
     expect(result.ok).toBe(true);
     expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("creates an MCP HTTP source and strips unrecognized connection secrets", async () => {
+    let body: unknown;
+    const result = await createMcpHttpSource(
+      {
+        kind: "mcp_http",
+        displayName: "Issue tracker",
+        description: "Local issue tools",
+        endpoint: "https://mcp.example.test/rpc?tenant=private",
+        allowPrivateNetwork: false,
+      },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources");
+        body = decodeJson(String(init?.body));
+        return Response.json(
+          {
+            ...sourceFixture(),
+            kind: "mcp_http",
+            displayName: "Issue tracker",
+            configuration: {
+              endpoint: "https://mcp.example.test/rpc",
+              allowPrivateNetwork: false,
+            },
+            sessionId: "upstream-session-secret",
+            authorization: "Bearer source-secret",
+          },
+          { status: 201 },
+        );
+      },
+    );
+
+    expect(body).toEqual({
+      kind: "mcp_http",
+      displayName: "Issue tracker",
+      description: "Local issue tools",
+      endpoint: "https://mcp.example.test/rpc?tenant=private",
+      allowPrivateNetwork: false,
+    });
+    expect(result.ok && result.value.kind).toBe("mcp_http");
+    expect(JSON.stringify(result)).not.toContain("upstream-session-secret");
+    expect(JSON.stringify(result)).not.toContain("source-secret");
+  });
+
+  it("sends every supported initial MCP HTTP credential directly on source create", async () => {
+    const credentials = [
+      { type: "bearer", token: "bearer-secret" },
+      { type: "basic", username: "admin", password: "password-secret" },
+      { type: "api_key_header", name: "X-Service-Key", value: "header-secret" },
+      { type: "oauth_access_token", accessToken: "oauth-secret" },
+    ] as const;
+    const bodies: unknown[] = [];
+
+    for (const credential of credentials) {
+      await createMcpHttpSource(
+        {
+          kind: "mcp_http",
+          displayName: "Authenticated MCP",
+          endpoint: "https://mcp.example.test/mcp",
+          credential,
+        },
+        async (_input, init) => {
+          bodies.push(decodeJson(String(init?.body)));
+          return Response.json({
+            ...sourceFixture(),
+            kind: "mcp_http",
+            configuration: {
+              endpoint: "https://mcp.example.test/mcp",
+              allowPrivateNetwork: false,
+            },
+          });
+        },
+      );
+    }
+
+    expect(bodies).toEqual(
+      credentials.map((credential) => ({
+        kind: "mcp_http",
+        displayName: "Authenticated MCP",
+        endpoint: "https://mcp.example.test/mcp",
+        credential,
+      })),
+    );
+  });
+
+  it("lists trusted stdio templates without decoding raw process configuration", async () => {
+    const secret = "raw-process-secret";
+    const result = await listMcpStdioTemplates(async (input) => {
+      expect(String(input)).toBe("/api/v1/mcp/stdio/templates");
+      return Response.json({
+        templates: [
+          {
+            name: "github-local",
+            secretFields: ["GITHUB_TOKEN"],
+            command: "/usr/local/bin/private-server",
+            args: ["--token", secret],
+            env: { TOKEN: secret },
+          },
+        ],
+      });
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      value: { templates: [{ name: "github-local", secretFields: ["GITHUB_TOKEN"] }] },
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain("private-server");
+  });
+
+  it("creates a trusted stdio source without accepting a secret echo", async () => {
+    const secret = " whitespace-sensitive-secret ";
+    let body: unknown;
+    const result = await createMcpStdioSource(
+      {
+        kind: "mcp_stdio",
+        displayName: "Local GitHub",
+        templateName: "github-local",
+        secretValues: { GITHUB_TOKEN: secret },
+      },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources");
+        expect(init?.method).toBe("POST");
+        body = decodeJson(String(init?.body));
+        return Response.json({
+          ...sourceFixture(),
+          kind: "mcp_stdio",
+          configuration: { templateName: "github-local" },
+          secretValues: { GITHUB_TOKEN: secret },
+        });
+      },
+    );
+
+    expect(body).toEqual({
+      kind: "mcp_stdio",
+      displayName: "Local GitHub",
+      templateName: "github-local",
+      secretValues: { GITHUB_TOKEN: secret },
+    });
+    expect(result.ok && result.value.configuration).toEqual({ templateName: "github-local" });
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("reads MCP credential metadata and sends protocol-specific CAS replacements", async () => {
+    const reads = await getSourceCredentials("mcp/source", async (input) => {
+      expect(String(input)).toBe("/api/v1/sources/mcp%2Fsource/credentials");
+      return Response.json({
+        revision: 7,
+        configuredSchemes: [{ name: "TOKEN", credentialType: "secret_env" }],
+      });
+    });
+    const bodies: unknown[] = [];
+    await putMcpHttpCredentials(
+      "http-source",
+      4,
+      {
+        credential: { type: "api_key_header", name: "X-Service-Key", value: "secret" },
+      },
+      async (_input, init) => {
+        bodies.push(decodeJson(String(init?.body)));
+        return Response.json({
+          revision: 5,
+          configuredSchemes: [{ name: "authorization", credentialType: "api_key_header" }],
+        });
+      },
+    );
+    await putMcpStdioCredentials(
+      "stdio-source",
+      7,
+      { secretValues: { TOKEN: " exact secret " } },
+      async (_input, init) => {
+        bodies.push(decodeJson(String(init?.body)));
+        return Response.json({
+          revision: 8,
+          configuredSchemes: [{ name: "TOKEN", credentialType: "secret_env" }],
+        });
+      },
+    );
+
+    expect(reads.ok && reads.value.revision).toBe(7);
+    expect(bodies).toEqual([
+      {
+        expectedRevision: 4,
+        credential: {
+          credential: { type: "api_key_header", name: "X-Service-Key", value: "secret" },
+        },
+      },
+      {
+        expectedRevision: 7,
+        credential: { secretValues: { TOKEN: " exact secret " } },
+      },
+    ]);
   });
 
   it("decodes OpenAPI refresh counts", async () => {

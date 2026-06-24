@@ -9,8 +9,9 @@ use executor::{
     AppConfig, DatabaseError, ExecutorApp,
     catalog::{
         ArtifactKind, AuditContext, CatalogError, CatalogSnapshot, CreateSource, CredentialPayload,
-        ListToolsFilter, ModeProvenance, NewRequestLog, RequestOutcome, RequestSurface, SourceKind,
-        StagedArtifact, StagedTool, StagedToolBinding, ToolBinding, ToolMode, UpdateSource,
+        InitialCatalogSnapshot, ListToolsFilter, ModeProvenance, NewRequestLog, RequestOutcome,
+        RequestSurface, SourceHealth, SourceKind, StagedArtifact, StagedTool, StagedToolBinding,
+        ToolBinding, ToolMode, UpdateSource,
     },
     openapi::{OpenApiBinding, OpenApiSecurityAlternative},
 };
@@ -472,6 +473,876 @@ async fn refresh_is_atomic_and_preserves_overrides_through_tombstones() {
     assert_eq!(restored.id, beta.id);
     assert_eq!(restored.local_name, beta.local_name);
     assert_eq!(restored.mode_override, Some(ToolMode::Disabled));
+}
+
+#[tokio::test]
+async fn source_health_failures_preserve_the_last_good_catalog_and_sync_restores_health() {
+    let executor = TestExecutor::new().await;
+    let source = executor.source("health-state").await;
+    let healthy = executor
+        .app
+        .catalog()
+        .sync_catalog(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: source.revision,
+                expected_credential_revision: None,
+                artifacts: vec![StagedArtifact {
+                    kind: ArtifactKind::Metadata,
+                    stable_key: "last-good".to_owned(),
+                    content: json!({ "version": 1 }),
+                }],
+                tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
+            },
+            AuditContext::system(None),
+        )
+        .await
+        .expect("initial catalog should sync");
+    let before_failure = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let global_before_failure = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let tool_before_failure = executor
+        .app
+        .catalog()
+        .list_tools(ListToolsFilter {
+            source_id: Some(source.id.clone()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("last-good tool should list")
+        .items
+        .remove(0);
+
+    let failed = executor
+        .app
+        .catalog()
+        .mark_source_error(
+            &source.id,
+            "mcp_discovery_failed",
+            before_failure.revision,
+            AuditContext::system(Some("health-failure")),
+        )
+        .await
+        .expect("source health failure should persist");
+    assert_eq!(failed.health_status, SourceHealth::Error);
+    assert_eq!(
+        failed.health_error_code.as_deref(),
+        Some("mcp_discovery_failed")
+    );
+    assert_eq!(failed.revision, before_failure.revision + 1);
+    assert_eq!(failed.catalog_revision, before_failure.catalog_revision);
+    assert_eq!(failed.last_refreshed_at, before_failure.last_refreshed_at);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_before_failure + 1
+    );
+    let retried_failure = executor
+        .app
+        .catalog()
+        .mark_source_error(
+            &source.id,
+            "mcp_discovery_failed",
+            before_failure.revision,
+            AuditContext::system(Some("health-failure-retry")),
+        )
+        .await
+        .expect("an identical stale error retry should be idempotent");
+    assert_eq!(retried_failure.revision, failed.revision);
+    assert_eq!(retried_failure.catalog_revision, failed.catalog_revision);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_before_failure + 1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE request_id = 'health-failure-retry'",
+        )
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("retry audit count should read"),
+        0
+    );
+    let tool_after_failure = executor
+        .app
+        .catalog()
+        .list_tools(ListToolsFilter {
+            source_id: Some(source.id.clone()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("last-good tool should remain")
+        .items
+        .remove(0);
+    assert_eq!(tool_after_failure.id, tool_before_failure.id);
+    assert_eq!(tool_after_failure.revision, tool_before_failure.revision);
+    assert!(tool_after_failure.present);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM source_artifacts WHERE source_id = ? AND stable_key = 'last-good'",
+        )
+        .bind(&source.id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("last-good artifact should remain"),
+        1
+    );
+    let audit_metadata = sqlx::query_scalar::<_, String>(
+        "SELECT metadata_json FROM audit_events WHERE request_id = 'health-failure'",
+    )
+    .fetch_one(executor.app.pool())
+    .await
+    .expect("health audit should exist");
+    assert_eq!(
+        serde_json::from_str::<Value>(&audit_metadata).expect("audit metadata should be JSON"),
+        json!({
+            "healthStatus": "error",
+            "errorCode": "mcp_discovery_failed",
+            "reasonCode": "mcp_discovery_failed",
+            "globalRevision": global_before_failure + 1,
+        })
+    );
+
+    let restored = executor
+        .app
+        .catalog()
+        .sync_catalog(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: failed.revision,
+                expected_credential_revision: None,
+                artifacts: vec![StagedArtifact {
+                    kind: ArtifactKind::Metadata,
+                    stable_key: "last-good".to_owned(),
+                    content: json!({ "version": 2 }),
+                }],
+                tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
+            },
+            AuditContext::system(None),
+        )
+        .await
+        .expect("successful sync should restore healthy state");
+    assert_eq!(restored.source_id, source.id);
+    let source_after_restore = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(source_after_restore.health_status, SourceHealth::Healthy);
+    assert_eq!(source_after_restore.health_error_code, None);
+    assert_eq!(
+        source_after_restore.catalog_revision,
+        healthy.catalog_revision + 1
+    );
+    let tool_after_restore = executor
+        .app
+        .catalog()
+        .list_tools(ListToolsFilter {
+            source_id: Some(source.id),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("restored tool should list")
+        .items
+        .remove(0);
+    assert_eq!(tool_after_restore.id, tool_before_failure.id);
+}
+
+#[tokio::test]
+async fn deferred_source_creation_atomically_persists_an_unknown_empty_catalog() {
+    let executor = TestExecutor::new().await;
+    let (source, catalog) = executor
+        .app
+        .catalog()
+        .create_source_with_catalog_health(
+            CreateSource {
+                kind: SourceKind::McpStdio,
+                preferred_slug: "deferred-stdio".to_owned(),
+                display_name: "Deferred stdio".to_owned(),
+                description: None,
+                configuration: Map::new(),
+            },
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({}),
+            },
+            InitialCatalogSnapshot {
+                artifacts: Vec::new(),
+                tools: Vec::new(),
+            },
+            Vec::new(),
+            SourceHealth::Unknown,
+            AuditContext::system(Some("deferred-source-create")),
+        )
+        .await
+        .expect("deferred source and its empty catalog should commit atomically");
+    assert_eq!(source.health_status, SourceHealth::Unknown);
+    assert_eq!(source.health_error_code, None);
+    assert_eq!(source.last_refreshed_at, None);
+    assert_eq!(source.tool_count, 0);
+    assert_eq!(source.tombstoned_tool_count, 0);
+    assert_eq!(catalog.active_tool_count, 0);
+    assert_eq!(catalog.tombstoned_tool_count, 0);
+    assert_eq!(catalog.source_revision, source.revision);
+    assert_eq!(catalog.catalog_revision, source.catalog_revision);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources WHERE id = ?")
+            .bind(&source.id)
+            .fetch_one(executor.app.pool())
+            .await
+            .expect("created source should exist"),
+        1
+    );
+
+    let source_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("source count should read");
+    let error = executor
+        .app
+        .catalog()
+        .create_source_with_catalog_health(
+            CreateSource {
+                kind: SourceKind::McpStdio,
+                preferred_slug: "invalid-error-source".to_owned(),
+                display_name: "Invalid error source".to_owned(),
+                description: None,
+                configuration: Map::new(),
+            },
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({}),
+            },
+            InitialCatalogSnapshot {
+                artifacts: Vec::new(),
+                tools: Vec::new(),
+            },
+            Vec::new(),
+            SourceHealth::Error,
+            AuditContext::system(None),
+        )
+        .await
+        .expect_err("error health without a stable code must be rejected before insertion");
+    assert!(matches!(
+        error,
+        CatalogError::Validation {
+            code: "invalid_initial_source_health",
+            ..
+        }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+            .fetch_one(executor.app.pool())
+            .await
+            .expect("source count should read"),
+        source_count
+    );
+}
+
+#[tokio::test]
+async fn credential_required_health_is_fixed_bounded_and_revision_guarded() {
+    let executor = TestExecutor::new().await;
+    let source = executor
+        .source_with_kind("stdio-needs-credential", SourceKind::McpStdio)
+        .await;
+    let global_before = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let already_unknown = executor
+        .app
+        .catalog()
+        .mark_source_credential_required(
+            &source.id,
+            source.revision,
+            AuditContext::system(Some("credential-required-existing")),
+        )
+        .await
+        .expect("an already unknown incomplete source should be an idempotent success");
+    assert_eq!(already_unknown.revision, source.revision);
+    assert_eq!(already_unknown.health_status, SourceHealth::Unknown);
+    assert_eq!(already_unknown.health_error_code, None);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_before
+    );
+
+    let errored = executor
+        .app
+        .catalog()
+        .mark_source_error(
+            &source.id,
+            "mcp_start_failed",
+            source.revision,
+            AuditContext::system(None),
+        )
+        .await
+        .expect("source should enter error state");
+    let marked = executor
+        .app
+        .catalog()
+        .mark_source_credential_required(
+            &source.id,
+            errored.revision,
+            AuditContext::system(Some("credential-required")),
+        )
+        .await
+        .expect("credential requirement should restore unknown state without violating schema");
+    assert_eq!(marked.health_status, SourceHealth::Unknown);
+    assert_eq!(marked.health_error_code, None);
+    assert_eq!(marked.revision, errored.revision + 1);
+    assert_eq!(marked.catalog_revision, source.catalog_revision);
+    let global_after_mark = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    assert_eq!(global_after_mark, global_before + 2);
+    let transition_metadata = sqlx::query_scalar::<_, String>(
+        "SELECT metadata_json FROM audit_events WHERE request_id = 'credential-required'",
+    )
+    .fetch_one(executor.app.pool())
+    .await
+    .expect("credential-required audit should exist");
+    assert_eq!(
+        serde_json::from_str::<Value>(&transition_metadata)
+            .expect("credential-required audit should be JSON"),
+        json!({
+            "healthStatus": "unknown",
+            "errorCode": null,
+            "reasonCode": "credential_required",
+            "globalRevision": global_after_mark,
+        })
+    );
+
+    let retried = executor
+        .app
+        .catalog()
+        .mark_source_credential_required(
+            &source.id,
+            errored.revision,
+            AuditContext::system(Some("credential-required-retry")),
+        )
+        .await
+        .expect("an identical stale retry should be idempotent");
+    assert_eq!(retried.revision, marked.revision);
+    assert_eq!(retried.catalog_revision, marked.catalog_revision);
+    assert_eq!(retried.health_status, marked.health_status);
+    assert_eq!(retried.health_error_code, marked.health_error_code);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_after_mark
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE request_id = 'credential-required-retry'",
+        )
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("retry audit count should read"),
+        0
+    );
+
+    let stale = executor
+        .app
+        .catalog()
+        .mark_source_error(
+            &source.id,
+            "mcp_discovery_failed",
+            source.revision,
+            AuditContext::system(None),
+        )
+        .await
+        .expect_err("stale health transition should fail");
+    assert!(matches!(
+        stale,
+        CatalogError::RevisionConflict {
+            scope: "source",
+            expected,
+            actual,
+        } if expected == source.revision && actual == marked.revision
+    ));
+    let after_stale = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(after_stale.revision, marked.revision);
+    assert_eq!(after_stale.health_status, SourceHealth::Unknown);
+    assert_eq!(after_stale.health_error_code, None);
+}
+
+#[tokio::test]
+async fn source_health_error_codes_reject_unbounded_or_nonstable_values_without_mutation() {
+    let executor = TestExecutor::new().await;
+    let source = executor.source("invalid-health-codes").await;
+    let global_revision = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    for invalid in [
+        "",
+        "UPSTREAM_FAILED",
+        "upstream-failed",
+        "upstream__failed",
+        "upstream_failed_",
+        "1_upstream_failed",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let error = executor
+            .app
+            .catalog()
+            .mark_source_error(
+                &source.id,
+                invalid,
+                source.revision,
+                AuditContext::system(None),
+            )
+            .await
+            .expect_err("invalid health code should be rejected");
+        assert!(matches!(
+            error,
+            CatalogError::Validation {
+                code: "invalid_source_health_error_code",
+                ..
+            }
+        ));
+    }
+    let after = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(after.revision, source.revision);
+    assert_eq!(after.health_status, SourceHealth::Unknown);
+    assert_eq!(after.health_error_code, None);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_revision
+    );
+}
+
+#[tokio::test]
+async fn credential_replacement_and_catalog_sync_commit_as_one_revision() {
+    let executor = TestExecutor::new().await;
+    let source = executor
+        .source_with_kind("atomic-credential-sync", SourceKind::Openapi)
+        .await;
+    executor
+        .app
+        .catalog()
+        .put_credential(
+            &source.id,
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({ "token": "old-secret" }),
+            },
+            None,
+            AuditContext::system(None),
+        )
+        .await
+        .expect("initial credential should persist");
+    let basis = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let credential = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    executor
+        .app
+        .catalog()
+        .sync_catalog_with_bindings(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: basis.revision,
+                expected_credential_revision: Some(credential.revision),
+                artifacts: Vec::new(),
+                tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
+            },
+            vec![openapi_binding("alpha", "GET")],
+            AuditContext::system(None),
+        )
+        .await
+        .expect("initial catalog should sync");
+    let before = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let credential_before = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    let global_before = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let replacement = CredentialPayload {
+        schema_version: 1,
+        payload: json!({ "token": "new-secret" }),
+    };
+    let (stored, sync, current) = executor
+        .app
+        .catalog()
+        .replace_credential_and_sync_catalog(
+            &source.id,
+            &replacement,
+            CatalogSnapshot {
+                expected_source_revision: before.revision,
+                expected_credential_revision: Some(credential_before.revision),
+                artifacts: vec![StagedArtifact {
+                    kind: ArtifactKind::Metadata,
+                    stable_key: "discovery".to_owned(),
+                    content: json!({ "version": 2 }),
+                }],
+                tools: vec![
+                    staged("alpha", "Updated Alpha", ToolMode::Ask),
+                    staged("beta", "Beta", ToolMode::Enabled),
+                ],
+            },
+            vec![
+                openapi_binding("alpha", "POST"),
+                openapi_binding("beta", "GET"),
+            ],
+            AuditContext::system(Some("atomic-credential-sync")),
+        )
+        .await
+        .expect("credential and discovered catalog should commit together");
+    assert_eq!(stored.revision, credential_before.revision + 1);
+    assert_eq!(stored.credential.payload, replacement.payload);
+    assert_eq!(current.revision, before.revision + 1);
+    assert_eq!(current.catalog_revision, before.catalog_revision + 1);
+    assert_eq!(sync.source_revision, current.revision);
+    assert_eq!(sync.catalog_revision, current.catalog_revision);
+    assert_eq!(sync.global_revision, global_before + 1);
+    assert_eq!(current.health_status, SourceHealth::Healthy);
+    assert_eq!(current.health_error_code, None);
+    assert_eq!(sync.active_tool_count, 2);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("credential should read")
+            .expect("credential should exist")
+            .credential
+            .payload,
+        replacement.payload
+    );
+    let audit = sqlx::query_scalar::<_, String>(
+        "SELECT group_concat(metadata_json, ' ') FROM audit_events \
+         WHERE request_id = 'atomic-credential-sync'",
+    )
+    .fetch_one(executor.app.pool())
+    .await
+    .expect("atomic audit metadata should read");
+    assert!(!audit.contains("new-secret"));
+}
+
+#[tokio::test]
+async fn atomic_credential_sync_rolls_back_credential_on_late_catalog_failure() {
+    let executor = TestExecutor::new().await;
+    let source = executor.source("atomic-rollback").await;
+    executor
+        .app
+        .catalog()
+        .put_credential(
+            &source.id,
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({ "token": "retained" }),
+            },
+            None,
+            AuditContext::system(None),
+        )
+        .await
+        .expect("initial credential should persist");
+    let basis = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    executor
+        .sync(
+            &source.id,
+            vec![staged("current", "Current", ToolMode::Enabled)],
+        )
+        .await;
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS ( \
+         SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 25000) \
+         INSERT INTO tools \
+         (id, source_id, stable_key, local_name, display_name, description, input_schema_json, \
+          typescript_definitions_json, intrinsic_mode, present, revision, created_at, updated_at, \
+          last_seen_at, tombstoned_at) \
+         SELECT printf('atomic-history-%05d', value), ?, printf('atomic-key-%05d', value), \
+                printf('atomic_%05d', value), 'Retained', NULL, '{}', '{}', 'enabled', \
+                0, 0, 1, 1, 1, 1 FROM sequence",
+    )
+    .bind(&source.id)
+    .execute(executor.app.pool())
+    .await
+    .expect("tombstone ceiling fixture should seed");
+    let before = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    assert!(before.revision > basis.revision);
+    let credential_before = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    let global_before = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let error = executor
+        .app
+        .catalog()
+        .replace_credential_and_sync_catalog(
+            &source.id,
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({ "token": "must-roll-back" }),
+            },
+            CatalogSnapshot {
+                expected_source_revision: before.revision,
+                expected_credential_revision: Some(credential_before.revision),
+                artifacts: vec![StagedArtifact {
+                    kind: ArtifactKind::Metadata,
+                    stable_key: "must-not-commit".to_owned(),
+                    content: json!({ "atomic": true }),
+                }],
+                tools: vec![staged("replacement", "Replacement", ToolMode::Enabled)],
+            },
+            Vec::new(),
+            AuditContext::system(Some("atomic-rollback")),
+        )
+        .await
+        .expect_err("late catalog failure must roll back the credential replacement");
+    assert!(matches!(
+        error,
+        CatalogError::Validation {
+            code: "catalog_too_large",
+            ..
+        }
+    ));
+    let credential_after = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    assert_eq!(credential_after.revision, credential_before.revision);
+    assert_eq!(
+        credential_after.credential.payload,
+        json!({ "token": "retained" })
+    );
+    let after = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.catalog_revision, before.catalog_revision);
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_before
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM source_artifacts WHERE source_id = ? AND stable_key = 'must-not-commit'",
+        )
+        .bind(&source.id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("artifact count should read"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE request_id = 'atomic-rollback'",
+        )
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("audit count should read"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn atomic_credential_mutations_are_cas_guarded_and_set_unknown_together() {
+    let executor = TestExecutor::new().await;
+    let source = executor.source("atomic-unknown").await;
+    executor
+        .app
+        .catalog()
+        .put_credential(
+            &source.id,
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({ "secrets": ["old"] }),
+            },
+            None,
+            AuditContext::system(None),
+        )
+        .await
+        .expect("initial credential should persist");
+    let healthy = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let credential = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    let cleared = CredentialPayload {
+        schema_version: 1,
+        payload: json!({ "secrets": [] }),
+    };
+    let first_store = executor.app.catalog().clone();
+    let second_store = executor.app.catalog().clone();
+    let first = first_store.replace_credential_and_mark_unknown(
+        &source.id,
+        &cleared,
+        healthy.revision,
+        credential.revision,
+        AuditContext::system(Some("atomic-unknown-1")),
+    );
+    let second = second_store.replace_credential_and_mark_unknown(
+        &source.id,
+        &cleared,
+        healthy.revision,
+        credential.revision,
+        AuditContext::system(Some("atomic-unknown-2")),
+    );
+    let (first, second) = tokio::join!(first, second);
+    let outcomes = [first, second];
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+    let (stored, unknown) = outcomes
+        .into_iter()
+        .find_map(Result::ok)
+        .expect("one atomic mutation should win");
+    assert_eq!(stored.revision, credential.revision + 1);
+    assert_eq!(stored.credential.payload, cleared.payload);
+    assert_eq!(unknown.revision, healthy.revision + 1);
+    assert_eq!(unknown.health_status, SourceHealth::Unknown);
+    assert_eq!(unknown.health_error_code, None);
+    let persisted = executor
+        .app
+        .catalog()
+        .credential(&source.id)
+        .await
+        .expect("credential should read")
+        .expect("credential should exist");
+    assert_eq!(persisted.revision, stored.revision);
+    assert_eq!(persisted.credential.payload, cleared.payload);
+
+    let deleted = executor
+        .app
+        .catalog()
+        .delete_credential_and_mark_unknown(
+            &source.id,
+            unknown.revision,
+            persisted.revision,
+            AuditContext::system(None),
+        )
+        .await
+        .expect("credential deletion and unknown health should commit together");
+    assert_eq!(deleted.revision, unknown.revision + 1);
+    assert_eq!(deleted.health_status, SourceHealth::Unknown);
+    assert_eq!(deleted.health_error_code, None);
+    assert!(
+        executor
+            .app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("credential read should succeed")
+            .is_none()
+    );
 }
 
 #[tokio::test]

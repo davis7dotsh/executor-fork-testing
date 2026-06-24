@@ -32,7 +32,12 @@ const TokenListSchema = Schema.Struct({
 
 const ToolModeSchema = Schema.Literals(["enabled", "ask", "disabled"]);
 const ModeProvenanceSchema = Schema.Literals(["tool_override", "source_override", "intrinsic"]);
-const JsonObjectSchema = Schema.Record(Schema.String, Schema.Unknown);
+const SourcePublicConfigurationSchema = Schema.Struct({
+  endpoint: Schema.optional(Schema.String),
+  allowPrivateNetwork: Schema.optional(Schema.Boolean),
+  templateName: Schema.optional(Schema.String),
+  negotiatedProtocolVersion: Schema.optional(Schema.String),
+});
 
 const SourceSchema = Schema.Struct({
   id: Schema.String,
@@ -40,7 +45,7 @@ const SourceSchema = Schema.Struct({
   slug: Schema.String,
   displayName: Schema.String,
   description: Schema.NullOr(Schema.String),
-  configuration: JsonObjectSchema,
+  configuration: SourcePublicConfigurationSchema,
   modeOverride: Schema.NullOr(ToolModeSchema),
   healthStatus: Schema.Literals(["unknown", "healthy", "error"]),
   healthErrorCode: Schema.NullOr(Schema.String),
@@ -110,7 +115,25 @@ const CredentialMetadataSchema = Schema.Struct({
   configuredSchemes: Schema.Array(
     Schema.Struct({
       name: Schema.String,
-      credentialType: Schema.Literals(["api_key", "bearer", "basic", "manual_oauth_access_token"]),
+      credentialType: Schema.Literals([
+        "api_key",
+        "bearer",
+        "basic",
+        "manual_oauth_access_token",
+        "secret_env",
+        "header",
+        "api_key_header",
+        "oauth_access_token",
+      ]),
+    }),
+  ),
+});
+
+const McpStdioTemplateListSchema = Schema.Struct({
+  templates: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      secretFields: Schema.Array(Schema.String),
     }),
   ),
 });
@@ -264,6 +287,7 @@ export type SourceList = typeof SourceListSchema.Type;
 export type OpenApiPreview = typeof OpenApiPreviewSchema.Type;
 export type CatalogSyncResult = typeof CatalogSyncResultSchema.Type;
 export type OpenApiCredentialMetadata = typeof CredentialMetadataSchema.Type;
+export type McpStdioTemplate = (typeof McpStdioTemplateListSchema.Type)["templates"][number];
 export type ToolSummary = typeof ToolSummarySchema.Type;
 export type ToolRecord = typeof ToolRecordSchema.Type;
 export type ToolPage = typeof ToolPageSchema.Type;
@@ -304,6 +328,9 @@ const decodeCatalogSyncResult = Schema.decodeUnknownOption(
 );
 const decodeCredentialMetadata = Schema.decodeUnknownOption(
   Schema.fromJsonString(CredentialMetadataSchema),
+);
+const decodeMcpStdioTemplateList = Schema.decodeUnknownOption(
+  Schema.fromJsonString(McpStdioTemplateListSchema),
 );
 const decodeToolRecord = Schema.decodeUnknownOption(Schema.fromJsonString(ToolRecordSchema));
 const decodeToolPage = Schema.decodeUnknownOption(Schema.fromJsonString(ToolPageSchema));
@@ -457,6 +484,51 @@ export type OpenApiSourceInput = {
   };
 };
 
+export type McpHttpSourceInput = {
+  readonly kind: "mcp_http";
+  readonly displayName: string;
+  readonly description?: string;
+  readonly endpoint: string;
+  readonly allowPrivateNetwork?: boolean;
+  readonly credential?: Exclude<McpHttpCredential["credential"], null>;
+};
+
+export type McpStdioSourceInput = {
+  readonly kind: "mcp_stdio";
+  readonly displayName: string;
+  readonly description?: string;
+  readonly templateName: string;
+  readonly secretValues: Readonly<Record<string, string>>;
+};
+
+export type McpHttpCredential =
+  | { readonly credential: null }
+  | { readonly credential: { readonly type: "bearer"; readonly token: string } }
+  | {
+      readonly credential: {
+        readonly type: "basic";
+        readonly username: string;
+        readonly password: string;
+      };
+    }
+  | {
+      readonly credential: {
+        readonly type: "api_key_header";
+        readonly name: string;
+        readonly value: string;
+      };
+    }
+  | {
+      readonly credential: {
+        readonly type: "oauth_access_token";
+        readonly accessToken: string;
+      };
+    };
+
+export type McpStdioCredential = {
+  readonly secretValues: Readonly<Record<string, string>>;
+};
+
 export async function previewOpenApiSource(
   spec: OpenApiSpecInput,
   allowPrivateNetwork: boolean,
@@ -486,7 +558,55 @@ export async function createOpenApiSource(
   return decodeResponse(response.value, decodeSource);
 }
 
+export async function createMcpHttpSource(
+  input: McpHttpSourceInput,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/sources",
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSource);
+}
+
+export async function listMcpStdioTemplates(fetcher: Fetcher = fetch, signal?: AbortSignal) {
+  const response = await request("/api/v1/mcp/stdio/templates", { signal }, fetcher);
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeMcpStdioTemplateList);
+}
+
+export async function createMcpStdioSource(
+  input: McpStdioSourceInput,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/sources",
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSource);
+}
+
 export async function refreshOpenApiSource(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/refresh`,
+    { method: "POST", body: "{}", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCatalogSyncResult);
+}
+
+export async function refreshSourceCatalog(
   sourceId: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
@@ -512,6 +632,40 @@ export async function getOpenApiCredentials(
   );
   if (!response.ok) return response;
   return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export async function getSourceCredentials(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export async function putMcpHttpCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  credential: McpHttpCredential,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  return putProtocolCredentials(sourceId, expectedRevision, credential, fetcher, signal);
+}
+
+export async function putMcpStdioCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  credential: McpStdioCredential,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  return putProtocolCredentials(sourceId, expectedRevision, credential, fetcher, signal);
 }
 
 export async function putOpenApiCredentials(
@@ -543,6 +697,26 @@ export async function deleteOpenApiCredentials(
   const response = await request(
     `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials?expectedRevision=${encodeURIComponent(String(expectedRevision))}`,
     { method: "DELETE", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+async function putProtocolCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  credential: McpHttpCredential | McpStdioCredential,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ expectedRevision, credential }),
+      signal,
+    },
     fetcher,
   );
   if (!response.ok) return response;

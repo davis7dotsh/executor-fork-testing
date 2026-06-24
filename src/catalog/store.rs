@@ -52,6 +52,7 @@ const MAX_SEARCH_DESCRIPTION_BYTES: usize = 32 * 1024;
 const MAX_SHORT_GRAM_DOCUMENT_BYTES: usize = 16 * 1024;
 const MAX_LOCAL_NAME_BYTES: usize = 128;
 const MAX_CATALOG_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_HEALTH_ERROR_CODE_BYTES: usize = 64;
 
 #[derive(Clone)]
 pub struct CatalogStore {
@@ -298,10 +299,39 @@ impl CatalogStore {
         bindings: Vec<StagedToolBinding>,
         audit: AuditContext<'_>,
     ) -> Result<(SourceRecord, CatalogSyncResult), CatalogError> {
-        if input.kind != SourceKind::Openapi {
+        self.create_source_with_catalog_health(
+            input,
+            credential,
+            snapshot,
+            bindings,
+            SourceHealth::Healthy,
+            audit,
+        )
+        .await
+    }
+
+    pub async fn create_source_with_catalog_health(
+        &self,
+        input: CreateSource,
+        credential: &CredentialPayload,
+        snapshot: InitialCatalogSnapshot,
+        bindings: Vec<StagedToolBinding>,
+        initial_health: SourceHealth,
+        audit: AuditContext<'_>,
+    ) -> Result<(SourceRecord, CatalogSyncResult), CatalogError> {
+        if !matches!(
+            input.kind,
+            SourceKind::Openapi | SourceKind::McpHttp | SourceKind::McpStdio
+        ) {
             return Err(validation(
                 "invalid_source_kind",
-                "Atomic imported-source creation currently supports OpenAPI sources only.",
+                "Atomic imported-source creation supports OpenAPI and MCP sources.",
+            ));
+        }
+        if initial_health == SourceHealth::Error {
+            return Err(validation(
+                "invalid_initial_source_health",
+                "Atomic source creation supports healthy or unknown initial health.",
             ));
         }
         let display_name = validate_text(
@@ -339,6 +369,15 @@ impl CatalogStore {
                 "Every staged imported tool must have exactly one binding.",
             ));
         }
+        if prepared_bindings
+            .iter()
+            .any(|binding| binding.protocol != input.kind.as_str())
+        {
+            return Err(validation(
+                "invalid_source_kind",
+                "Every staged tool binding must match its source protocol.",
+            ));
+        }
 
         let source_id = Uuid::new_v4().to_string();
         let configuration_json = serde_json::to_string(&input.configuration)?;
@@ -359,11 +398,17 @@ impl CatalogStore {
         used_slugs.extend(RESERVED_SOURCE_SLUGS.into_iter().map(str::to_owned));
         let slug = NameAllocator::new(used_slugs).allocate(&base_slug, 63, '_');
         let search_short_grams = search::short_gram_document(&[&slug]);
+        let initial_health = match initial_health {
+            SourceHealth::Unknown => "unknown",
+            SourceHealth::Healthy => "healthy",
+            SourceHealth::Error => unreachable!("error initial health was rejected"),
+        };
+        let last_refreshed_at = (initial_health == "healthy").then_some(now);
         sqlx::query(
             "INSERT INTO sources \
              (id, kind, slug, search_short_grams, display_name, description, configuration_json, \
               health_status, revision, catalog_revision, created_at, updated_at, last_refreshed_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'healthy', 1, 1, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
         )
         .bind(&source_id)
         .bind(input.kind.as_str())
@@ -372,9 +417,10 @@ impl CatalogStore {
         .bind(display_name)
         .bind(description)
         .bind(configuration_json)
+        .bind(initial_health)
         .bind(now)
         .bind(now)
-        .bind(now)
+        .bind(last_refreshed_at)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -677,6 +723,127 @@ impl CatalogStore {
         self.source(source_id).await
     }
 
+    pub async fn mark_source_credential_required(
+        &self,
+        source_id: &str,
+        expected_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<SourceRecord, CatalogError> {
+        self.set_source_health(
+            source_id,
+            SourceHealth::Unknown,
+            None,
+            "credential_required",
+            expected_revision,
+            audit,
+        )
+        .await
+    }
+
+    pub async fn mark_source_error(
+        &self,
+        source_id: &str,
+        error_code: &'static str,
+        expected_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<SourceRecord, CatalogError> {
+        self.set_source_health(
+            source_id,
+            SourceHealth::Error,
+            Some(error_code),
+            error_code,
+            expected_revision,
+            audit,
+        )
+        .await
+    }
+
+    async fn set_source_health(
+        &self,
+        source_id: &str,
+        health: SourceHealth,
+        health_error_code: Option<&'static str>,
+        transition_code: &'static str,
+        expected_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<SourceRecord, CatalogError> {
+        validate_source_health_error_code(transition_code)?;
+        if let Some(error_code) = health_error_code {
+            validate_source_health_error_code(error_code)?;
+        }
+        let _write = self.mutation_lock.write().await;
+        let now = unix_timestamp();
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(source_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(CatalogError::NotFound { entity: "source" })?;
+        let health_status = match health {
+            SourceHealth::Unknown => "unknown",
+            SourceHealth::Healthy => "healthy",
+            SourceHealth::Error => "error",
+        };
+        if current.health_status == health_status
+            && current.health_error_code.as_deref() == health_error_code
+        {
+            let source = current.try_into()?;
+            transaction.commit().await?;
+            return Ok(source);
+        }
+        if current.revision != expected_revision {
+            return Err(CatalogError::RevisionConflict {
+                scope: "source",
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let changed = sqlx::query(
+            "UPDATE sources SET health_status = ?, health_error_code = ?, \
+             revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?",
+        )
+        .bind(health_status)
+        .bind(health_error_code)
+        .bind(now)
+        .bind(source_id)
+        .bind(expected_revision)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(CatalogError::RevisionConflict {
+                scope: "source",
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let global_revision = bump_global_revision(&mut transaction, now).await?;
+        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.health_changed",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({
+                "healthStatus": health,
+                "errorCode": health_error_code,
+                "reasonCode": transition_code,
+                "globalRevision": global_revision,
+            }),
+            now,
+        )
+        .await?;
+        let source = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        transaction.commit().await?;
+        Ok(source)
+    }
+
     pub async fn put_credential(
         &self,
         source_id: &str,
@@ -843,6 +1010,143 @@ impl CatalogStore {
         Ok(())
     }
 
+    pub async fn replace_credential_and_mark_unknown(
+        &self,
+        source_id: &str,
+        credential: &CredentialPayload,
+        expected_source_revision: i64,
+        expected_credential_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<(StoredCredential, SourceRecord), CatalogError> {
+        let ciphertext = self.prepare_credential_ciphertext(source_id, credential)?;
+        let now = unix_timestamp();
+        let _write = self.mutation_lock.write().await;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_source_revision(&mut transaction, source_id, expected_source_revision).await?;
+        let credential_revision = replace_credential_in_transaction(
+            &mut transaction,
+            source_id,
+            credential.schema_version,
+            ciphertext,
+            expected_credential_revision,
+            now,
+        )
+        .await?;
+        let source_revision = sqlx::query_scalar::<_, i64>(
+            "UPDATE sources SET health_status = 'unknown', health_error_code = NULL, \
+             revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ? \
+             RETURNING revision",
+        )
+        .bind(now)
+        .bind(source_id)
+        .bind(expected_source_revision)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let global_revision = bump_global_revision(&mut transaction, now).await?;
+        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.credential_changed",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({ "schemaVersion": credential.schema_version }),
+            now,
+        )
+        .await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.health_changed",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({
+                "healthStatus": SourceHealth::Unknown,
+                "errorCode": null,
+                "reasonCode": "credential_required",
+                "globalRevision": global_revision,
+            }),
+            now,
+        )
+        .await?;
+        let source: SourceRecord = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        transaction.commit().await?;
+        debug_assert_eq!(source_revision, source.revision);
+        Ok((
+            StoredCredential {
+                revision: credential_revision,
+                credential: credential.clone(),
+            },
+            source,
+        ))
+    }
+
+    pub async fn delete_credential_and_mark_unknown(
+        &self,
+        source_id: &str,
+        expected_source_revision: i64,
+        expected_credential_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<SourceRecord, CatalogError> {
+        let now = unix_timestamp();
+        let _write = self.mutation_lock.write().await;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_source_revision(&mut transaction, source_id, expected_source_revision).await?;
+        delete_credential_in_transaction(&mut transaction, source_id, expected_credential_revision)
+            .await?;
+        sqlx::query(
+            "UPDATE sources SET health_status = 'unknown', health_error_code = NULL, \
+             revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?",
+        )
+        .bind(now)
+        .bind(source_id)
+        .bind(expected_source_revision)
+        .execute(&mut *transaction)
+        .await?;
+        let global_revision = bump_global_revision(&mut transaction, now).await?;
+        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.credential_deleted",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({}),
+            now,
+        )
+        .await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.health_changed",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({
+                "healthStatus": SourceHealth::Unknown,
+                "errorCode": null,
+                "reasonCode": "credential_required",
+                "globalRevision": global_revision,
+            }),
+            now,
+        )
+        .await?;
+        let source: SourceRecord = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        transaction.commit().await?;
+        Ok(source)
+    }
+
     #[cfg(test)]
     pub(crate) async fn replace_tool_bindings(
         &self,
@@ -855,10 +1159,22 @@ impl CatalogStore {
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let source_kind = source_kind(&mut transaction, source_id).await?;
-        if source_kind != SourceKind::Openapi {
+        if !matches!(
+            source_kind,
+            SourceKind::Openapi | SourceKind::McpHttp | SourceKind::McpStdio
+        ) {
             return Err(validation(
                 "invalid_source_kind",
-                "OpenAPI tool bindings may only be stored for OpenAPI sources.",
+                "Imported tool bindings may only be stored for imported sources.",
+            ));
+        }
+        if prepared
+            .iter()
+            .any(|binding| binding.protocol != source_kind.as_str())
+        {
+            return Err(validation(
+                "invalid_source_kind",
+                "Every tool binding must match its source protocol.",
             ));
         }
         let active_count = sqlx::query_scalar::<_, i64>(
@@ -927,10 +1243,7 @@ impl CatalogStore {
             entity: "tool binding",
         })?;
         let binding = ToolBinding::decode(&row.3, row.4, &row.5)?;
-        if !matches!(
-            (&binding, SourceKind::from_str(&row.2)?),
-            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
-        ) {
+        if !binding_matches_source_kind(&binding, SourceKind::from_str(&row.2)?) {
             return Err(CatalogError::CorruptData(
                 "tool binding does not match source kind",
             ));
@@ -966,85 +1279,119 @@ impl CatalogStore {
         let now = unix_timestamp();
         let _write = self.mutation_lock.write().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (actual_source_revision, source_kind) =
-            sqlx::query_as::<_, (i64, String)>("SELECT revision, kind FROM sources WHERE id = ?")
-                .bind(source_id)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .ok_or(CatalogError::NotFound { entity: "source" })?;
-        if actual_source_revision != expected_source_revision {
-            return Err(CatalogError::RevisionConflict {
-                scope: "source",
-                expected: expected_source_revision,
-                actual: actual_source_revision,
-            });
-        }
-        let source_kind = SourceKind::from_str(&source_kind)?;
-        let binding_keys = prepared_bindings
-            .iter()
-            .map(|binding| &binding.stable_key)
-            .collect::<HashSet<_>>();
-        let staged_tool_keys = prepared
-            .tools
-            .iter()
-            .map(|tool| &tool.stable_key)
-            .collect::<HashSet<_>>();
-        match source_kind {
-            SourceKind::Openapi if binding_keys != staged_tool_keys => {
-                return Err(validation(
-                    "incomplete_tool_bindings",
-                    "Every active OpenAPI tool must have exactly one binding.",
-                ));
-            }
-            SourceKind::Openapi => {}
-            _ if !prepared_bindings.is_empty() => {
-                return Err(validation(
-                    "invalid_source_kind",
-                    "OpenAPI tool bindings may only be stored for OpenAPI sources.",
-                ));
-            }
-            _ => {}
-        }
-        let actual_credential_revision = sqlx::query_scalar::<_, i64>(
-            "SELECT revision FROM source_credentials WHERE source_id = ?",
-        )
-        .bind(source_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if actual_credential_revision != expected_credential_revision {
-            return Err(CatalogError::RevisionConflict {
-                scope: "credential",
-                expected: expected_credential_revision.unwrap_or(-1),
-                actual: actual_credential_revision.unwrap_or(-1),
-            });
-        }
-        apply_artifacts(&mut transaction, source_id, &prepared.artifacts, now).await?;
-        let missing = apply_tools(&mut transaction, source_id, &prepared.tools, now).await?;
-        apply_tool_bindings(&mut transaction, source_id, &prepared_bindings, now).await?;
-        rebuild_search_indexes(&mut transaction, source_id).await?;
-
-        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
-        let (source_revision, catalog_revision, global_revision) = finalize_catalog_apply(
+        validate_catalog_apply_basis(
             &mut transaction,
-            audit,
             source_id,
-            &source_path,
-            CatalogApplyKind::Refresh,
-            prepared.tools.len(),
-            prepared.artifacts.len(),
-            missing.len(),
+            expected_source_revision,
+            expected_credential_revision,
+            &prepared,
+            &prepared_bindings,
+        )
+        .await?;
+        let result = apply_prepared_catalog_refresh(
+            &mut transaction,
+            source_id,
+            &prepared,
+            &prepared_bindings,
+            audit,
             now,
         )
         .await?;
         transaction.commit().await?;
-        Ok(CatalogSyncResult {
-            source_id: source_id.to_owned(),
-            source_revision,
-            catalog_revision,
-            global_revision,
-            active_tool_count: prepared.tools.len(),
-            tombstoned_tool_count: missing.len(),
-        })
+        Ok(result)
+    }
+
+    pub async fn replace_credential_and_sync_catalog(
+        &self,
+        source_id: &str,
+        credential: &CredentialPayload,
+        snapshot: CatalogSnapshot,
+        bindings: Vec<StagedToolBinding>,
+        audit: AuditContext<'_>,
+    ) -> Result<(StoredCredential, CatalogSyncResult, SourceRecord), CatalogError> {
+        let expected_source_revision = snapshot.expected_source_revision;
+        let expected_credential_revision =
+            snapshot.expected_credential_revision.ok_or_else(|| {
+                validation(
+                    "credential_required",
+                    "Atomic credential replacement requires an existing credential revision.",
+                )
+            })?;
+        let (prepared, prepared_bindings) = prepare_snapshot_and_bindings(snapshot, bindings)?;
+        let ciphertext = self.prepare_credential_ciphertext(source_id, credential)?;
+        let now = unix_timestamp();
+        let _write = self.mutation_lock.write().await;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        validate_catalog_apply_basis(
+            &mut transaction,
+            source_id,
+            expected_source_revision,
+            Some(expected_credential_revision),
+            &prepared,
+            &prepared_bindings,
+        )
+        .await?;
+        let credential_revision = replace_credential_in_transaction(
+            &mut transaction,
+            source_id,
+            credential.schema_version,
+            ciphertext,
+            expected_credential_revision,
+            now,
+        )
+        .await?;
+        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.credential_changed",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({ "schemaVersion": credential.schema_version }),
+            now,
+        )
+        .await?;
+        let sync = apply_prepared_catalog_refresh(
+            &mut transaction,
+            source_id,
+            &prepared,
+            &prepared_bindings,
+            audit,
+            now,
+        )
+        .await?;
+        let source: SourceRecord = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        transaction.commit().await?;
+        Ok((
+            StoredCredential {
+                revision: credential_revision,
+                credential: credential.clone(),
+            },
+            sync,
+            source,
+        ))
+    }
+
+    fn prepare_credential_ciphertext(
+        &self,
+        source_id: &str,
+        credential: &CredentialPayload,
+    ) -> Result<Vec<u8>, CatalogError> {
+        if credential.schema_version == 0 {
+            return Err(validation(
+                "invalid_credential_schema",
+                "Credential schema versions must be positive.",
+            ));
+        }
+        let plaintext = serde_json::to_vec(&credential.payload)?;
+        Ok(self
+            .keyring
+            .encrypt(CREDENTIAL_PURPOSE, source_id, &plaintext)?)
     }
 
     pub async fn list_tools(&self, filter: ListToolsFilter) -> Result<ToolPage, CatalogError> {
@@ -1543,10 +1890,7 @@ impl CatalogStore {
             .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
         let binding = ToolBinding::decode(binding_protocol, binding_version, definition_json)?;
         let source_kind = SourceKind::from_str(&row.source_kind)?;
-        if !matches!(
-            (&binding, source_kind),
-            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
-        ) {
+        if !binding_matches_source_kind(&binding, source_kind) {
             return Err(CatalogError::CorruptData(
                 "tool binding does not match source kind",
             ));
@@ -1643,10 +1987,7 @@ impl CatalogStore {
             .binding_revision
             .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
         let binding = ToolBinding::decode(binding_protocol, binding_version, definition_json)?;
-        if !matches!(
-            (&binding, SourceKind::from_str(&row.source_kind)?),
-            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
-        ) {
+        if !binding_matches_source_kind(&binding, SourceKind::from_str(&row.source_kind)?) {
             return Err(CatalogError::CorruptData(
                 "tool binding does not match source kind",
             ));
@@ -2225,6 +2566,26 @@ fn prepare_tool_bindings_with_limits(
                 }
                 serde_json::to_string(binding)?
             }
+            ToolBinding::McpHttpV1(binding) | ToolBinding::McpStdioV1(binding) => {
+                if binding.version != 1
+                    || binding.tool_name.is_empty()
+                    || binding.tool_name.chars().count() > 128
+                    || binding.tool_name.trim() != binding.tool_name
+                    || binding.tool_name.chars().any(char::is_control)
+                {
+                    return Err(validation(
+                        "invalid_tool_binding",
+                        "The MCP tool binding version or tool name is not supported.",
+                    ));
+                }
+                if binding.tool_name != stable_key {
+                    return Err(validation(
+                        "invalid_tool_binding",
+                        "An MCP tool binding name must match its stable catalog key.",
+                    ));
+                }
+                serde_json::to_string(binding)?
+            }
         };
         if definition_json.len() > limits.schema {
             return Err(validation(
@@ -2483,6 +2844,15 @@ fn parse_optional_mode(value: Option<String>) -> Result<Option<ToolMode>, Catalo
     value.map(|value| ToolMode::from_str(&value)).transpose()
 }
 
+fn binding_matches_source_kind(binding: &ToolBinding, source_kind: SourceKind) -> bool {
+    matches!(
+        (binding, source_kind),
+        (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
+            | (ToolBinding::McpHttpV1(_), SourceKind::McpHttp)
+            | (ToolBinding::McpStdioV1(_), SourceKind::McpStdio)
+    )
+}
+
 fn normalize_source_slug(value: &str) -> String {
     normalize_identifier(value, "source")
 }
@@ -2699,6 +3069,32 @@ fn validate_optional_text(
         .transpose()
 }
 
+fn validate_source_health_error_code(error_code: &str) -> Result<(), CatalogError> {
+    let characters = error_code.as_bytes();
+    let valid = error_code.len() <= MAX_SOURCE_HEALTH_ERROR_CODE_BYTES
+        && characters
+            .first()
+            .is_some_and(|character| character.is_ascii_lowercase())
+        && characters
+            .last()
+            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        && characters.iter().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || *character == b'_'
+        })
+        && characters.windows(2).all(|pair| pair != b"__");
+    if valid {
+        Ok(())
+    } else {
+        Err(validation(
+            "invalid_source_health_error_code",
+            format!(
+                "Source health error codes must contain at most \
+                 {MAX_SOURCE_HEALTH_ERROR_CODE_BYTES} ASCII bytes and use lower_snake_case."
+            ),
+        ))
+    }
+}
+
 fn validation(code: &'static str, message: impl Into<String>) -> CatalogError {
     CatalogError::Validation {
         code,
@@ -2760,6 +3156,114 @@ fn parse_tool_path(path: &str) -> Option<(&str, &str)> {
 
 fn normalize_sandbox_path(path: &str) -> String {
     path.strip_prefix("tools.").unwrap_or(path).to_owned()
+}
+
+async fn validate_catalog_apply_basis(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    expected_source_revision: i64,
+    expected_credential_revision: Option<i64>,
+    prepared: &PreparedSnapshot,
+    prepared_bindings: &[PreparedToolBinding],
+) -> Result<SourceKind, CatalogError> {
+    let (actual_source_revision, source_kind) =
+        sqlx::query_as::<_, (i64, String)>("SELECT revision, kind FROM sources WHERE id = ?")
+            .bind(source_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(CatalogError::NotFound { entity: "source" })?;
+    if actual_source_revision != expected_source_revision {
+        return Err(CatalogError::RevisionConflict {
+            scope: "source",
+            expected: expected_source_revision,
+            actual: actual_source_revision,
+        });
+    }
+    let source_kind = SourceKind::from_str(&source_kind)?;
+    let binding_keys = prepared_bindings
+        .iter()
+        .map(|binding| &binding.stable_key)
+        .collect::<HashSet<_>>();
+    let staged_tool_keys = prepared
+        .tools
+        .iter()
+        .map(|tool| &tool.stable_key)
+        .collect::<HashSet<_>>();
+    match source_kind {
+        SourceKind::Openapi | SourceKind::McpHttp | SourceKind::McpStdio
+            if binding_keys != staged_tool_keys =>
+        {
+            return Err(validation(
+                "incomplete_tool_bindings",
+                "Every active imported tool must have exactly one binding.",
+            ));
+        }
+        SourceKind::Openapi | SourceKind::McpHttp | SourceKind::McpStdio => {}
+        _ if !prepared_bindings.is_empty() => {
+            return Err(validation(
+                "invalid_source_kind",
+                "Imported tool bindings may only be stored for imported sources.",
+            ));
+        }
+        _ => {}
+    }
+    if prepared_bindings
+        .iter()
+        .any(|binding| binding.protocol != source_kind.as_str())
+    {
+        return Err(validation(
+            "invalid_source_kind",
+            "Every staged tool binding must match its source protocol.",
+        ));
+    }
+    let actual_credential_revision =
+        sqlx::query_scalar::<_, i64>("SELECT revision FROM source_credentials WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    if actual_credential_revision != expected_credential_revision {
+        return Err(CatalogError::RevisionConflict {
+            scope: "credential",
+            expected: expected_credential_revision.unwrap_or(-1),
+            actual: actual_credential_revision.unwrap_or(-1),
+        });
+    }
+    Ok(source_kind)
+}
+
+async fn apply_prepared_catalog_refresh(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    prepared: &PreparedSnapshot,
+    prepared_bindings: &[PreparedToolBinding],
+    audit: AuditContext<'_>,
+    now: i64,
+) -> Result<CatalogSyncResult, CatalogError> {
+    apply_artifacts(transaction, source_id, &prepared.artifacts, now).await?;
+    let missing = apply_tools(transaction, source_id, &prepared.tools, now).await?;
+    apply_tool_bindings(transaction, source_id, prepared_bindings, now).await?;
+    rebuild_search_indexes(transaction, source_id).await?;
+    let source_path = source_path_snapshot(transaction, source_id).await?;
+    let (source_revision, catalog_revision, global_revision) = finalize_catalog_apply(
+        transaction,
+        audit,
+        source_id,
+        &source_path,
+        CatalogApplyKind::Refresh,
+        prepared.tools.len(),
+        prepared.artifacts.len(),
+        missing.len(),
+        now,
+    )
+    .await?;
+    Ok(CatalogSyncResult {
+        source_id: source_id.to_owned(),
+        source_revision,
+        catalog_revision,
+        global_revision,
+        active_tool_count: prepared.tools.len(),
+        tombstoned_tool_count: missing.len(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3094,6 +3598,91 @@ async fn ensure_source_exists(
     } else {
         Err(CatalogError::NotFound { entity: "source" })
     }
+}
+
+async fn ensure_source_revision(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    expected_revision: i64,
+) -> Result<(), CatalogError> {
+    let actual_revision = sqlx::query_scalar::<_, i64>("SELECT revision FROM sources WHERE id = ?")
+        .bind(source_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(CatalogError::NotFound { entity: "source" })?;
+    if actual_revision == expected_revision {
+        Ok(())
+    } else {
+        Err(CatalogError::RevisionConflict {
+            scope: "source",
+            expected: expected_revision,
+            actual: actual_revision,
+        })
+    }
+}
+
+async fn replace_credential_in_transaction(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    schema_version: u32,
+    ciphertext: Vec<u8>,
+    expected_revision: i64,
+    now: i64,
+) -> Result<i64, CatalogError> {
+    let revision = sqlx::query_scalar::<_, i64>(
+        "UPDATE source_credentials SET schema_version = ?, payload_ciphertext = ?, \
+         revision = revision + 1, updated_at = ? WHERE source_id = ? AND revision = ? \
+         RETURNING revision",
+    )
+    .bind(i64::from(schema_version))
+    .bind(ciphertext)
+    .bind(now)
+    .bind(source_id)
+    .bind(expected_revision)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(revision) = revision {
+        return Ok(revision);
+    }
+    let actual =
+        sqlx::query_scalar::<_, i64>("SELECT revision FROM source_credentials WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .unwrap_or(-1);
+    Err(CatalogError::RevisionConflict {
+        scope: "credential",
+        expected: expected_revision,
+        actual,
+    })
+}
+
+async fn delete_credential_in_transaction(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    expected_revision: i64,
+) -> Result<(), CatalogError> {
+    let changed =
+        sqlx::query("DELETE FROM source_credentials WHERE source_id = ? AND revision = ?")
+            .bind(source_id)
+            .bind(expected_revision)
+            .execute(&mut **transaction)
+            .await?
+            .rows_affected();
+    if changed == 1 {
+        return Ok(());
+    }
+    let actual =
+        sqlx::query_scalar::<_, i64>("SELECT revision FROM source_credentials WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .unwrap_or(-1);
+    Err(CatalogError::RevisionConflict {
+        scope: "credential",
+        expected: expected_revision,
+        actual,
+    })
 }
 
 async fn source_path_snapshot(
@@ -3498,6 +4087,11 @@ mod tests {
             ToolBinding::OpenapiV1(binding) => serde_json::to_string(binding)
                 .expect("binding should serialize")
                 .len(),
+            ToolBinding::McpHttpV1(binding) | ToolBinding::McpStdioV1(binding) => {
+                serde_json::to_string(binding)
+                    .expect("binding should serialize")
+                    .len()
+            }
         };
         limits.aggregate = snapshot_bytes + binding_bytes - 1;
         assert!(prepare_snapshot_with_limits(snapshot.clone(), limits).is_ok());

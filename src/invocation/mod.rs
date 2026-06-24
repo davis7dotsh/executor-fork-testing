@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
+    pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -125,9 +126,42 @@ pub struct ToolCallService {
     discovery_slots: Arc<Semaphore>,
     execution_slots: Arc<Semaphore>,
     in_flight_approvals: Arc<Mutex<HashSet<String>>>,
+    in_flight_mcp_settlements: Arc<Mutex<HashSet<String>>>,
     deferred_execution_cancellations: Arc<RwLock<HashSet<String>>>,
     execution_stopping_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    #[cfg(test)]
+    approval_cancellation_race_hook: Arc<Mutex<Option<Arc<ApprovalCancellationRaceHook>>>>,
+    #[cfg(test)]
+    approved_execution_hook: Arc<Mutex<Option<Arc<ApprovedExecutionHook>>>>,
+    #[cfg(test)]
+    cancel_execution_hook: Arc<Mutex<Option<Arc<CancelExecutionHook>>>>,
     background_tasks: TaskTracker,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ApprovalCancellationRaceHook {
+    decision_read_acquired: Notify,
+    cancellation_write_queued: Notify,
+    release_decision: Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ApprovedExecutionHook {
+    started: Notify,
+    release: Notify,
+    dispatches: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CancelExecutionHook {
+    failures: std::sync::atomic::AtomicUsize,
+    block_retries: AtomicBool,
+    retry_waiters: std::sync::atomic::AtomicUsize,
+    retry_waiting: Notify,
+    release_retries: Notify,
 }
 
 #[derive(Clone)]
@@ -250,6 +284,42 @@ pub(crate) struct GatewayInvokeResponse {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct McpIdempotencyRequest {
+    pub owner_api_token_id: String,
+    pub key: String,
+    pub route: String,
+    pub callable_path: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct McpIdempotencyBlob {
+    pub body: Vec<u8>,
+}
+
+pub(crate) enum McpIdempotencyClaim {
+    Fresh(Box<McpIdempotencyReservation>),
+    InProgress,
+    Replay(McpIdempotencyBlob),
+    Indeterminate,
+    Mismatch,
+}
+
+pub(crate) struct McpIdempotencyReservation {
+    guard: Option<IdempotencyReservationGuard>,
+}
+
+pub(crate) struct McpIdempotencyExecution {
+    guard: Option<IdempotencyExecutionGuard>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct McpIdempotentResponse {
+    pub result: ToolResult,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum GatewayInvokeError {
     #[error(transparent)]
@@ -266,6 +336,8 @@ pub(crate) enum GatewayInvokeError {
     InProgress,
     #[error("the idempotent invocation outcome is unknown")]
     OutcomeUnknown,
+    #[error("the idempotent invocation wait was canceled")]
+    Canceled,
 }
 
 impl From<IdempotencyError> for GatewayInvokeError {
@@ -384,6 +456,9 @@ async fn settle_abandoned_reservation(
                     .await
                     .map_err(|error| error.to_string());
             };
+            if approval.record.surface == RequestSurface::Mcp {
+                return Ok(());
+            }
             let response = match approval_required_response(&approval.record) {
                 Ok(response) => response,
                 Err(_) => {
@@ -464,6 +539,54 @@ impl Drop for IdempotencyExecutionGuard {
     }
 }
 
+impl McpIdempotencyReservation {
+    pub(crate) async fn mark_executing(
+        mut self,
+    ) -> Result<McpIdempotencyExecution, GatewayInvokeError> {
+        let mut guard = self.guard.take().ok_or_else(|| {
+            GatewayInvokeError::Idempotency(
+                "idempotency reservation was already consumed".to_owned(),
+            )
+        })?;
+        guard.store.mark_executing(&guard.record.id).await?;
+        guard.disarm();
+        Ok(McpIdempotencyExecution {
+            guard: Some(IdempotencyExecutionGuard::new(
+                guard.record.id.clone(),
+                guard.store.clone(),
+                guard.tasks.clone(),
+            )),
+        })
+    }
+}
+
+impl McpIdempotencyExecution {
+    pub(crate) async fn mark_indeterminate(mut self) -> Result<(), GatewayInvokeError> {
+        let mut guard = self.guard.take().ok_or_else(|| {
+            GatewayInvokeError::Idempotency("idempotency execution was already consumed".to_owned())
+        })?;
+        guard.store.mark_indeterminate(&guard.id).await?;
+        guard.disarm();
+        Ok(())
+    }
+
+    pub(crate) async fn complete(
+        mut self,
+        response: McpIdempotencyBlob,
+    ) -> Result<(), GatewayInvokeError> {
+        let mut guard = self.guard.take().ok_or_else(|| {
+            GatewayInvokeError::Idempotency("idempotency execution was already consumed".to_owned())
+        })?;
+        let response = mcp_blob_response(response);
+        guard
+            .store
+            .complete(&guard.id, IdempotencyResponseKind::Tool, &response, None)
+            .await?;
+        guard.disarm();
+        Ok(())
+    }
+}
+
 struct IdempotencyAskCompletionGuard {
     id: String,
     approval_id: String,
@@ -471,6 +594,37 @@ struct IdempotencyAskCompletionGuard {
     store: GatewayIdempotencyStore,
     tasks: TaskTracker,
     armed: bool,
+}
+
+struct McpApprovalSettlementGuard {
+    service: ToolCallService,
+    record: IdempotencyRecord,
+    actor: ToolActor,
+    armed: bool,
+}
+
+impl McpApprovalSettlementGuard {
+    fn new(service: ToolCallService, record: IdempotencyRecord, actor: ToolActor) -> Self {
+        Self {
+            service,
+            record,
+            actor,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for McpApprovalSettlementGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.service
+                .spawn_mcp_idempotency_settlement(self.record.clone(), self.actor.clone());
+        }
+    }
 }
 
 impl IdempotencyAskCompletionGuard {
@@ -585,14 +739,86 @@ impl ToolCallService {
             discovery_slots: Arc::new(Semaphore::new(1)),
             execution_slots: Arc::new(Semaphore::new(APPROVAL_EXECUTION_CONCURRENCY)),
             in_flight_approvals: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_mcp_settlements: Arc::new(Mutex::new(HashSet::new())),
             deferred_execution_cancellations: Arc::new(RwLock::new(HashSet::new())),
             execution_stopping_flags: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            approval_cancellation_race_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            approved_execution_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            cancel_execution_hook: Arc::new(Mutex::new(None)),
             background_tasks: TaskTracker::default(),
         }
     }
 
     pub fn approvals(&self) -> &ApprovalQueries {
         &self.approval_queries
+    }
+
+    pub(crate) async fn claim_mcp_idempotency(
+        &self,
+        request: &McpIdempotencyRequest,
+    ) -> Result<McpIdempotencyClaim, GatewayInvokeError> {
+        if !token_is_active(self.catalog.pool(), &request.owner_api_token_id)
+            .await
+            .map_err(ToolCallError::Approval)?
+        {
+            return Err(ToolCallError::Approval(ApprovalError::OwnerTokenInactive).into());
+        }
+        let claim = self
+            .idempotency
+            .claim(IdempotencyRequest {
+                owner: IdempotencyOwner {
+                    owner_api_token_id: &request.owner_api_token_id,
+                },
+                key: &request.key,
+                route: &request.route,
+                callable_path: &request.callable_path,
+                arguments: &request.arguments,
+            })
+            .await?;
+        Ok(match claim {
+            IdempotencyClaim::Fresh(record) => {
+                McpIdempotencyClaim::Fresh(Box::new(McpIdempotencyReservation {
+                    guard: Some(IdempotencyReservationGuard::new(
+                        record,
+                        self.idempotency.clone(),
+                        self.approvals.clone(),
+                        self.background_tasks.clone(),
+                    )),
+                }))
+            }
+            IdempotencyClaim::InProgress(_) => McpIdempotencyClaim::InProgress,
+            IdempotencyClaim::Replay { response, .. } => {
+                McpIdempotencyClaim::Replay(mcp_response_blob(response)?)
+            }
+            IdempotencyClaim::Indeterminate(_) => McpIdempotencyClaim::Indeterminate,
+            IdempotencyClaim::Mismatch => McpIdempotencyClaim::Mismatch,
+        })
+    }
+
+    pub(crate) async fn wait_mcp_idempotency<C>(
+        &self,
+        request: &McpIdempotencyRequest,
+        cancellation: C,
+    ) -> Result<McpIdempotencyClaim, GatewayInvokeError>
+    where
+        C: Future<Output = ()> + Send,
+    {
+        tokio::pin!(cancellation);
+        let mut delay = Duration::from_millis(10);
+        loop {
+            match self.claim_mcp_idempotency(request).await? {
+                McpIdempotencyClaim::InProgress => {}
+                terminal => return Ok(terminal),
+            }
+            tokio::select! {
+                () = &mut cancellation => return Err(GatewayInvokeError::Canceled),
+                () = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(Duration::from_millis(250));
+        }
     }
 
     pub(crate) fn discovery_slots(&self) -> Arc<Semaphore> {
@@ -678,6 +904,7 @@ impl ToolCallService {
             .recover_startup()
             .await
             .map_err(idempotency_startup_error)?;
+        let mut mcp_settlements = Vec::new();
         for reservation in idempotency_recovery.reserved {
             let approval_id = self
                 .idempotency
@@ -709,6 +936,27 @@ impl ToolCallService {
                     continue;
                 }
             };
+            if approval.record.surface == RequestSurface::Mcp {
+                if approval.record.status == ApprovalStatus::Executing {
+                    self.idempotency
+                        .mark_indeterminate(&reservation.id)
+                        .await
+                        .map_err(idempotency_startup_error)?;
+                    continue;
+                }
+                let Some(actor_api_token_id) = approval.record.actor_api_token_id.clone() else {
+                    terminalize_idempotency(&self.idempotency, &reservation.id).await;
+                    continue;
+                };
+                mcp_settlements.push((
+                    reservation,
+                    ToolActor::api_token(
+                        actor_api_token_id,
+                        approval.record.actor_name_snapshot.clone(),
+                    ),
+                ));
+                continue;
+            }
             let response = match approval_required_response(&approval.record) {
                 Ok(response) => response,
                 Err(_) => {
@@ -741,6 +989,9 @@ impl ToolCallService {
             {
                 self.spawn_approved(approval_id.clone());
             }
+        }
+        for (reservation, actor) in mcp_settlements {
+            self.spawn_mcp_idempotency_settlement(reservation, actor);
         }
         Ok(())
     }
@@ -920,6 +1171,228 @@ impl ToolCallService {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn submit_mcp_idempotent<C>(
+        &self,
+        mut call: ToolCall,
+        route: &str,
+        key: &str,
+        cancellation: C,
+    ) -> Result<McpIdempotentResponse, GatewayInvokeError>
+    where
+        C: Future<Output = ()> + Send,
+    {
+        if call.surface != RequestSurface::Mcp {
+            return Err(IdempotencyError::InvalidMetadata.into());
+        }
+        let actor_api_token_id = call
+            .actor
+            .api_token_id()
+            .ok_or(IdempotencyError::InvalidMetadata)?
+            .to_owned();
+        if !token_is_active(self.catalog.pool(), &actor_api_token_id)
+            .await
+            .map_err(ToolCallError::Approval)?
+        {
+            return Err(ToolCallError::Approval(ApprovalError::OwnerTokenInactive).into());
+        }
+        let encoded_arguments =
+            serde_json::to_vec(&call.arguments).map_err(|_| ToolCallError::InvalidArguments)?;
+        if encoded_arguments.len() > MAX_ARGUMENT_BYTES {
+            return Err(ToolCallError::ArgumentsTooLarge.into());
+        }
+        let request_path = idempotency::canonical_callable_path(&call.path)?;
+        tokio::pin!(cancellation);
+        let request = || IdempotencyRequest {
+            owner: IdempotencyOwner {
+                owner_api_token_id: &actor_api_token_id,
+            },
+            key,
+            route,
+            callable_path: &request_path,
+            arguments: &call.arguments,
+        };
+        if let Some(claim) = self.idempotency.lookup(request()).await?
+            && let Some(response) = self
+                .resolve_mcp_idempotency_claim(claim, &call, &request, cancellation.as_mut(), true)
+                .await?
+        {
+            return Ok(response);
+        }
+
+        let (preflight, record) = loop {
+            let preflight = self
+                .catalog
+                .preflight_invocation(&call.path)
+                .await
+                .map_err(ToolCallError::Catalog)?;
+            if !preflight.arguments_are_valid(&call.arguments) {
+                return Err(ToolCallError::InvalidArguments.into());
+            }
+            match self.idempotency.claim(request()).await? {
+                IdempotencyClaim::Fresh(record) => break (preflight, record),
+                existing => {
+                    drop(preflight);
+                    if let Some(response) = self
+                        .resolve_mcp_idempotency_claim(
+                            existing,
+                            &call,
+                            &request,
+                            cancellation.as_mut(),
+                            true,
+                        )
+                        .await?
+                    {
+                        return Ok(response);
+                    }
+                }
+            }
+        };
+        let token = preflight.revisions().clone();
+        let lookup = preflight.lookup().clone();
+        let mut reservation = IdempotencyReservationGuard::new(
+            record,
+            self.idempotency.clone(),
+            self.approvals.clone(),
+            self.background_tasks.clone(),
+        );
+        call.execution_id = idempotency_execution_id(&reservation.record.id);
+        call.call_id = "gateway".to_owned();
+
+        if lookup.requires_approval {
+            let input_schema = preflight.input_schema().clone();
+            drop(preflight);
+            let invocation_snapshot = json!({
+                "version": 1,
+                "requestId": call.request_id.clone(),
+                "actorKind": call.actor.kind(),
+                "actorId": call.actor.id(),
+                "actorApiTokenId": call.actor.api_token_id(),
+                "surface": call.surface,
+                "executionId": call.execution_id.clone(),
+                "callId": call.call_id.clone(),
+                "path": lookup.callable_path.clone(),
+                "sourceId": lookup.source_id.clone(),
+                "toolId": lookup.tool_id.clone(),
+            });
+            let pending = self
+                .approvals
+                .create(NewApproval {
+                    execution_id: call.execution_id.clone(),
+                    call_id: call.call_id.clone(),
+                    worker_generation: call.worker_generation,
+                    actor: call.actor.clone(),
+                    surface: call.surface,
+                    callable_path_snapshot: lookup.callable_path,
+                    source_display_name_snapshot: Some(lookup.source_display_name),
+                    tool_display_name_snapshot: Some(lookup.tool_display_name),
+                    mode_provenance: lookup.mode_provenance,
+                    revisions: token,
+                    arguments: call.arguments.clone(),
+                    input_schema,
+                    output_schema: None,
+                    invocation_snapshot,
+                })
+                .await
+                .map_err(ToolCallError::Approval)?;
+            let approval = ApprovalRequired {
+                delivery: pending.delivery_pin.then(|| ApprovalDeliveryTicket {
+                    identity: Some(ApprovalDeliveryIdentity {
+                        approval_id: pending.record.id.clone(),
+                        actor: call.actor.clone(),
+                        execution_id: call.execution_id.clone(),
+                        call_id: call.call_id.clone(),
+                    }),
+                    approvals: self.approvals.clone(),
+                    notifications: self.approval_notifications.clone(),
+                    tasks: self.background_tasks.clone(),
+                }),
+                record: Box::new(pending.record),
+            };
+            reservation.disarm();
+            return self
+                .finish_mcp_idempotent_approval(
+                    &reservation.record,
+                    &call,
+                    approval,
+                    cancellation.as_mut(),
+                    false,
+                )
+                .await;
+        }
+
+        drop(preflight);
+        let lease = match self
+            .catalog
+            .revalidate_invocation(&token)
+            .await
+            .map_err(ToolCallError::Catalog)?
+        {
+            Some(lease) => lease,
+            None => {
+                self.idempotency
+                    .release_reserved(&reservation.record.id)
+                    .await?;
+                reservation.disarm();
+                return Err(ToolCallError::Stale.into());
+            }
+        };
+        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.idempotency
+                    .release_reserved(&reservation.record.id)
+                    .await?;
+                reservation.disarm();
+                return Err(error.into());
+            }
+        };
+        self.idempotency
+            .mark_executing(&reservation.record.id)
+            .await?;
+        reservation.disarm();
+        let mut execution_guard = IdempotencyExecutionGuard::new(
+            reservation.record.id.clone(),
+            self.idempotency.clone(),
+            self.background_tasks.clone(),
+        );
+        let execution = execute_prepared(&self.protocols, prepared);
+        tokio::pin!(execution);
+        let execution_result = tokio::select! {
+            result = &mut execution => result,
+            () = &mut cancellation => {
+                self.idempotency
+                    .mark_indeterminate(&reservation.record.id)
+                    .await?;
+                execution_guard.disarm();
+                return Err(GatewayInvokeError::Canceled);
+            }
+        };
+        let result = match execution_result {
+            Ok(result) => result,
+            Err(error) => {
+                self.idempotency
+                    .mark_indeterminate(&reservation.record.id)
+                    .await?;
+                execution_guard.disarm();
+                return Err(error.into());
+            }
+        };
+        let response = tool_result_response(&result)?;
+        self.idempotency
+            .complete(
+                &reservation.record.id,
+                IdempotencyResponseKind::Tool,
+                &response,
+                None,
+            )
+            .await?;
+        execution_guard.disarm();
+        Ok(McpIdempotentResponse {
+            result,
+            replayed: false,
+        })
     }
 
     pub(crate) async fn submit_gateway_idempotent(
@@ -1321,6 +1794,274 @@ impl ToolCallService {
         })
     }
 
+    async fn resolve_mcp_idempotency_claim<'a, C, F>(
+        &self,
+        mut claim: IdempotencyClaim,
+        call: &ToolCall,
+        request: &F,
+        mut cancellation: Pin<&mut C>,
+        replayed: bool,
+    ) -> Result<Option<McpIdempotentResponse>, GatewayInvokeError>
+    where
+        C: Future<Output = ()> + Send,
+        F: Fn() -> IdempotencyRequest<'a>,
+    {
+        let mut delay = Duration::from_millis(10);
+        loop {
+            match claim {
+                IdempotencyClaim::Fresh(_) => return Ok(None),
+                IdempotencyClaim::Mismatch => return Err(GatewayInvokeError::KeyMismatch),
+                IdempotencyClaim::Indeterminate(_) => {
+                    return Err(GatewayInvokeError::OutcomeUnknown);
+                }
+                IdempotencyClaim::Replay { record, response } => {
+                    if record.response_kind == Some(IdempotencyResponseKind::Tool) {
+                        return Ok(Some(McpIdempotentResponse {
+                            result: tool_result_from_response(&response)?,
+                            replayed,
+                        }));
+                    }
+                    let approval = self.idempotent_approval(&record, call).await?;
+                    return self
+                        .finish_mcp_idempotent_approval(
+                            &record,
+                            call,
+                            approval,
+                            cancellation,
+                            replayed,
+                        )
+                        .await
+                        .map(Some);
+                }
+                IdempotencyClaim::InProgress(record) => {
+                    if record.state == idempotency::IdempotencyState::Reserved
+                        && let Some(CorrelatedApproval::Live(_)) =
+                            self.idempotency.correlated_approval_id(&record).await?
+                    {
+                        let approval = self.idempotent_approval(&record, call).await?;
+                        return self
+                            .finish_mcp_idempotent_approval(
+                                &record,
+                                call,
+                                approval,
+                                cancellation,
+                                replayed,
+                            )
+                            .await
+                            .map(Some);
+                    }
+                }
+            }
+            tokio::select! {
+                () = &mut cancellation => return Err(GatewayInvokeError::Canceled),
+                () = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(Duration::from_millis(250));
+            let Some(next_claim) = self.idempotency.lookup(request()).await? else {
+                return Ok(None);
+            };
+            claim = next_claim;
+        }
+    }
+
+    async fn idempotent_approval(
+        &self,
+        record: &IdempotencyRecord,
+        call: &ToolCall,
+    ) -> Result<ApprovalRequired, GatewayInvokeError> {
+        let approval_id = match self.idempotency.correlated_approval_id(record).await? {
+            Some(CorrelatedApproval::Live(approval_id)) => approval_id,
+            Some(CorrelatedApproval::Retired) | None => {
+                return Err(GatewayInvokeError::OutcomeUnknown);
+            }
+        };
+        let detail = self
+            .approvals
+            .get_for_actor(&approval_id, &call.actor)
+            .await
+            .map_err(ToolCallError::Approval)?
+            .ok_or(GatewayInvokeError::OutcomeUnknown)?;
+        if detail.record.execution_id != idempotency_execution_id(&record.id)
+            || detail.record.call_id != "gateway"
+            || detail.record.surface != RequestSurface::Mcp
+        {
+            return Err(GatewayInvokeError::OutcomeUnknown);
+        }
+        Ok(ApprovalRequired {
+            record: Box::new(detail.record),
+            delivery: None,
+        })
+    }
+
+    async fn finish_mcp_idempotent_approval<C>(
+        &self,
+        record: &IdempotencyRecord,
+        call: &ToolCall,
+        approval: ApprovalRequired,
+        cancellation: Pin<&mut C>,
+        replayed: bool,
+    ) -> Result<McpIdempotentResponse, GatewayInvokeError>
+    where
+        C: Future<Output = ()> + Send,
+    {
+        let mut settlement_guard =
+            McpApprovalSettlementGuard::new(self.clone(), record.clone(), call.actor.clone());
+        let approval_id = approval.id.clone();
+        let approval_execution_id = approval.execution_id.clone();
+        let idempotency_execution_id = idempotency_execution_id(&record.id);
+        let approval_wait = self.wait_for_approval(
+            approval,
+            &call.actor,
+            &idempotency_execution_id,
+            "gateway",
+            cancellation,
+        );
+        let idempotency_failure = self.wait_for_mcp_indeterminate(&record.id);
+        tokio::pin!(approval_wait);
+        tokio::pin!(idempotency_failure);
+        let approval_result = tokio::select! {
+            detail = &mut approval_wait => detail,
+            result = &mut idempotency_failure => {
+                result?;
+                return Err(GatewayInvokeError::OutcomeUnknown);
+            }
+        };
+        let detail = match approval_result {
+            Ok(detail) => detail,
+            Err(ApprovalWaitError::Approval(error)) => {
+                return Err(GatewayInvokeError::ToolCall(ToolCallError::Approval(error)));
+            }
+            Err(ApprovalWaitError::Canceled) => {
+                self.cancel_mcp_approval_execution(&approval_execution_id)
+                    .await
+                    .map_err(ToolCallError::Approval)?;
+                self.notify_approval(&approval_id);
+                if let Some(detail) = self
+                    .approvals
+                    .get_for_actor(&approval_id, &call.actor)
+                    .await
+                    .map_err(ToolCallError::Approval)?
+                {
+                    if detail.record.status.is_terminal() {
+                        let result = terminal_approval_result(detail.record.status, detail.result)?;
+                        self.complete_mcp_approval_result(record, &result).await?;
+                        settlement_guard.disarm();
+                    } else if detail.record.status == ApprovalStatus::Executing {
+                        match self.idempotency.mark_indeterminate(&record.id).await {
+                            Ok(_) | Err(IdempotencyError::InvalidTransition("indeterminate")) => {}
+                            Err(IdempotencyError::InvalidTransition("completed")) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        settlement_guard.disarm();
+                    }
+                }
+                return Err(GatewayInvokeError::Canceled);
+            }
+        };
+        let result = terminal_approval_result(detail.record.status, detail.result)?;
+        self.complete_mcp_approval_result(record, &result).await?;
+        settlement_guard.disarm();
+        Ok(McpIdempotentResponse { result, replayed })
+    }
+
+    async fn wait_for_mcp_indeterminate(&self, id: &str) -> Result<(), GatewayInvokeError> {
+        loop {
+            match self.idempotency.state(id).await? {
+                Some(idempotency::IdempotencyState::Indeterminate) => return Ok(()),
+                Some(
+                    idempotency::IdempotencyState::Reserved
+                    | idempotency::IdempotencyState::Executing
+                    | idempotency::IdempotencyState::Completed,
+                ) => {}
+                None => return Err(GatewayInvokeError::OutcomeUnknown),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn complete_mcp_approval_result(
+        &self,
+        record: &IdempotencyRecord,
+        result: &ToolResult,
+    ) -> Result<(), GatewayInvokeError> {
+        if !matches!(
+            record.state,
+            idempotency::IdempotencyState::Reserved | idempotency::IdempotencyState::Executing
+        ) {
+            return Ok(());
+        }
+        let response = tool_result_response(result)?;
+        match self
+            .idempotency
+            .complete(&record.id, IdempotencyResponseKind::Tool, &response, None)
+            .await
+        {
+            Ok(_) | Err(IdempotencyError::InvalidTransition("completed")) => Ok(()),
+            Err(IdempotencyError::InvalidTransition("indeterminate")) => {
+                Err(GatewayInvokeError::OutcomeUnknown)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn spawn_mcp_idempotency_settlement(&self, record: IdempotencyRecord, actor: ToolActor) {
+        if !self
+            .in_flight_mcp_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.id.clone())
+        {
+            return;
+        }
+        let service = self.clone();
+        let settlement_id = record.id.clone();
+        let spawned = self.background_tasks.spawn(async move {
+            let call = ToolCall {
+                request_id: format!("mcp-idempotency-settlement:{}", record.id),
+                actor,
+                surface: RequestSurface::Mcp,
+                execution_id: idempotency_execution_id(&record.id),
+                call_id: "gateway".to_owned(),
+                worker_generation: 0,
+                path: "executor.settlement".to_owned(),
+                arguments: Value::Null,
+            };
+            let result = async {
+                let approval = service.idempotent_approval(&record, &call).await?;
+                let cancellation = std::future::pending::<()>();
+                tokio::pin!(cancellation);
+                service
+                    .finish_mcp_idempotent_approval(
+                        &record,
+                        &call,
+                        approval,
+                        cancellation.as_mut(),
+                        false,
+                    )
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    idempotency_id = record.id,
+                    error = %error,
+                    "MCP approval idempotency settlement stopped"
+                );
+            }
+            service
+                .in_flight_mcp_settlements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&record.id);
+        });
+        if !spawned {
+            self.in_flight_mcp_settlements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&settlement_id);
+        }
+    }
+
     async fn reconcile_idempotent_approval(
         &self,
         record: &IdempotencyRecord,
@@ -1572,6 +2313,20 @@ impl ToolCallService {
         } else {
             None
         };
+        #[cfg(test)]
+        let race_hook = {
+            self.approval_cancellation_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        if cancellation_guard.is_some()
+            && let Some(hook) = race_hook
+        {
+            hook.decision_read_acquired.notify_one();
+            hook.release_decision.notified().await;
+        }
         let result = self
             .approvals
             .decide(
@@ -1598,12 +2353,70 @@ impl ToolCallService {
     }
 
     pub async fn cancel_execution(&self, execution_id: &str) -> Result<u64, ApprovalError> {
+        #[cfg(test)]
+        let cancel_hook = {
+            self.cancel_execution_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(hook) = cancel_hook {
+            if hook
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                hook.block_retries.store(true, Ordering::SeqCst);
+                return Err(ApprovalError::Database(sqlx::Error::Protocol(
+                    "forced cancellation persistence failure".to_owned(),
+                )));
+            }
+            if hook.block_retries.load(Ordering::SeqCst) {
+                let release = hook.release_retries.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                hook.retry_waiters.fetch_add(1, Ordering::SeqCst);
+                hook.retry_waiting.notify_one();
+                release.await;
+            }
+        }
         let affected = self.approvals.cancel_execution(execution_id).await?;
         if affected > 0 {
             self.schedule_approval_log_flush();
             self.global_approval_notify.notify_waiters();
         }
         Ok(affected)
+    }
+
+    async fn cancel_mcp_approval_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<u64, ApprovalError> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .approval_cancellation_race_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook.cancellation_write_queued.notify_one();
+        }
+        let mut fence = self.deferred_execution_cancellations.write().await;
+        let stopping = self.execution_stopping_flag(execution_id);
+        stopping.store(true, Ordering::Release);
+        fence.insert(execution_id.to_owned());
+        let result = self.cancel_execution(execution_id).await;
+        if result.is_ok() {
+            fence.remove(execution_id);
+            self.clear_execution_stopping_flag(execution_id);
+        } else {
+            drop(fence);
+            self.defer_execution_cancellation(execution_id);
+        }
+        result
     }
 
     pub(crate) async fn mark_execution_lost(&self, execution_id: &str) {
@@ -1641,6 +2454,10 @@ impl ToolCallService {
                 }
             }
         }
+        self.defer_execution_cancellation(execution_id);
+    }
+
+    fn defer_execution_cancellation(&self, execution_id: &str) {
         let service = self.clone();
         let deferred_execution_id = execution_id.to_owned();
         if !self.background_tasks.spawn(async move {
@@ -2002,7 +2819,6 @@ impl ToolCallService {
             self.wait_for_delivery_release(approval_id).await?;
             return Ok(());
         }
-        drop(cancellation_guard);
         if !lease.arguments_are_valid(&snapshot.arguments) {
             let result = error_result(&ToolCallError::InvalidArguments);
             self.approvals
@@ -2019,7 +2835,61 @@ impl ToolCallService {
             self.wait_for_delivery_release(approval_id).await?;
             return Ok(());
         }
+        let mut mcp_idempotency_execution = if record.surface == RequestSurface::Mcp {
+            let id = record
+                .execution_id
+                .strip_prefix("gateway-idempotency:")
+                .filter(|id| !id.is_empty() && record.call_id == "gateway")
+                .ok_or_else(|| ToolCallError::Adapter {
+                    code: "idempotency_metadata_invalid",
+                    message: "The MCP approval idempotency metadata is invalid.".to_owned(),
+                })?
+                .to_owned();
+            self.idempotency
+                .mark_executing(&id)
+                .await
+                .map_err(idempotency_tool_call_error)?;
+            Some(IdempotencyExecutionGuard::new(
+                id,
+                self.idempotency.clone(),
+                self.background_tasks.clone(),
+            ))
+        } else {
+            None
+        };
+        drop(cancellation_guard);
+        #[cfg(test)]
+        let execution_hook = {
+            self.approved_execution_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        let result = if let Some(hook) = execution_hook {
+            hook.dispatches.fetch_add(1, Ordering::SeqCst);
+            hook.started.notify_one();
+            hook.release.notified().await;
+            Ok(ToolResult {
+                ok: true,
+                data: Some(json!({ "ok": true })),
+                error: None,
+                http: None,
+            })
+        } else {
+            execute_with_lease(&self.protocols, lease, &snapshot.arguments).await
+        };
+        #[cfg(not(test))]
         let result = execute_with_lease(&self.protocols, lease, &snapshot.arguments).await;
+        if result.is_err()
+            && let Some(execution) = mcp_idempotency_execution.as_mut()
+        {
+            self.idempotency
+                .mark_indeterminate(&execution.id)
+                .await
+                .map_err(idempotency_tool_call_error)?;
+            execution.disarm();
+        }
         let (tool_result, outcome, failure_code) = match result {
             Ok(result) if result.ok => (result, ExecutionOutcome::Succeeded, None),
             Ok(result) => (
@@ -2034,7 +2904,8 @@ impl ToolCallService {
             ),
         };
         let result_json = serde_json::to_value(&tool_result).map_err(ApprovalError::Json)?;
-        self.approvals
+        let approval_finish = self
+            .approvals
             .finish(
                 approval_id,
                 snapshot.record.revision,
@@ -2042,7 +2913,44 @@ impl ToolCallService {
                 &result_json,
                 failure_code,
             )
-            .await?;
+            .await;
+        if let Err(error) = approval_finish {
+            if let Some(execution) = mcp_idempotency_execution.as_mut()
+                && execution.armed
+            {
+                self.idempotency
+                    .mark_indeterminate(&execution.id)
+                    .await
+                    .map_err(idempotency_tool_call_error)?;
+                execution.disarm();
+            }
+            return Err(error.into());
+        }
+        if let Some(execution) = mcp_idempotency_execution.as_mut()
+            && execution.armed
+        {
+            let response =
+                tool_result_response(&tool_result).map_err(idempotency_tool_call_error)?;
+            match self
+                .idempotency
+                .complete(
+                    &execution.id,
+                    IdempotencyResponseKind::Tool,
+                    &response,
+                    None,
+                )
+                .await
+            {
+                Ok(_) | Err(IdempotencyError::InvalidTransition("completed")) => {
+                    execution.disarm();
+                }
+                Err(error) => {
+                    self.schedule_approval_log_flush();
+                    self.notify_approval(approval_id);
+                    return Err(idempotency_tool_call_error(error));
+                }
+            }
+        }
         self.schedule_approval_log_flush();
         self.notify_approval(approval_id);
         self.wait_for_delivery_release(approval_id).await?;
@@ -2224,6 +3132,14 @@ async fn execute_prepared(
         .await
         .map_err(|error| match error {
             ProtocolInvocationError::Outbound(error) => ToolCallError::Outbound(error),
+            ProtocolInvocationError::Mcp(error) => ToolCallError::Adapter {
+                code: if error.outcome_unknown() {
+                    "mcp_outcome_unknown"
+                } else {
+                    "mcp_invocation_failed"
+                },
+                message: "The upstream MCP tool call could not be completed safely.".to_owned(),
+            },
         })?;
     let result = ToolResult {
         ok: response.ok,
@@ -2250,6 +3166,94 @@ fn tool_result_response(result: &ToolResult) -> Result<IdempotencyResponse, Idem
         headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
         body: serde_json::to_vec(result)?,
     })
+}
+
+fn tool_result_from_response(
+    response: &IdempotencyResponse,
+) -> Result<ToolResult, GatewayInvokeError> {
+    if response.status != 200 {
+        return Err(GatewayInvokeError::Idempotency(
+            "stored MCP idempotency response has an invalid status".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(IdempotencyError::Json)
+        .map_err(GatewayInvokeError::from)
+}
+
+fn mcp_blob_response(response: McpIdempotencyBlob) -> IdempotencyResponse {
+    IdempotencyResponse {
+        status: 200,
+        headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+        body: response.body,
+    }
+}
+
+fn mcp_response_blob(
+    response: IdempotencyResponse,
+) -> Result<McpIdempotencyBlob, GatewayInvokeError> {
+    if response.status != 200 {
+        return Err(GatewayInvokeError::Idempotency(
+            "stored MCP idempotency response has an invalid status".to_owned(),
+        ));
+    }
+    Ok(McpIdempotencyBlob {
+        body: response.body,
+    })
+}
+
+fn terminal_approval_result(
+    status: ApprovalStatus,
+    result: Option<Value>,
+) -> Result<ToolResult, GatewayInvokeError> {
+    match status {
+        ApprovalStatus::Succeeded | ApprovalStatus::Failed => result
+            .ok_or_else(|| {
+                GatewayInvokeError::Idempotency("terminal approval result is missing".to_owned())
+            })
+            .and_then(|result| {
+                serde_json::from_value(result)
+                    .map_err(IdempotencyError::Json)
+                    .map_err(GatewayInvokeError::from)
+            }),
+        ApprovalStatus::Denied => Ok(approval_failure_result(
+            "approval_denied",
+            "The tool call was denied.",
+        )),
+        ApprovalStatus::Expired => Ok(approval_failure_result(
+            "approval_expired",
+            "The tool approval expired.",
+        )),
+        ApprovalStatus::Canceled => Ok(approval_failure_result(
+            "approval_canceled",
+            "The tool call was canceled.",
+        )),
+        ApprovalStatus::Stale => Ok(approval_failure_result(
+            "approval_stale",
+            "The tool changed before approval completed.",
+        )),
+        ApprovalStatus::Interrupted => Ok(approval_failure_result(
+            "approval_interrupted",
+            "The approved tool call was interrupted.",
+        )),
+        ApprovalStatus::Pending | ApprovalStatus::Approved | ApprovalStatus::Executing => {
+            Err(GatewayInvokeError::Idempotency(
+                "approval wait returned a nonterminal state".to_owned(),
+            ))
+        }
+    }
+}
+
+fn approval_failure_result(code: &str, message: &str) -> ToolResult {
+    ToolResult {
+        ok: false,
+        data: None,
+        error: Some(PublicToolError {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }),
+        http: None,
+    }
 }
 
 fn approval_required_response(
@@ -2314,6 +3318,13 @@ fn idempotency_startup_error(error: IdempotencyError) -> ApprovalError {
     }
 }
 
+fn idempotency_tool_call_error(_error: IdempotencyError) -> ToolCallError {
+    ToolCallError::Adapter {
+        code: "idempotency_failed",
+        message: "The idempotent tool call could not be completed safely.".to_owned(),
+    }
+}
+
 fn error_code(error: &ToolCallError) -> &'static str {
     match error {
         ToolCallError::Approval(_) => "approval_error",
@@ -2362,14 +3373,113 @@ fn error_result(error: &ToolCallError) -> ToolResult {
 
 #[cfg(test)]
 mod idempotency_guard_tests {
-    use std::{future::pending, time::Duration};
+    use std::{collections::BTreeMap, future::pending, time::Duration};
 
     use serde_json::json;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::*;
+    use crate::{
+        AppConfig, ExecutorApp,
+        catalog::{
+            ArtifactKind, AuditContext, CreateSource, CredentialPayload, InitialCatalogSnapshot,
+            SourceKind, StagedArtifact, StagedTool, StagedToolBinding, ToolBinding, ToolMode,
+        },
+        openapi::{OpenApiBinding, OpenApiSecurityAlternative},
+    };
 
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+    async fn app_with_mcp_ask_tool_at(server_url: &str) -> (tempfile::TempDir, ExecutorApp) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("Executor should open");
+        sqlx::query(
+            "INSERT INTO api_tokens \
+             (id, name, token_digest, token_prefix, token_suffix, created_at) \
+             VALUES ('mcp-owner', 'MCP owner', x'010203', 'exr_test', 'test', 1)",
+        )
+        .execute(app.pool())
+        .await
+        .expect("owner token");
+        sqlx::query(
+            "INSERT INTO admins (id, username, password_hash, created_at) \
+             VALUES (1, 'admin', 'unused', 1)",
+        )
+        .execute(app.pool())
+        .await
+        .expect("admin");
+        app.catalog()
+            .create_source_with_catalog(
+                CreateSource {
+                    kind: SourceKind::Openapi,
+                    preferred_slug: "mcp-approval".to_owned(),
+                    display_name: "MCP approval source".to_owned(),
+                    description: None,
+                    configuration: json!({
+                        "spec": { "type": "inline" },
+                        "allowPrivateNetwork": true
+                    })
+                    .as_object()
+                    .expect("source configuration should be an object")
+                    .clone(),
+                },
+                &CredentialPayload {
+                    schema_version: 1,
+                    payload: json!({
+                        "locator": { "type": "inline" },
+                        "credentials": { "schemes": {} }
+                    }),
+                },
+                InitialCatalogSnapshot {
+                    artifacts: vec![StagedArtifact {
+                        kind: ArtifactKind::OpenapiDocument,
+                        stable_key: "document".to_owned(),
+                        content: json!({ "openapi": "3.1.0" }),
+                    }],
+                    tools: vec![StagedTool {
+                        stable_key: "write".to_owned(),
+                        preferred_name: "write".to_owned(),
+                        display_name: "Write".to_owned(),
+                        description: None,
+                        input_schema: json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["value"],
+                            "properties": { "value": { "type": "string" } }
+                        }),
+                        output_schema: None,
+                        input_typescript: None,
+                        output_typescript: None,
+                        typescript_definitions: BTreeMap::new(),
+                        intrinsic_mode: ToolMode::Ask,
+                    }],
+                },
+                vec![StagedToolBinding {
+                    stable_key: "write".to_owned(),
+                    binding: ToolBinding::OpenapiV1(OpenApiBinding {
+                        version: 1,
+                        method: "POST".to_owned(),
+                        path_template: "/write".to_owned(),
+                        server_url: server_url.to_owned(),
+                        parameters: Vec::new(),
+                        request_body: None,
+                        security: vec![OpenApiSecurityAlternative {
+                            requirements: Vec::new(),
+                        }],
+                    }),
+                }],
+                AuditContext::system(Some("mcp-approval-test")),
+            )
+            .await
+            .expect("Ask tool should import");
+        (directory, app)
+    }
 
     #[tokio::test]
     async fn canceled_pre_execution_task_releases_its_reservation() {
@@ -2594,6 +3704,719 @@ mod idempotency_guard_tests {
         })
         .await
         .expect("dropped Ask completion is durably finished");
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_mcp_ask_cancellation_blocks_later_approval_and_replays_canceled() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let upstream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_count = upstream_count.clone();
+        let (stop_server, mut server_stopped) = oneshot::channel::<()>();
+        let upstream = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut server_stopped => break,
+                    accepted = listener.accept() => {
+                        let (mut connection, _) = accepted.expect("upstream should accept");
+                        server_count.fetch_add(1, Ordering::SeqCst);
+                        let mut request = vec![0_u8; 4096];
+                        let _ = connection.read(&mut request).await;
+                        let _ = connection.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                        ).await;
+                    }
+                }
+            }
+        });
+        let (_directory, app) = app_with_mcp_ask_tool_at(&server_url).await;
+        let race_hook = Arc::new(ApprovalCancellationRaceHook::default());
+        *app.tool_calls()
+            .approval_cancellation_race_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(race_hook.clone());
+        let service = app.tool_calls().clone();
+        let call = ToolCall {
+            request_id: "mcp-ask-request".to_owned(),
+            actor: ToolActor::api_token("mcp-owner", Some("MCP owner".to_owned())),
+            surface: RequestSurface::Mcp,
+            execution_id: "downstream-session".to_owned(),
+            call_id: "rpc-42".to_owned(),
+            worker_generation: 0,
+            path: "mcp_approval.write".to_owned(),
+            arguments: json!({ "value": "write once" }),
+        };
+        let retry_call = call.clone();
+        let (cancel, canceled) = oneshot::channel::<()>();
+        let submission = tokio::spawn(async move {
+            service
+                .submit_mcp_idempotent(call, "POST /mcp tools/call", "session:rpc-42", async {
+                    let _ = canceled.await;
+                })
+                .await
+        });
+
+        let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(approval_id) = sqlx::query_scalar::<_, String>(
+                    "SELECT approval_id FROM approval_correlations \
+                     WHERE execution_id LIKE 'gateway-idempotency:%' AND call_id = 'gateway'",
+                )
+                .fetch_optional(app.pool())
+                .await
+                .expect("approval correlation should read")
+                {
+                    break approval_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval correlation should appear");
+        let pending_approval = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval_id)
+            .await
+            .expect("approval should read before cancellation")
+            .expect("approval should exist before cancellation");
+        let decision_service = app.tool_calls().clone();
+        let decision_approval_id = approval_id.clone();
+        let decision = tokio::spawn(async move {
+            decision_service
+                .decide(
+                    &decision_approval_id,
+                    "approve-racing-cancel",
+                    pending_approval.record.revision,
+                    ApprovalDecision::Approve,
+                    1,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            race_hook.decision_read_acquired.notified(),
+        )
+        .await
+        .expect("approval should hold the cancellation read fence");
+        cancel.send(()).expect("wait cancellation should send");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let delivery_pin = sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS(SELECT 1 FROM approval_delivery_pins WHERE approval_id = ?)",
+                )
+                .bind(&approval_id)
+                .fetch_one(app.pool())
+                .await
+                .expect("approval delivery pin should read");
+                if delivery_pin == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit cancellation should release delivery before fencing execution");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            race_hook.cancellation_write_queued.notified(),
+        )
+        .await
+        .expect("cancellation should queue behind the approval read fence");
+        race_hook.release_decision.notify_one();
+        let canceled = submission
+            .await
+            .expect("submission task should not panic")
+            .expect_err("submission wait should be canceled");
+        assert!(matches!(canceled, GatewayInvokeError::Canceled));
+
+        let _ = decision.await.expect("decision task should not panic");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let after_later_approval = app
+                    .tool_calls()
+                    .approvals()
+                    .get_admin(&approval_id)
+                    .await
+                    .expect("approval should reread")
+                    .expect("approval should remain stored");
+                if after_later_approval.record.status == ApprovalStatus::Canceled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation should win before approved execution starts");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM gateway_invocation_idempotency \
+                     WHERE owner_api_token_id = 'mcp-owner'",
+                )
+                .fetch_one(app.pool())
+                .await
+                .expect("idempotency state should read");
+                if state == "completed" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settlement worker should complete the idempotency row");
+
+        let replay = app
+            .tool_calls()
+            .submit_mcp_idempotent(
+                retry_call,
+                "POST /mcp tools/call",
+                "session:rpc-42",
+                pending(),
+            )
+            .await
+            .expect("exact retry should replay");
+        assert!(replay.replayed);
+        assert!(!replay.result.ok);
+        assert_eq!(
+            replay
+                .result
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("approval_canceled")
+        );
+        let (rows, state, response_kind) = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT COUNT(*), MIN(state), MIN(response_kind) \
+             FROM gateway_invocation_idempotency WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency row should read");
+        assert_eq!(rows, 1);
+        assert_eq!(state, "completed");
+        assert_eq!(response_kind, "tool");
+        stop_server.send(()).expect("upstream shutdown should send");
+        upstream.await.expect("upstream task should not panic");
+        assert_eq!(upstream_count.load(Ordering::SeqCst), 0);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_storage_failure_keeps_execution_fenced_until_retry_succeeds() {
+        let (_directory, app) = app_with_mcp_ask_tool_at("http://127.0.0.1:9").await;
+        let execution_hook = Arc::new(ApprovedExecutionHook::default());
+        *app.tool_calls()
+            .approved_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(execution_hook.clone());
+        let cancel_hook = Arc::new(CancelExecutionHook::default());
+        cancel_hook.failures.store(1, Ordering::SeqCst);
+        *app.tool_calls()
+            .cancel_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel_hook.clone());
+        let call = ToolCall {
+            request_id: "mcp-cancel-storage-failure".to_owned(),
+            actor: ToolActor::api_token("mcp-owner", Some("MCP owner".to_owned())),
+            surface: RequestSurface::Mcp,
+            execution_id: "downstream-session".to_owned(),
+            call_id: "rpc-cancel-storage-failure".to_owned(),
+            worker_generation: 0,
+            path: "mcp_approval.write".to_owned(),
+            arguments: json!({ "value": "write once" }),
+        };
+        let retry_call = call.clone();
+        let service = app.tool_calls().clone();
+        let (cancel, canceled) = oneshot::channel::<()>();
+        let submission = tokio::spawn(async move {
+            service
+                .submit_mcp_idempotent(
+                    call,
+                    "POST /mcp tools/call",
+                    "session:cancel-storage-failure",
+                    async {
+                        let _ = canceled.await;
+                    },
+                )
+                .await
+        });
+        let approval = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = app
+                    .tool_calls()
+                    .approvals()
+                    .list_admin(crate::approval::ApprovalListQuery {
+                        before_sequence: None,
+                        limit: 1,
+                        status: None,
+                    })
+                    .await
+                    .expect("approvals should list")
+                    .items
+                    .into_iter()
+                    .next()
+                {
+                    break detail;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval should appear");
+        cancel.send(()).expect("explicit cancellation should send");
+        let first_result = tokio::time::timeout(Duration::from_secs(2), submission)
+            .await
+            .expect("storage failure should return to the original request")
+            .expect("submission task should not panic")
+            .expect_err("forced cancellation storage failure should surface");
+        assert!(matches!(
+            first_result,
+            GatewayInvokeError::ToolCall(ToolCallError::Approval(ApprovalError::Database(_)))
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cancel_hook.retry_waiters.load(Ordering::SeqCst) < 1 {
+                cancel_hook.retry_waiting.notified().await;
+            }
+        })
+        .await
+        .expect("deferred cancellation retry should start");
+
+        let decision_service = app.tool_calls().clone();
+        let approval_id = approval.id.clone();
+        let decision = tokio::spawn(async move {
+            decision_service
+                .decide(
+                    &approval_id,
+                    "approve-while-cancel-retries",
+                    approval.revision,
+                    ApprovalDecision::Approve,
+                    1,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cancel_hook.retry_waiters.load(Ordering::SeqCst) < 2 {
+                cancel_hook.retry_waiting.notified().await;
+            }
+        })
+        .await
+        .expect("approval should remain blocked behind cancellation retry");
+        assert!(!decision.is_finished());
+        assert_eq!(execution_hook.dispatches.load(Ordering::SeqCst), 0);
+        cancel_hook.block_retries.store(false, Ordering::SeqCst);
+        cancel_hook.release_retries.notify_waiters();
+        let decision_result = decision.await.expect("decision task should not panic");
+        assert!(decision_result.is_err());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = app
+                    .tool_calls()
+                    .approvals()
+                    .get_admin(&approval.id)
+                    .await
+                    .expect("approval should read")
+                    .expect("approval should remain stored");
+                if detail.record.status == ApprovalStatus::Canceled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation retry should persist the canceled state");
+        let replay = app
+            .tool_calls()
+            .submit_mcp_idempotent(
+                retry_call,
+                "POST /mcp tools/call",
+                "session:cancel-storage-failure",
+                pending(),
+            )
+            .await
+            .expect("retry should replay canceled result");
+        assert!(replay.replayed);
+        assert_eq!(
+            replay
+                .result
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("approval_canceled")
+        );
+        assert_eq!(execution_hook.dispatches.load(Ordering::SeqCst), 0);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn approval_finish_failure_makes_current_and_replay_outcomes_unknown() {
+        let (_directory, app) = app_with_mcp_ask_tool_at("http://127.0.0.1:9").await;
+        let execution_hook = Arc::new(ApprovedExecutionHook::default());
+        *app.tool_calls()
+            .approved_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(execution_hook.clone());
+        sqlx::query(
+            "CREATE TRIGGER fail_mcp_approval_finish \
+             BEFORE UPDATE OF status ON approvals \
+             WHEN OLD.status = 'executing' \
+              AND NEW.status IN ('succeeded', 'failed', 'interrupted') \
+             BEGIN SELECT RAISE(ABORT, 'forced approval finish failure'); END",
+        )
+        .execute(app.pool())
+        .await
+        .expect("finish failure trigger should install");
+
+        let call = ToolCall {
+            request_id: "mcp-finish-failure".to_owned(),
+            actor: ToolActor::api_token("mcp-owner", Some("MCP owner".to_owned())),
+            surface: RequestSurface::Mcp,
+            execution_id: "downstream-session".to_owned(),
+            call_id: "rpc-finish-failure".to_owned(),
+            worker_generation: 0,
+            path: "mcp_approval.write".to_owned(),
+            arguments: json!({ "value": "write once" }),
+        };
+        let retry_call = call.clone();
+        let service = app.tool_calls().clone();
+        let submission = tokio::spawn(async move {
+            service
+                .submit_mcp_idempotent(
+                    call,
+                    "POST /mcp tools/call",
+                    "session:finish-failure",
+                    pending(),
+                )
+                .await
+        });
+        let approval = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = app
+                    .tool_calls()
+                    .approvals()
+                    .list_admin(crate::approval::ApprovalListQuery {
+                        before_sequence: None,
+                        limit: 1,
+                        status: None,
+                    })
+                    .await
+                    .expect("approvals should list")
+                    .items
+                    .into_iter()
+                    .next()
+                {
+                    break detail;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval should appear");
+
+        app.tool_calls()
+            .decide(
+                &approval.id,
+                "approve-for-finish-failure",
+                approval.revision,
+                ApprovalDecision::Approve,
+                1,
+            )
+            .await
+            .expect("approval decision should persist");
+        tokio::time::timeout(Duration::from_secs(2), execution_hook.started.notified())
+            .await
+            .expect("approved execution should reach dispatch");
+        execution_hook.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM gateway_invocation_idempotency \
+                     WHERE owner_api_token_id = 'mcp-owner'",
+                )
+                .fetch_one(app.pool())
+                .await
+                .expect("idempotency state should read");
+                if state == "indeterminate" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finish failure should first make the invocation indeterminate");
+        let unfinished_approval = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval.id)
+            .await
+            .expect("approval should read after finish failure")
+            .expect("approval should remain stored after finish failure");
+        assert_eq!(unfinished_approval.record.status, ApprovalStatus::Executing);
+
+        let current = tokio::time::timeout(Duration::from_secs(2), submission)
+            .await
+            .expect("current request should finish")
+            .expect("submission task should not panic")
+            .expect_err("failed terminal persistence should be uncertain");
+        assert!(matches!(current, GatewayInvokeError::OutcomeUnknown));
+        let replay = app
+            .tool_calls()
+            .submit_mcp_idempotent(
+                retry_call,
+                "POST /mcp tools/call",
+                "session:finish-failure",
+                pending(),
+            )
+            .await
+            .expect_err("retry should preserve the uncertain outcome");
+        assert!(matches!(replay, GatewayInvokeError::OutcomeUnknown));
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency state should read");
+        assert_eq!(state, "indeterminate");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_after_execution_starts_returns_and_stays_indeterminate() {
+        let (_directory, app) = app_with_mcp_ask_tool_at("http://127.0.0.1:9").await;
+        let execution_hook = Arc::new(ApprovedExecutionHook::default());
+        *app.tool_calls()
+            .approved_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(execution_hook.clone());
+        let call = ToolCall {
+            request_id: "mcp-cancel-executing".to_owned(),
+            actor: ToolActor::api_token("mcp-owner", Some("MCP owner".to_owned())),
+            surface: RequestSurface::Mcp,
+            execution_id: "downstream-session".to_owned(),
+            call_id: "rpc-cancel-executing".to_owned(),
+            worker_generation: 0,
+            path: "mcp_approval.write".to_owned(),
+            arguments: json!({ "value": "write once" }),
+        };
+        let retry_call = call.clone();
+        let service = app.tool_calls().clone();
+        let (cancel, canceled) = oneshot::channel::<()>();
+        let submission = tokio::spawn(async move {
+            service
+                .submit_mcp_idempotent(
+                    call,
+                    "POST /mcp tools/call",
+                    "session:cancel-executing",
+                    async {
+                        let _ = canceled.await;
+                    },
+                )
+                .await
+        });
+        let approval = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = app
+                    .tool_calls()
+                    .approvals()
+                    .list_admin(crate::approval::ApprovalListQuery {
+                        before_sequence: None,
+                        limit: 1,
+                        status: None,
+                    })
+                    .await
+                    .expect("approvals should list")
+                    .items
+                    .into_iter()
+                    .next()
+                {
+                    break detail;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval should appear");
+        app.tool_calls()
+            .decide(
+                &approval.id,
+                "approve-before-cancel",
+                approval.revision,
+                ApprovalDecision::Approve,
+                1,
+            )
+            .await
+            .expect("approval should persist");
+        tokio::time::timeout(Duration::from_secs(2), execution_hook.started.notified())
+            .await
+            .expect("execution should reach dispatch");
+        let executing = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval.id)
+            .await
+            .expect("approval should read while upstream is blocked")
+            .expect("approval should remain stored");
+        assert_eq!(executing.record.status, ApprovalStatus::Executing);
+
+        cancel.send(()).expect("explicit cancellation should send");
+        let canceled = tokio::time::timeout(Duration::from_secs(2), submission)
+            .await
+            .expect("cancellation should not wait for upstream")
+            .expect("submission task should not panic")
+            .expect_err("executing request cancellation should return canceled");
+        assert!(matches!(canceled, GatewayInvokeError::Canceled));
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency state should read");
+        assert_eq!(state, "indeterminate");
+
+        execution_hook.release.notify_one();
+        let retry = app
+            .tool_calls()
+            .submit_mcp_idempotent(
+                retry_call,
+                "POST /mcp tools/call",
+                "session:cancel-executing",
+                pending(),
+            )
+            .await
+            .expect_err("completed upstream work must not become a deterministic replay");
+        assert!(matches!(retry, GatewayInvokeError::OutcomeUnknown));
+        let final_state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("final idempotency state should read");
+        assert_eq!(final_state, "indeterminate");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn generic_mcp_boundary_replays_exact_blobs_and_terminalizes_drops() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(directory.path().join("mcp-boundary.db"))
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .busy_timeout(Duration::from_secs(2)),
+            )
+            .await
+            .expect("database pool");
+        MIGRATOR.run(&pool).await.expect("migrations");
+        sqlx::query(
+            "INSERT INTO api_tokens (id, name, token_digest, token_prefix, token_suffix, created_at) \
+             VALUES ('mcp-owner', 'MCP owner', zeroblob(32), 'tok_', 'tail', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("owner token");
+        let keyring = Keyring::from_master_key([11; 32]).expect("keyring");
+        let store = GatewayIdempotencyStore::new(pool.clone(), keyring.clone());
+        let approvals = ApprovalStore::system(pool, keyring);
+        let tasks = TaskTracker::default();
+        let arguments = json!({ "code": "return 1" });
+        let request = || IdempotencyRequest {
+            owner: IdempotencyOwner {
+                owner_api_token_id: "mcp-owner",
+            },
+            key: "session:request-1",
+            route: "mcp tools/call",
+            callable_path: "executor.execute",
+            arguments: &arguments,
+        };
+        let IdempotencyClaim::Fresh(record) =
+            store.claim(request()).await.expect("fresh reservation")
+        else {
+            panic!("fresh reservation expected");
+        };
+        let reservation = McpIdempotencyReservation {
+            guard: Some(IdempotencyReservationGuard::new(
+                record,
+                store.clone(),
+                approvals.clone(),
+                tasks.clone(),
+            )),
+        };
+        reservation
+            .mark_executing()
+            .await
+            .expect("execution boundary")
+            .complete(McpIdempotencyBlob {
+                body: br#"{"result":1}"#.to_vec(),
+            })
+            .await
+            .expect("durable completion");
+        let IdempotencyClaim::Replay { response, .. } =
+            store.claim(request()).await.expect("exact replay")
+        else {
+            panic!("completed request must replay");
+        };
+        assert_eq!(response.body, br#"{"result":1}"#);
+
+        let dropped_arguments = json!({ "code": "return 2" });
+        let dropped_request = || IdempotencyRequest {
+            owner: IdempotencyOwner {
+                owner_api_token_id: "mcp-owner",
+            },
+            key: "session:request-2",
+            route: "mcp tools/call",
+            callable_path: "executor.execute",
+            arguments: &dropped_arguments,
+        };
+        let IdempotencyClaim::Fresh(record) = store
+            .claim(dropped_request())
+            .await
+            .expect("second reservation")
+        else {
+            panic!("fresh second reservation expected");
+        };
+        let execution = McpIdempotencyReservation {
+            guard: Some(IdempotencyReservationGuard::new(
+                record,
+                store.clone(),
+                approvals,
+                tasks.clone(),
+            )),
+        }
+        .mark_executing()
+        .await
+        .expect("second execution boundary");
+        drop(execution);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    store.claim(dropped_request()).await.expect("dropped claim"),
+                    IdempotencyClaim::Indeterminate(_)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped execution becomes indeterminate");
         tasks.shutdown().await;
     }
 }

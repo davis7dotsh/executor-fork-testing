@@ -20,7 +20,7 @@ use crate::{
     execution::{ExecuteCodeRequest, ExecutionServiceError},
     invocation::{
         GatewayInvokeError, GatewayInvokeResponse, ToolCall, ToolCallError, ToolCallSubmission,
-        gateway_idempotency_key_is_valid,
+        ToolDiscoveryError, gateway_idempotency_key_is_valid,
     },
     outbound::OutboundError,
     protocols::{CredentialMetadata, ProtocolError, ProtocolErrorCategory},
@@ -41,6 +41,7 @@ pub(super) fn router() -> Router<AppState> {
         .merge(
             Router::new()
                 .route("/api/v1/sources/{id}/refresh", post(refresh_source))
+                .route("/api/v1/mcp/stdio/templates", get(stdio_templates))
                 .route(
                     "/api/v1/sources/{id}/credentials",
                     get(get_credentials)
@@ -51,6 +52,7 @@ pub(super) fn router() -> Router<AppState> {
         .merge(
             Router::new()
                 .route("/api/v1/gateway/tools/invoke", post(invoke))
+                .route("/api/v1/gateway/sources", get(gateway_sources))
                 .layer(DefaultBodyLimit::max(MAX_INVOKE_BODY_BYTES)),
         )
         .merge(
@@ -58,6 +60,115 @@ pub(super) fn router() -> Router<AppState> {
                 .route("/api/v1/gateway/execute", post(execute))
                 .layer(DefaultBodyLimit::max(MAX_EXECUTE_BODY_BYTES)),
         )
+}
+
+#[derive(Serialize)]
+struct StdioTemplatesResponse {
+    templates: Vec<crate::mcp::upstream::stdio::StdioTemplateDescriptor>,
+}
+
+async fn stdio_templates(
+    _admin: AdminAuthentication,
+    State(state): State<AppState>,
+) -> Json<StdioTemplatesResponse> {
+    Json(StdioTemplatesResponse {
+        templates: state.sources.stdio_template_descriptors(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewaySourcesResponse {
+    sources: Vec<GatewaySourceResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewaySourceResponse {
+    slug: String,
+    display_name: String,
+    description: Option<String>,
+    kind: SourceKind,
+    tool_count: usize,
+}
+
+async fn gateway_sources(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    GatewayAuthentication(identity): GatewayAuthentication,
+) -> Result<Json<GatewaySourcesResponse>, ApiError> {
+    let call = ToolCall {
+        request_id: request_id.0.clone(),
+        actor: ToolActor::api_token(identity.token_id, Some(identity.token_name)),
+        surface: RequestSurface::Gateway,
+        execution_id: request_id.0.clone(),
+        call_id: "gateway.sources".to_owned(),
+        worker_generation: 0,
+        path: "executor.sources".to_owned(),
+        arguments: Value::Object(Map::new()),
+    };
+    let discovered = state
+        .tool_calls
+        .discover_sources(&call)
+        .await
+        .map_err(|error| discovery_error(&request_id, error))?;
+    let Value::Array(items) = discovered else {
+        return Err(ApiError::internal_logged(
+            &request_id,
+            "source discovery returned an invalid payload",
+        ));
+    };
+    let mut sources = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(item) = item.as_object() else {
+            return Err(ApiError::internal(&request_id));
+        };
+        let source = GatewaySourceResponse {
+            slug: required_string(item, "slug").ok_or_else(|| ApiError::internal(&request_id))?,
+            display_name: required_string(item, "displayName")
+                .ok_or_else(|| ApiError::internal(&request_id))?,
+            description: item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            kind: serde_json::from_value(
+                item.get("kind")
+                    .cloned()
+                    .ok_or_else(|| ApiError::internal(&request_id))?,
+            )
+            .map_err(|_| ApiError::internal(&request_id))?,
+            tool_count: item
+                .get("toolCount")
+                .and_then(Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| ApiError::internal(&request_id))?,
+        };
+        sources.push(source);
+    }
+    Ok(Json(GatewaySourcesResponse { sources }))
+}
+
+fn required_string(item: &Map<String, Value>, field: &str) -> Option<String> {
+    item.get(field).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn discovery_error(request_id: &RequestId, error: ToolDiscoveryError) -> ApiError {
+    match error {
+        ToolDiscoveryError::Busy => ApiError::new(
+            request_id,
+            StatusCode::TOO_MANY_REQUESTS,
+            "search_busy",
+            "Tool discovery is busy. Try again shortly.",
+        )
+        .with_retry_after(1),
+        ToolDiscoveryError::Catalog(error) => catalog_error(request_id, error),
+        ToolDiscoveryError::Interrupted => ApiError::new(
+            request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discovery_interrupted",
+            "Tool discovery was interrupted. Try again.",
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -495,6 +606,13 @@ fn gateway_invoke_error(request_id: &RequestId, error: GatewayInvokeError) -> Ap
             "idempotency_outcome_unknown",
             "The invocation may have reached the upstream service, so it will not be retried.",
         ),
+        GatewayInvokeError::Canceled => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "idempotency_in_progress",
+            "The invocation is still in progress.",
+        )
+        .with_retry_after(1),
         GatewayInvokeError::Idempotency(error) => ApiError::internal_logged(request_id, error),
     }
 }

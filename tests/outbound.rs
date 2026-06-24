@@ -246,6 +246,93 @@ async fn response_size_cap_rejects_declared_oversize_before_returning_body() {
 }
 
 #[tokio::test]
+async fn streaming_response_yields_before_connection_eof_and_keeps_byte_cap() {
+    let server = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("server binds");
+    let address = server.local_addr().expect("server has an address");
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = server.accept().await.expect("server accepts");
+        let _request = read_request(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfirst")
+            .await
+            .expect("first chunk writes");
+        stream.flush().await.expect("first chunk flushes");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+    let policy = OutboundPolicy {
+        allow_private_networks: true,
+        max_response_bytes: 5,
+        ..OutboundPolicy::default()
+    };
+    let client = HardenedHttpClient::new(policy);
+    let request = OutboundRequest::new(
+        Method::GET,
+        Url::parse(&format!("http://{address}/stream")).expect("request URL parses"),
+    );
+    let mut response = client
+        .execute_streaming(request)
+        .await
+        .expect("stream headers arrive");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(500), response.next_chunk())
+        .await
+        .expect("chunk arrives before EOF")
+        .expect("chunk is valid")
+        .expect("chunk exists");
+    assert_eq!(first, b"first");
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn long_lived_stream_uses_idle_timeout_instead_of_request_deadline() {
+    let server = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("server binds");
+    let address = server.local_addr().expect("server has an address");
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = server.accept().await.expect("server accepts");
+        let _request = read_request(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nfirst")
+            .await
+            .expect("headers write");
+        stream.flush().await.expect("headers flush");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stream.write_all(b"again").await.expect("event writes");
+        stream.flush().await.expect("event flushes");
+    });
+    let policy = OutboundPolicy {
+        allow_private_networks: true,
+        request_timeout: std::time::Duration::from_millis(50),
+        max_response_bytes: 5,
+        ..OutboundPolicy::default()
+    };
+    let client = HardenedHttpClient::new(policy);
+    let request = OutboundRequest::new(
+        Method::GET,
+        Url::parse(&format!("http://{address}/events")).expect("request URL parses"),
+    );
+    let mut response = client
+        .execute_long_lived_streaming(request, std::time::Duration::from_millis(500))
+        .await
+        .expect("long-lived headers arrive");
+    let first = response
+        .next_chunk()
+        .await
+        .expect("idle deadline permits delayed event")
+        .expect("event chunk exists");
+    let second = response
+        .next_chunk()
+        .await
+        .expect("cumulative lifetime bytes do not exhaust the per-chunk cap")
+        .expect("second chunk exists");
+    assert_eq!(first, b"first");
+    assert_eq!(second, b"again");
+    server_task.await.expect("server task completes");
+}
+
+#[tokio::test]
 async fn trace_and_connect_are_rejected_before_network_work() {
     let policy = OutboundPolicy {
         allow_private_networks: true,

@@ -271,24 +271,44 @@ pub struct StagedToolBinding {
 #[serde(tag = "kind", content = "definition", rename_all = "snake_case")]
 pub enum ToolBinding {
     OpenapiV1(OpenApiBinding),
+    McpHttpV1(McpToolBindingV1),
+    McpStdioV1(McpToolBindingV1),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct McpToolBindingV1 {
+    pub version: u32,
+    pub tool_name: String,
 }
 
 impl ToolBinding {
     pub const fn protocol(&self) -> &'static str {
         match self {
             Self::OpenapiV1(_) => "openapi",
+            Self::McpHttpV1(_) => "mcp_http",
+            Self::McpStdioV1(_) => "mcp_stdio",
         }
     }
 
     pub const fn version(&self) -> i64 {
         match self {
             Self::OpenapiV1(_) => 1,
+            Self::McpHttpV1(_) | Self::McpStdioV1(_) => 1,
         }
     }
 
     pub fn openapi(&self) -> Option<&OpenApiBinding> {
         match self {
             Self::OpenapiV1(binding) => Some(binding),
+            Self::McpHttpV1(_) | Self::McpStdioV1(_) => None,
+        }
+    }
+
+    pub fn mcp(&self) -> Option<&McpToolBindingV1> {
+        match self {
+            Self::McpHttpV1(binding) | Self::McpStdioV1(binding) => Some(binding),
+            Self::OpenapiV1(_) => None,
         }
     }
 
@@ -307,11 +327,32 @@ impl ToolBinding {
                 }
                 Ok(Self::OpenapiV1(binding))
             }
+            ("mcp_http", 1) | ("mcp_stdio", 1) => {
+                let binding: McpToolBindingV1 = serde_json::from_str(definition_json)?;
+                if !valid_mcp_binding(&binding) {
+                    return Err(CatalogError::CorruptData(
+                        "unsupported MCP binding version or tool name",
+                    ));
+                }
+                Ok(if protocol == "mcp_http" {
+                    Self::McpHttpV1(binding)
+                } else {
+                    Self::McpStdioV1(binding)
+                })
+            }
             _ => Err(CatalogError::CorruptData(
                 "unknown tool binding protocol or version",
             )),
         }
     }
+}
+
+fn valid_mcp_binding(binding: &McpToolBindingV1) -> bool {
+    binding.version == 1
+        && !binding.tool_name.is_empty()
+        && binding.tool_name.chars().count() <= 128
+        && binding.tool_name.trim() == binding.tool_name
+        && !binding.tool_name.chars().any(char::is_control)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

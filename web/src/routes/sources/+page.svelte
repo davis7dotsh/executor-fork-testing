@@ -2,6 +2,9 @@
   import { tick, untrack } from "svelte";
   import DashboardShell from "$lib/DashboardShell.svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
+  import McpCredentialEditor from "$lib/McpCredentialEditor.svelte";
+  import McpHttpSourceForm from "$lib/McpHttpSourceForm.svelte";
+  import McpStdioSourceForm from "$lib/McpStdioSourceForm.svelte";
   import {
     createOpenApiSource,
     deleteOpenApiCredentials,
@@ -10,7 +13,7 @@
     listSources,
     previewOpenApiSource,
     putOpenApiCredentials,
-    refreshOpenApiSource,
+    refreshSourceCatalog,
     setSourceMode,
     type ApiError,
     type OpenApiPreview,
@@ -36,6 +39,7 @@
     type CredentialDraft,
     type SupportedCredentialType,
   } from "$lib/openapi-credentials";
+  import { safeMcpSourceDetails } from "$lib/mcp-source-state";
 
   const auth = useAuthState();
   const latest = createLatestRequest();
@@ -56,6 +60,7 @@
   let displayNameEdited = $state(false);
   let preferredSlug = $state("");
   let sourceDescription = $state("");
+  let sourceType = $state<"openapi" | "mcp_http" | "mcp_stdio">("openapi");
   let importCredentialRows = $state<CredentialDraft[]>([]);
   let credentialEditorSource = $state<string | null>(null);
   let confirmingCredentialClear = $state<string | null>(null);
@@ -183,6 +188,7 @@
     );
     if (!finishMutation("openapi-preview", controller)) return;
     previewBusy = false;
+    if (fingerprint !== currentSpecFingerprint()) return;
     if (!result.ok) {
       if (auth.recoverFromApiError(result.error)) return;
       importError = result.error;
@@ -201,6 +207,7 @@
     if (!previewCurrent || displayName.trim() === "") return;
     const credentials = buildCredentialMap(importCredentialRows);
     if (credentials === null) return;
+    const submissionFingerprint = currentImportFingerprint();
     const controller = beginMutation("openapi-create");
     createBusy = true;
     importError = null;
@@ -225,7 +232,7 @@
       return;
     }
     importNotice = `${result.value.displayName} was imported with ${result.value.toolCount} tools.`;
-    clearImportForm();
+    if (submissionFingerprint === currentImportFingerprint()) clearImportForm();
     refreshKey += 1;
   }
 
@@ -233,7 +240,7 @@
     const mutationId = sourceMutationId("refresh", sourceId);
     clearSourceMutationError(sourceId);
     const controller = beginMutation(mutationId);
-    const result = await refreshOpenApiSource(sourceId, undefined, controller.signal);
+    const result = await refreshSourceCatalog(sourceId, undefined, controller.signal);
     if (!finishMutation(mutationId, controller)) return;
     if (!result.ok) {
       if (auth.recoverFromApiError(result.error)) return;
@@ -452,6 +459,10 @@
   }
 
   function clearImportForm() {
+    cancelMutation("openapi-preview");
+    cancelMutation("openapi-create");
+    previewBusy = false;
+    createBusy = false;
     locatorType = "url";
     specUrl = "";
     specContent = "";
@@ -464,6 +475,28 @@
     preview = null;
     previewFingerprint = null;
     importError = null;
+  }
+
+  function currentImportFingerprint() {
+    return JSON.stringify({
+      spec: currentSpecFingerprint(),
+      displayName,
+      preferredSlug,
+      sourceDescription,
+      credentials: buildCredentialMap(importCredentialRows),
+    });
+  }
+
+  function switchSourceType(next: "openapi" | "mcp_http" | "mcp_stdio") {
+    if (next === sourceType) return;
+    if (sourceType === "openapi") clearImportForm();
+    sourceType = next;
+  }
+
+  function connectedMcpSource(source: SourceList["sources"][number]) {
+    importNotice = `${source.displayName} connected with ${source.toolCount} tools.`;
+    refreshKey += 1;
+    focusSourceStatus();
   }
 
   function authenticatedPreviewWithoutCredentials() {
@@ -533,10 +566,16 @@
   }
 
   function finishMutation(id: string, controller: AbortController) {
-    if (mutationControllers.get(id) !== controller || controller.signal.aborted) return false;
+    if (mutationControllers.get(id) !== controller) return false;
     mutationControllers.delete(id);
     pending = pending.filter((candidate) => candidate !== id);
-    return true;
+    return !controller.signal.aborted;
+  }
+
+  function cancelMutation(id: string) {
+    mutationControllers.get(id)?.abort();
+    mutationControllers.delete(id);
+    pending = pending.filter((candidate) => candidate !== id);
   }
 
   function formatTime(timestamp: number | null) {
@@ -557,7 +596,7 @@
 
 <DashboardShell
   title="Sources"
-  description="Connect MCP servers, OpenAPI services, and GraphQL endpoints."
+  description="Connect MCP servers and OpenAPI services to one global tool catalog."
 >
   {#if conflictNotice !== null}
     <div id="source-conflict" class="notice warning" role="status" tabindex="-1">
@@ -569,177 +608,219 @@
     </div>{/if}
 
   <details class="surface import-panel" open={resource.data?.sources.length === 0}>
-    <summary>Connect an OpenAPI source</summary>
-    <form class="import-form" onsubmit={previewSource}>
-      <fieldset class="mode-control">
-        <legend>Specification location</legend>
-        <label><input type="radio" name="locator" value="url" bind:group={locatorType} />URL</label>
-        <label
-          ><input type="radio" name="locator" value="inline" bind:group={locatorType} />Paste
-          document</label
-        >
-      </fieldset>
-      {#if locatorType === "url"}
-        <label
-          >OpenAPI URL<input
-            type="url"
-            required
-            bind:value={specUrl}
-            placeholder="https://api.example.com/openapi.json"
-          /></label
-        >
-      {:else}
-        <label
-          >OpenAPI JSON or YAML<textarea
-            required
-            rows="10"
-            bind:value={specContent}
-            placeholder="openapi: 3.1.0"></textarea></label
-        >
-      {/if}
-      <label class="checkbox-label private-network-choice">
+    <summary>Connect a source</summary>
+    <fieldset class="mode-control source-type-picker">
+      <legend>Source type</legend>
+      <label>
         <input
-          type="checkbox"
-          bind:checked={allowPrivateNetwork}
-          aria-describedby="private-network-help"
+          type="radio"
+          name="source-type"
+          checked={sourceType === "openapi"}
+          onchange={() => switchSourceType("openapi")}
         />
-        Allow private network addresses for this source
+        OpenAPI service
       </label>
-      <p class="field-help" id="private-network-help">
-        Keep this off unless the specification or API intentionally runs on your local network.
+      <label>
+        <input
+          type="radio"
+          name="source-type"
+          checked={sourceType === "mcp_http"}
+          onchange={() => switchSourceType("mcp_http")}
+        />
+        MCP over HTTP
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="source-type"
+          checked={sourceType === "mcp_stdio"}
+          onchange={() => switchSourceType("mcp_stdio")}
+        />
+        Trusted local MCP template
+      </label>
+      <p class="mode-impact">
+        OpenAPI compiles an API specification. MCP connects using Streamable HTTP or a locally
+        configured process template.
       </p>
-      <button type="submit" disabled={previewBusy || createBusy}
-        >{previewBusy ? "Inspecting..." : "Preview tools"}</button
-      >
-      <button type="button" disabled={previewBusy || createBusy} onclick={clearImportForm}
-        >Reset importer</button
-      >
-    </form>
-
-    {#if importError !== null}<ErrorNotice error={importError} />{/if}
-    {#if preview !== null}
-      <form
-        class="preview-panel"
-        aria-live="polite"
-        onsubmit={(event) => {
-          event.preventDefault();
-          void createSource();
-        }}
-      >
-        <div>
-          <p class="eyebrow">Preview</p>
-          <h2>{preview.title}</h2>
-          <p>{preview.description ?? "No API description provided."}</p>
-        </div>
-        <strong>{preview.toolCount} tools found</strong>
-        {#if !previewCurrent}<p class="notice warning">
-            The specification changed. Preview it again before importing.
-          </p>{/if}
-        <div class="preview-tools">
-          {#each preview.tools.slice(0, 8) as tool, index (previewToolKey(tool.preferredName, index))}
-            <span
-              ><strong>{tool.displayName}</strong><small>{modeLabel(tool.intrinsicMode)}</small
-              ></span
-            >
-          {/each}
-          {#if preview.tools.length > 8}<span>+ {preview.tools.length - 8} more</span>{/if}
-        </div>
-        <div class="import-fields">
+    </fieldset>
+    {#if sourceType === "openapi"}
+      <form class="import-form" onsubmit={previewSource}>
+        <fieldset class="mode-control">
+          <legend>Specification location</legend>
           <label
-            >Source name<input
+            ><input type="radio" name="locator" value="url" bind:group={locatorType} />URL</label
+          >
+          <label
+            ><input type="radio" name="locator" value="inline" bind:group={locatorType} />Paste
+            document</label
+          >
+        </fieldset>
+        {#if locatorType === "url"}
+          <label
+            >OpenAPI URL<input
+              type="url"
               required
-              value={displayName}
-              oninput={(event) => {
-                displayName = event.currentTarget.value;
-                displayNameEdited = true;
-              }}
+              bind:value={specUrl}
+              placeholder="https://api.example.com/openapi.json"
             /></label
           >
+        {:else}
           <label
-            >Slug (optional)<input
-              bind:value={preferredSlug}
-              placeholder="generated from name"
-            /></label
+            >OpenAPI JSON or YAML<textarea
+              required
+              rows="10"
+              bind:value={specContent}
+              placeholder="openapi: 3.1.0"></textarea></label
           >
-          <label class="wide-field"
-            >Description (optional)<input bind:value={sourceDescription} /></label
-          >
-          {#if preview.securitySchemes.length > 0}
-            <fieldset class="credential-schemes wide-field">
-              <legend>Authentication schemes</legend>
-              <p class="field-help">
-                Select every credential you want to configure. Tool requirements use OR between
-                groups and AND within a group.
-              </p>
-              {#each preview.securitySchemes as scheme (scheme.name)}
-                {@const row = importCredentialRows.find(
-                  (candidate) => candidate.name === scheme.name,
-                )}
-                <div class="credential-row">
-                  <label class="checkbox-label">
-                    <input
-                      type="checkbox"
-                      disabled={row === undefined}
-                      checked={row?.enabled ?? false}
-                      onchange={(event) => {
-                        if (row !== undefined) row.enabled = event.currentTarget.checked;
-                      }}
-                    />
-                    <span
-                      ><strong>{scheme.name}</strong><small
-                        >{credentialTypeLabel(scheme.credentialType)}{scheme.placement
-                          ? ` · ${scheme.placement}`
-                          : ""}{scheme.supported ? "" : " · unsupported"}</small
-                      ></span
-                    >
-                  </label>
-                  {#if row?.enabled}
-                    {#if row.credentialType === "basic"}<label
-                        >Username<input
+        {/if}
+        <label class="checkbox-label private-network-choice">
+          <input
+            type="checkbox"
+            bind:checked={allowPrivateNetwork}
+            aria-describedby="private-network-help"
+          />
+          Allow private network addresses for this source
+        </label>
+        <p class="field-help" id="private-network-help">
+          Keep this off unless the specification or API intentionally runs on your local network.
+        </p>
+        <button type="submit" disabled={previewBusy || createBusy}
+          >{previewBusy ? "Inspecting..." : "Preview tools"}</button
+        >
+        <button type="button" disabled={previewBusy || createBusy} onclick={clearImportForm}
+          >Reset importer</button
+        >
+      </form>
+
+      {#if importError !== null}<ErrorNotice error={importError} />{/if}
+      {#if preview !== null}
+        <form
+          class="preview-panel"
+          aria-live="polite"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void createSource();
+          }}
+        >
+          <div>
+            <p class="eyebrow">Preview</p>
+            <h2>{preview.title}</h2>
+            <p>{preview.description ?? "No API description provided."}</p>
+          </div>
+          <strong>{preview.toolCount} tools found</strong>
+          {#if !previewCurrent}<p class="notice warning">
+              The specification changed. Preview it again before importing.
+            </p>{/if}
+          <div class="preview-tools">
+            {#each preview.tools.slice(0, 8) as tool, index (previewToolKey(tool.preferredName, index))}
+              <span
+                ><strong>{tool.displayName}</strong><small>{modeLabel(tool.intrinsicMode)}</small
+                ></span
+              >
+            {/each}
+            {#if preview.tools.length > 8}<span>+ {preview.tools.length - 8} more</span>{/if}
+          </div>
+          <div class="import-fields">
+            <label
+              >Source name<input
+                required
+                value={displayName}
+                oninput={(event) => {
+                  displayName = event.currentTarget.value;
+                  displayNameEdited = true;
+                }}
+              /></label
+            >
+            <label
+              >Slug (optional)<input
+                bind:value={preferredSlug}
+                placeholder="generated from name"
+              /></label
+            >
+            <label class="wide-field"
+              >Description (optional)<input bind:value={sourceDescription} /></label
+            >
+            {#if preview.securitySchemes.length > 0}
+              <fieldset class="credential-schemes wide-field">
+                <legend>Authentication schemes</legend>
+                <p class="field-help">
+                  Select every credential you want to configure. Tool requirements use OR between
+                  groups and AND within a group.
+                </p>
+                {#each preview.securitySchemes as scheme (scheme.name)}
+                  {@const row = importCredentialRows.find(
+                    (candidate) => candidate.name === scheme.name,
+                  )}
+                  <div class="credential-row">
+                    <label class="checkbox-label">
+                      <input
+                        type="checkbox"
+                        disabled={row === undefined}
+                        checked={row?.enabled ?? false}
+                        onchange={(event) => {
+                          if (row !== undefined) row.enabled = event.currentTarget.checked;
+                        }}
+                      />
+                      <span
+                        ><strong>{scheme.name}</strong><small
+                          >{credentialTypeLabel(scheme.credentialType)}{scheme.placement
+                            ? ` · ${scheme.placement}`
+                            : ""}{scheme.supported ? "" : " · unsupported"}</small
+                        ></span
+                      >
+                    </label>
+                    {#if row?.enabled}
+                      {#if row.credentialType === "basic"}<label
+                          >Username<input
+                            required
+                            bind:value={row.username}
+                            autocomplete="off"
+                          /></label
+                        >{/if}
+                      <label
+                        >{credentialTypeLabel(row.credentialType)}<input
                           required
-                          bind:value={row.username}
+                          type="password"
+                          bind:value={row.value}
                           autocomplete="off"
                         /></label
-                      >{/if}
-                    <label
-                      >{credentialTypeLabel(row.credentialType)}<input
-                        required
-                        type="password"
-                        bind:value={row.value}
-                        autocomplete="off"
-                      /></label
-                    >
-                  {/if}
-                  {#if row?.enabled && row.credentialType === "oauth_access_token"}
-                    <p class="field-help wide-field">
-                      Supply an access token manually. Executor does not run authorization flows or
-                      refresh OAuth tokens yet.
-                    </p>
-                  {/if}
-                </div>
-              {/each}
-            </fieldset>
+                      >
+                    {/if}
+                    {#if row?.enabled && row.credentialType === "oauth_access_token"}
+                      <p class="field-help wide-field">
+                        Supply an access token manually. Executor does not run authorization flows
+                        or refresh OAuth tokens yet.
+                      </p>
+                    {/if}
+                  </div>
+                {/each}
+              </fieldset>
+            {/if}
+          </div>
+          <button
+            type="submit"
+            class="primary"
+            disabled={!previewCurrent ||
+              previewBusy ||
+              createBusy ||
+              displayName.trim() === "" ||
+              buildCredentialMap(importCredentialRows) === null}
+          >
+            {createBusy ? "Importing..." : "Import source"}
+          </button>
+          {#if authenticatedPreviewWithoutCredentials()}
+            <p class="notice warning">
+              This specification declares authentication, but no credentials are selected. Protected
+              tools will fail until credentials are configured.
+            </p>
           {/if}
-        </div>
-        <button
-          type="submit"
-          class="primary"
-          disabled={!previewCurrent ||
-            previewBusy ||
-            createBusy ||
-            displayName.trim() === "" ||
-            buildCredentialMap(importCredentialRows) === null}
-        >
-          {createBusy ? "Importing..." : "Import source"}
-        </button>
-        {#if authenticatedPreviewWithoutCredentials()}
-          <p class="notice warning">
-            This specification declares authentication, but no credentials are selected. Protected
-            tools will fail until credentials are configured.
-          </p>
-        {/if}
-        <p class="field-help">Credentials are encrypted locally and are never shown again.</p>
-      </form>
+          <p class="field-help">Credentials are encrypted locally and are never shown again.</p>
+        </form>
+      {/if}
+    {:else if sourceType === "mcp_http"}
+      <McpHttpSourceForm oncreated={connectedMcpSource} />
+    {:else}
+      <McpStdioSourceForm oncreated={connectedMcpSource} />
     {/if}
   </details>
 
@@ -762,8 +843,8 @@
       <span class="number-chip">01</span>
       <h2>No sources connected</h2>
       <p>
-        This instance has no source data yet. Use the OpenAPI importer above to connect the first
-        API.
+        This instance has no source data yet. Use the source connector above to add an API or MCP
+        server.
       </p>
     </section>
   {:else if resource.data !== null}
@@ -802,6 +883,44 @@
 
           {#if source.healthErrorCode !== null}
             <p class="source-error">Refresh error: <code>{source.healthErrorCode}</code></p>
+          {/if}
+
+          {#if source.kind === "mcp_http" || source.kind === "mcp_stdio"}
+            {@const details = safeMcpSourceDetails(source.kind, source.configuration)}
+            <dl class="detail-list">
+              <div>
+                <dt>Transport</dt>
+                <dd>{source.kind === "mcp_http" ? "Streamable HTTP" : "Trusted local template"}</dd>
+              </div>
+              {#if details.endpointLabel !== null}
+                <div>
+                  <dt>Endpoint</dt>
+                  <dd>{details.endpointLabel}</dd>
+                </div>
+              {/if}
+              {#if details.templateName !== null}
+                <div>
+                  <dt>Template</dt>
+                  <dd>{details.templateName}</dd>
+                </div>
+              {/if}
+              {#if source.kind === "mcp_http"}
+                <div>
+                  <dt>Private network</dt>
+                  <dd>{details.allowPrivateNetwork ? "Allowed" : "Blocked"}</dd>
+                </div>
+                <div>
+                  <dt>Upstream sessions</dt>
+                  <dd>Memory only</dd>
+                </div>
+              {/if}
+              {#if details.negotiatedProtocolVersion !== null}
+                <div>
+                  <dt>MCP version</dt>
+                  <dd>{details.negotiatedProtocolVersion}</dd>
+                </div>
+              {/if}
+            </dl>
           {/if}
 
           <fieldset
@@ -889,7 +1008,7 @@
             <a class="button-link" href={`/tools?source=${encodeURIComponent(source.id)}`}>
               View tools
             </a>
-            {#if source.kind === "openapi"}
+            {#if source.kind === "openapi" || source.kind === "mcp_http" || source.kind === "mcp_stdio"}
               <button
                 type="button"
                 disabled={sourceOperationPending(source.id) || credentialBusySource === source.id}
@@ -897,8 +1016,12 @@
               >
                 {pending.includes(sourceMutationId("refresh", source.id))
                   ? "Refreshing..."
-                  : "Refresh"}
+                  : source.kind === "openapi"
+                    ? "Refresh"
+                    : "Reconnect and refresh tools"}
               </button>
+            {/if}
+            {#if source.kind === "openapi"}
               <button
                 id={`manage-credentials-${source.id}`}
                 type="button"
@@ -913,6 +1036,9 @@
                     ? "Close credentials"
                     : "Manage credentials"}
               </button>
+            {/if}
+            {#if source.kind === "mcp_http" || source.kind === "mcp_stdio"}
+              <McpCredentialEditor {source} disabled={sourceOperationPending(source.id)} />
             {/if}
             {#if confirmingDelete === source.id}
               <div class="inline-confirm" role="group" aria-label={`Delete ${source.displayName}`}>

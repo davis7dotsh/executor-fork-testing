@@ -170,6 +170,60 @@ pub struct OutboundResponse {
     pub final_url: Url,
 }
 
+pub struct OutboundStreamResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub final_url: Url,
+    response: reqwest::Response,
+    bytes_read: usize,
+    max_response_bytes: usize,
+    timeout: StreamTimeout,
+    declared_response_too_large: bool,
+}
+
+enum StreamTimeout {
+    Absolute(tokio::time::Instant),
+    Idle(Duration),
+}
+
+impl OutboundStreamResponse {
+    pub fn declared_response_too_large(&self) -> bool {
+        self.declared_response_too_large
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, OutboundError> {
+        let remaining = match self.timeout {
+            StreamTimeout::Absolute(deadline) => deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or(OutboundError::Timeout)?,
+            StreamTimeout::Idle(timeout) => timeout,
+        };
+        let Some(chunk) = tokio::time::timeout(remaining, self.response.chunk())
+            .await
+            .map_err(|_| OutboundError::Timeout)?
+            .map_err(map_reqwest_error)?
+        else {
+            return Ok(None);
+        };
+        match self.timeout {
+            StreamTimeout::Absolute(_) => {
+                self.bytes_read = self
+                    .bytes_read
+                    .checked_add(chunk.len())
+                    .ok_or(OutboundError::ResponseBodyTooLarge)?;
+                if self.bytes_read > self.max_response_bytes {
+                    return Err(OutboundError::ResponseBodyTooLarge);
+                }
+            }
+            StreamTimeout::Idle(_) if chunk.len() > self.max_response_bytes => {
+                return Err(OutboundError::ResponseBodyTooLarge);
+            }
+            StreamTimeout::Idle(_) => {}
+        }
+        Ok(Some(chunk.to_vec()))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HardenedHttpClient {
     policy: OutboundPolicy,
@@ -194,6 +248,50 @@ impl HardenedHttpClient {
         tokio::time::timeout(self.policy.request_timeout, self.execute_once(request))
             .await
             .map_err(|_| OutboundError::Timeout)?
+    }
+
+    pub async fn execute_streaming(
+        &self,
+        request: OutboundRequest,
+    ) -> Result<OutboundStreamResponse, OutboundError> {
+        validate_request(&request, &self.policy)?;
+        tokio::time::timeout(
+            self.policy.request_timeout,
+            self.execute_streaming_once(request, false, false),
+        )
+        .await
+        .map_err(|_| OutboundError::Timeout)?
+    }
+
+    pub async fn execute_streaming_headers_first(
+        &self,
+        request: OutboundRequest,
+    ) -> Result<OutboundStreamResponse, OutboundError> {
+        validate_request(&request, &self.policy)?;
+        tokio::time::timeout(
+            self.policy.request_timeout,
+            self.execute_streaming_once(request, false, true),
+        )
+        .await
+        .map_err(|_| OutboundError::Timeout)?
+    }
+
+    pub async fn execute_long_lived_streaming(
+        &self,
+        request: OutboundRequest,
+        idle_timeout: Duration,
+    ) -> Result<OutboundStreamResponse, OutboundError> {
+        validate_request(&request, &self.policy)?;
+        tokio::time::timeout(
+            self.policy.request_timeout,
+            self.execute_streaming_once(request, true, true),
+        )
+        .await
+        .map_err(|_| OutboundError::Timeout)?
+        .map(|mut response| {
+            response.timeout = StreamTimeout::Idle(idle_timeout);
+            response
+        })
     }
 
     pub async fn fetch_spec(
@@ -257,8 +355,27 @@ impl HardenedHttpClient {
 
     async fn execute_once(
         &self,
-        mut request: OutboundRequest,
+        request: OutboundRequest,
     ) -> Result<OutboundResponse, OutboundError> {
+        let mut response = self.execute_streaming_once(request, false, false).await?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.next_chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok(OutboundResponse {
+            status: response.status,
+            headers: response.headers,
+            body,
+            final_url: response.final_url,
+        })
+    }
+
+    async fn execute_streaming_once(
+        &self,
+        mut request: OutboundRequest,
+        long_lived: bool,
+        allow_declared_oversize: bool,
+    ) -> Result<OutboundStreamResponse, OutboundError> {
         validate_request(&request, &self.policy)?;
         let resolved = resolve_target(&request.url, &self.policy).await?;
         if !request.headers.contains_key(ACCEPT_ENCODING) {
@@ -274,8 +391,10 @@ impl HardenedHttpClient {
             .redirect(Policy::none())
             .referer(false)
             .connect_timeout(self.policy.connect_timeout)
-            .timeout(self.policy.request_timeout)
             .pool_max_idle_per_host(0);
+        if !long_lived {
+            builder = builder.timeout(self.policy.request_timeout);
+        }
         if let Some(hostname) = resolved.hostname.as_deref() {
             builder = builder.resolve_to_addrs(hostname, &resolved.addresses);
         }
@@ -289,26 +408,23 @@ impl HardenedHttpClient {
             .send()
             .await
             .map_err(map_reqwest_error)?;
-        validate_response_headers(response.headers(), &self.policy)?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let mut body = Vec::new();
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-            let next_length = body
-                .len()
-                .checked_add(chunk.len())
-                .ok_or(OutboundError::ResponseBodyTooLarge)?;
-            if next_length > self.policy.max_response_bytes {
-                return Err(OutboundError::ResponseBodyTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(OutboundResponse {
-            status,
-            headers,
-            body,
+        let declared_response_too_large =
+            match validate_response_headers(response.headers(), &self.policy) {
+                Err(OutboundError::ResponseBodyTooLarge) if allow_declared_oversize => true,
+                Err(error) => return Err(error),
+                Ok(()) => false,
+            };
+        Ok(OutboundStreamResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
             final_url: request.url,
+            response,
+            bytes_read: 0,
+            max_response_bytes: self.policy.max_response_bytes,
+            timeout: StreamTimeout::Absolute(
+                tokio::time::Instant::now() + self.policy.request_timeout,
+            ),
+            declared_response_too_large,
         })
     }
 }

@@ -312,6 +312,65 @@ metadata. It does not yet claim a managed OAuth flow. State and PKCE handling,
 browser callbacks, authorization-code exchange, refresh-token rotation, and
 provider error recovery remain part of the dedicated OAuth slice.
 
+## MCP transport boundary
+
+Executor exposes one stateful Streamable HTTP MCP endpoint at `/mcp`. It
+requires dashboard API-token bearer authentication and protocol version
+`2025-11-25`. A session belongs to its creating token and is removed when that
+token is revoked. Explicit deletion, token revocation, and lazy idle-session
+expiry terminate the session, cancel its scoped waits, and prevent a pending
+Ask released by that termination from executing later. The MCP surface
+intentionally exposes five stable virtual tools, `execute`, `call`, `search`,
+`describe`, and `sources`, instead of mirroring an unbounded upstream catalog
+into `tools/list`. For virtual-tool invocations, JSON-RPC request IDs provide
+the idempotency and cancellation correlation. Downstream GET streaming is
+intentionally unavailable and returns 405 after session validation. Body
+admission and detached execution each have independent instance-wide and
+per-token concurrency caps, leaving cancellation handling separate from tool
+execution admission. Pending Ask calls follow the durable ten-minute approval
+TTL with expiry settlement checked at intervals of at most 30 seconds. They do
+not use an independent MCP transport wait timeout.
+
+The Rust package pins `rmcp` exactly at `1.8.0` for MCP model types. Executor
+owns the HTTP and stdio transport implementations so protocol handling remains
+inside the hardened outbound, process, authentication, and lifecycle
+boundaries.
+
+Upstream MCP sources use the same catalog and invocation boundary as OpenAPI.
+Streamable HTTP endpoints use the hardened outbound client, while stdio sources
+can select only administrator-approved templates loaded at server startup.
+Executables, arguments, working directories, and static environment values are
+not accepted from source API requests. Only declared secret environment fields
+can be supplied through the encrypted source credential envelope.
+
+Successful creation with complete credentials and successful refresh complete
+initialization and bounded paginated discovery before an atomic catalog commit.
+Required-secret stdio creation may instead commit the documented deferred empty
+source without starting the child. Upstreams that advertise
+`tools.listChanged` receive one coalescing watcher per source. Watchers are
+restored on startup, replaced after relevant changes, stopped before deletion,
+and drained during shutdown. Candidate HTTP and stdio credentials are used for
+discovery before one transaction replaces the encrypted credential and catalog.
+An HTTP notification-stream GET that returns 405 is treated as permanently
+unsupported only after the current revision-fenced reconciliation commits. The
+watcher then exits without reconnecting, so later catalog changes require a
+manual refresh.
+
+Clearing HTTP authentication tries anonymous discovery; clearing required stdio
+secrets instead retains the last catalog and marks health unknown. A zero-secret
+stdio template treats its empty overlay as a complete credential and refreshes
+normally.
+
+Imported MCP tools are intrinsically `enabled` only when the upstream explicitly
+marks them read-only without marking them destructive. Other MCP tools are
+intrinsically `ask`. Administrator source and tool overrides still use the global
+catalog precedence rules. Invocation creates a fresh upstream connection,
+performs one tool call, and closes it. Outcome-unknown tool calls are never
+automatically replayed. Long-lived HTTP notification streams have a five-minute
+idle-read timeout plus per-event and parser-state bounds, not a fixed lifetime.
+The complete configuration, API payloads, lifecycle, and limit contract is
+documented in [MCP support](mcp.md).
+
 Audit history is bounded to the most recently inserted 10,000 events for a
 single-user instance. Each event's serialized metadata is capped at 64 KiB.
 Insertion and oldest-insertion compaction happen in the same catalog

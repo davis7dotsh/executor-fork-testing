@@ -637,6 +637,16 @@ impl GatewayIdempotencyStore {
         row.map(|row| row.record()).transpose()
     }
 
+    pub(crate) async fn state(
+        &self,
+        id: &str,
+    ) -> Result<Option<IdempotencyState>, IdempotencyError> {
+        validate_identifier(id, 128)?;
+        self.get(id)
+            .await
+            .map(|record| record.map(|record| record.state))
+    }
+
     fn key_digest(&self, owner: IdempotencyOwner<'_>, key: &str) -> [u8; 32] {
         let mut input = Vec::with_capacity(owner.owner_api_token_id.len() + key.len() + 16);
         append_field(&mut input, owner.owner_api_token_id.as_bytes());
@@ -1095,6 +1105,19 @@ mod tests {
                 .expect("path mismatch"),
             IdempotencyClaim::Mismatch
         ));
+        let changed_route = IdempotencyRequest {
+            owner: IdempotencyOwner {
+                owner_api_token_id: "owner-a",
+            },
+            key: "retry-key",
+            route: "mcp tools/call changed",
+            callable_path: "source.tool",
+            arguments: &first_arguments,
+        };
+        assert!(matches!(
+            store.claim(changed_route).await.expect("route mismatch"),
+            IdempotencyClaim::Mismatch
+        ));
         assert!(matches!(
             store
                 .claim(request(
@@ -1188,6 +1211,63 @@ mod tests {
                 ))
                 .await
                 .expect("post-restart claim"),
+            IdempotencyClaim::Indeterminate(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_never_replays_an_uncertain_mcp_approval_execution() {
+        let (_directory, store, _clock) = store().await;
+        let arguments = json!({"sideEffect": true});
+        let claim = store
+            .claim(request(
+                "owner-a",
+                "mcp-ask-crash",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("claim");
+        let IdempotencyClaim::Fresh(record) = claim else {
+            panic!("fresh claim expected");
+        };
+        sqlx::query(
+            "INSERT INTO approvals ( \
+                 id, execution_id, call_id, worker_generation, actor_kind, actor_id, \
+                 actor_api_token_id, surface, source_id, tool_id, callable_path_snapshot, \
+                 mode_provenance, source_revision, catalog_revision, tool_revision, \
+                 binding_revision, arguments_digest, arguments_ciphertext, \
+                 redacted_arguments_ciphertext, input_schema_ciphertext, \
+                 invocation_snapshot_ciphertext, status, created_at, updated_at, expires_at, \
+                 execution_started_at \
+             ) VALUES ( \
+                 'mcp-ask-approval', ?, 'gateway', 0, 'api_token', 'owner-a', \
+                 'owner-a', 'mcp', 'source-1', 'tool-1', 'tools.source.tool', \
+                 'intrinsic', 0, 0, 0, 0, zeroblob(32), zeroblob(42), zeroblob(42), \
+                 zeroblob(42), zeroblob(42), 'executing', 1, 1, 601, 1 \
+             )",
+        )
+        .bind(idempotency_execution_id(&record.id))
+        .execute(&store.pool)
+        .await
+        .expect("MCP Ask approval fixture");
+        store
+            .mark_executing(&record.id)
+            .await
+            .expect("approved call crosses execution boundary");
+
+        let recovery = store.recover_startup().await.expect("startup recovery");
+        assert_eq!(recovery.indeterminate_executions, 1);
+        assert!(matches!(
+            store
+                .claim(request(
+                    "owner-a",
+                    "mcp-ask-crash",
+                    "source.tool",
+                    &arguments,
+                ))
+                .await
+                .expect("post-crash retry"),
             IdempotencyClaim::Indeterminate(_)
         ));
     }

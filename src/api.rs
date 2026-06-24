@@ -29,6 +29,7 @@ use crate::{
     database::{Database, SETUP_TOKEN_TTL_SECONDS},
     execution::ExecutionService,
     invocation::ToolCallService,
+    mcp::downstream::McpState,
     protocols::SourceService,
     request_logs::RequestLogSink,
     tasks::TaskTracker,
@@ -69,6 +70,7 @@ struct AppState {
     sources: SourceService,
     tool_calls: ToolCallService,
     execution: ExecutionService,
+    mcp: McpState,
     request_logs: RequestLogSink,
     origin: Arc<str>,
     session_ttl_seconds: i64,
@@ -425,6 +427,7 @@ pub(crate) struct ApiServices {
     sources: SourceService,
     tool_calls: ToolCallService,
     execution: ExecutionService,
+    mcp: McpState,
 }
 
 impl ApiServices {
@@ -432,11 +435,13 @@ impl ApiServices {
         sources: SourceService,
         tool_calls: ToolCallService,
         execution: ExecutionService,
+        mcp: McpState,
     ) -> Self {
         Self {
             sources,
             tool_calls,
             execution,
+            mcp,
         }
     }
 }
@@ -515,6 +520,7 @@ pub(crate) fn router(
         sources: services.sources,
         tool_calls: services.tool_calls,
         execution: services.execution,
+        mcp: services.mcp,
         request_logs,
         origin: Arc::from(config.public_origin()),
         session_ttl_seconds: config.session_ttl_seconds,
@@ -541,6 +547,7 @@ pub(crate) fn router(
         .merge(approvals::router())
         .merge(protocols::router())
         .merge(openapi::router())
+        .merge(crate::mcp::downstream::router(state.mcp.clone()))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -1028,6 +1035,7 @@ async fn revoke_token(
         ));
     }
     state.execution.revoke_owner(&token_id).await;
+    state.mcp.revoke_token(&token_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

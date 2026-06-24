@@ -16,10 +16,12 @@ pub mod actor;
 mod api;
 pub mod approval;
 pub mod catalog;
+pub mod cli;
 pub mod crypto;
 mod database;
 pub mod execution;
 pub use approval::invocation;
+pub(crate) mod mcp;
 pub mod openapi;
 pub mod outbound;
 pub(crate) mod protocols;
@@ -41,6 +43,7 @@ pub struct AppConfig {
     pub(crate) session_ttl_seconds: i64,
     pub(crate) trusted_proxies: Arc<[IpNet]>,
     pub(crate) runtime_executable: Option<PathBuf>,
+    pub(crate) mcp_stdio_templates_file: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -52,6 +55,7 @@ impl AppConfig {
             session_ttl_seconds: 8 * 60 * 60,
             trusted_proxies: Arc::from([]),
             runtime_executable: None,
+            mcp_stdio_templates_file: None,
         }
     }
 
@@ -73,6 +77,11 @@ impl AppConfig {
 
     pub fn with_runtime_executable(mut self, executable: PathBuf) -> Self {
         self.runtime_executable = Some(executable);
+        self
+    }
+
+    pub fn with_mcp_stdio_templates_file(mut self, path: Option<PathBuf>) -> Self {
+        self.mcp_stdio_templates_file = path;
         self
     }
 
@@ -134,15 +143,40 @@ pub struct ExecutorApp {
     catalog: catalog::CatalogStore,
     tool_calls: invocation::ToolCallService,
     execution: execution::ExecutionService,
+    mcp_connections: Arc<mcp::manager::McpConnectionManager>,
+    #[cfg(test)]
+    mcp: mcp::downstream::McpState,
     api_tasks: tasks::TaskTracker,
+}
+
+#[derive(Clone)]
+pub struct ExecutorShutdown {
+    mcp_connections: Arc<mcp::manager::McpConnectionManager>,
+    execution: execution::ExecutionService,
+    api_tasks: tasks::TaskTracker,
+    tool_calls: invocation::ToolCallService,
+}
+
+impl ExecutorShutdown {
+    pub fn begin(&self) {
+        self.mcp_connections.begin_shutdown();
+        self.execution.cancel_all();
+        self.api_tasks.abort_all();
+        self.tool_calls.abort_background_tasks();
+    }
 }
 
 impl ExecutorApp {
     pub async fn open(config: AppConfig) -> Result<Self, DatabaseError> {
+        let stdio_templates = match config.mcp_stdio_templates_file.as_deref() {
+            Some(path) => mcp::upstream::stdio::StdioTemplateRegistry::load(path)?,
+            None => mcp::upstream::stdio::StdioTemplateRegistry::default(),
+        };
+        let mcp_connections = Arc::new(mcp::manager::McpConnectionManager::new(stdio_templates));
         let opened = database::Database::open(&config).await?;
         let pool = opened.database.pool.clone();
         let catalog = catalog::CatalogStore::new(pool.clone(), opened.database.keyring.clone());
-        let sources = protocols::SourceService::new(catalog.clone());
+        let sources = protocols::SourceService::new(catalog.clone(), mcp_connections.clone());
         let protocol_registry = sources.registry().clone();
         let request_logs =
             request_logs::RequestLogSink::new(opened.database.clone(), catalog.clone());
@@ -161,10 +195,24 @@ impl ExecutorApp {
             }));
         let execution = execution::ExecutionService::new(runtime, tool_calls.clone());
         let dummy_password_hash = crypto::hash_password("executor-dummy-login-password")?;
+        let mcp = mcp::downstream::McpState::new(
+            opened.database.clone(),
+            catalog.clone(),
+            tool_calls.clone(),
+            execution.clone(),
+            api_tasks.clone(),
+            config.public_origin(),
+        );
+        if let Err(error) = sources.restore_mcp_watchers().await {
+            tracing::warn!(
+                code = error.code,
+                "existing MCP source watchers could not be fully restored"
+            );
+        }
         let router = api::router(
             opened.database,
             catalog.clone(),
-            api::ApiServices::new(sources, tool_calls.clone(), execution.clone()),
+            api::ApiServices::new(sources, tool_calls.clone(), execution.clone(), mcp.clone()),
             request_logs,
             api_tasks.clone(),
             &config,
@@ -177,6 +225,9 @@ impl ExecutorApp {
             catalog,
             tool_calls,
             execution,
+            mcp_connections,
+            #[cfg(test)]
+            mcp,
             api_tasks,
         })
     }
@@ -205,19 +256,37 @@ impl ExecutorApp {
         &self.execution
     }
 
+    #[cfg(test)]
+    pub(crate) fn mcp_state(&self) -> &mcp::downstream::McpState {
+        &self.mcp
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutdown_handle().begin();
+    }
+
+    pub fn shutdown_handle(&self) -> ExecutorShutdown {
+        ExecutorShutdown {
+            mcp_connections: self.mcp_connections.clone(),
+            execution: self.execution.clone(),
+            api_tasks: self.api_tasks.clone(),
+            tool_calls: self.tool_calls.clone(),
+        }
+    }
+
     pub async fn shutdown(self) {
+        self.begin_shutdown();
         self.execution.shutdown().await;
         self.api_tasks.shutdown().await;
         self.tool_calls.shutdown().await;
+        self.mcp_connections.shutdown().await;
         self.pool.close().await;
     }
 }
 
 impl Drop for ExecutorApp {
     fn drop(&mut self) {
-        self.execution.cancel_all();
-        self.api_tasks.abort_all();
-        self.tool_calls.abort_background_tasks();
+        self.begin_shutdown();
     }
 }
 

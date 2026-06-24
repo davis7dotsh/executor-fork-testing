@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use executor::{AppConfig, DEFAULT_BIND_ADDRESS, ExecutorApp};
+use executor::{AppConfig, DEFAULT_BIND_ADDRESS, ExecutorApp, cli};
 use ipnet::IpNet;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -15,6 +15,28 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "executor", about = "The local Executor gateway")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        env = "EXECUTOR_BASE_URL",
+        default_value = cli::DEFAULT_BASE_URL
+    )]
+    base_url: String,
+    #[arg(
+        long,
+        global = true,
+        env = "EXECUTOR_API_TOKEN",
+        hide_env_values = true
+    )]
+    api_token: Option<String>,
+    #[arg(long, global = true)]
+    json: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Allow API tokens over plaintext HTTP to a non-loopback server"
+    )]
+    allow_insecure_http: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -22,6 +44,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Server(ServerArgs),
+    Call(cli::CallArgs),
+    Tools(cli::ToolsArgs),
+    Open,
+    Mcp,
     #[command(hide = true)]
     SandboxWorker(SandboxWorkerArgs),
 }
@@ -42,6 +68,8 @@ struct ServerArgs {
     data_dir: Option<PathBuf>,
     #[arg(long, env = "EXECUTOR_MASTER_KEY_FILE")]
     master_key_file: Option<PathBuf>,
+    #[arg(long, env = "EXECUTOR_MCP_STDIO_TEMPLATES_FILE")]
+    mcp_stdio_templates: Option<PathBuf>,
     #[arg(long, env = "EXECUTOR_PUBLIC_ORIGIN")]
     public_origin: Option<String>,
     #[arg(
@@ -64,8 +92,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match Cli::parse().command {
+    let arguments = Cli::parse();
+    let connection = cli::ConnectionOptions {
+        base_url: arguments.base_url,
+        api_token: arguments.api_token,
+        json: arguments.json,
+        allow_insecure_http: arguments.allow_insecure_http,
+    };
+    match arguments.command {
         Command::Server(args) => run_server(args).await,
+        Command::Call(args) => cli::call(connection, args).await,
+        Command::Tools(args) => cli::tools(connection, args).await,
+        Command::Open => cli::open(&connection),
+        Command::Mcp => cli::mcp(connection).await,
         Command::SandboxWorker(args) => {
             let ipc = take_worker_socket(args.ipc_fd)?;
             executor::runtime::worker_main(ipc, args.generation)
@@ -111,6 +150,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     };
     config = config
         .with_master_key_file(args.master_key_file)
+        .with_mcp_stdio_templates_file(args.mcp_stdio_templates)
         .with_trusted_proxies(args.trusted_proxies);
     let listener = TcpListener::bind(args.bind)
         .await
@@ -133,12 +173,16 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     }
 
     info!(address = %bound_address, "Executor is listening");
+    let router = app.router();
+    let shutdown = app.shutdown_handle();
     let server_result = axum::serve(
         listener,
-        app.router()
-            .into_make_service_with_connect_info::<SocketAddr>(),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown.begin();
+    })
     .await
     .context("Executor server stopped unexpectedly");
     app.shutdown().await;
@@ -169,4 +213,39 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_retained_client_commands_and_global_connection_flags() {
+        let cli = Cli::try_parse_from([
+            "executor",
+            "--base-url",
+            "http://localhost:9000",
+            "--api-token",
+            "secret",
+            "--json",
+            "call",
+            "github",
+            "issues_create",
+            r#"{"title":"Bug"}"#,
+        ])
+        .expect("call command");
+        assert_eq!(cli.base_url, "http://localhost:9000");
+        assert_eq!(cli.api_token.as_deref(), Some("secret"));
+        assert!(cli.json);
+        let Command::Call(arguments) = cli.command else {
+            panic!("expected call command");
+        };
+        assert_eq!(arguments.values.len(), 3);
+
+        assert!(Cli::try_parse_from(["executor", "tools", "sources"]).is_ok());
+        assert!(Cli::try_parse_from(["executor", "mcp"]).is_ok());
+        assert!(Cli::try_parse_from(["executor", "open"]).is_ok());
+    }
 }

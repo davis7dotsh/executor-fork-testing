@@ -93,10 +93,10 @@ async fn delete_source(
     let admin = require_admin_mutation(&request_id, &state, &headers).await?;
     let Path(source_id) = parse_path(&request_id, path)?;
     state
-        .catalog
-        .delete_source(&source_id, AuditContext::admin(&request_id.0, admin.id))
+        .sources
+        .delete(&source_id, AuditContext::admin(&request_id.0, admin.id))
         .await
-        .map_err(|error| catalog_error(&request_id, error))?;
+        .map_err(|error| super::protocols::protocol_error(&request_id, error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
