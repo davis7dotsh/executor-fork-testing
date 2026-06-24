@@ -1,34 +1,42 @@
 <script lang="ts">
   import { tick } from "svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
-  import { createMcpHttpSource, type ApiError, type Source } from "$lib/api";
+  import type { ApiError, ApiResult, Source } from "$lib/api";
   import { useAuthState } from "$lib/auth.svelte";
   import { unexpectedRequestError } from "$lib/catalog-state";
   import {
-    buildMcpHttpCredential,
-    requiresPrivateNetworkOptIn,
-    type McpHttpAuthDraft,
-  } from "$lib/mcp-source-state";
+    buildGraphqlCredential,
+    clearGraphqlSecret,
+    emptyGraphqlAuthDraft,
+    normalizeGraphqlEndpoint,
+    requiresGraphqlPrivateNetworkOptIn,
+    type GraphqlAuthDraft,
+    type GraphqlSourceInput,
+  } from "$lib/graphql-source-state";
 
-  let { oncreated }: { oncreated: (source: Source) => void } = $props();
+  let {
+    create,
+    oncreated,
+  }: {
+    create: (input: GraphqlSourceInput, signal: AbortSignal) => Promise<ApiResult<Source>>;
+    oncreated: (source: Source) => void;
+  } = $props();
 
   const auth = useAuthState();
   let endpoint = $state("");
   let displayName = $state("");
+  let preferredSlug = $state("");
   let description = $state("");
   let allowPrivateNetwork = $state(false);
-  let credentialDraft = $state<McpHttpAuthDraft>({
-    type: "none",
-    headerName: "",
-    username: "",
-    secret: "",
-  });
+  let credentialDraft = $state<GraphqlAuthDraft>(emptyGraphqlAuthDraft());
   let busy = $state(false);
   let error = $state<ApiError | null>(null);
+  let credential = $derived(buildGraphqlCredential(credentialDraft));
+  let normalizedEndpoint = $derived(normalizeGraphqlEndpoint(endpoint));
+  let endpointInvalid = $derived(endpoint.trim() !== "" && normalizedEndpoint === null);
   let localOptInMissing = $derived(
-    endpoint.trim() !== "" && requiresPrivateNetworkOptIn(endpoint) && !allowPrivateNetwork,
+    endpoint.trim() !== "" && requiresGraphqlPrivateNetworkOptIn(endpoint) && !allowPrivateNetwork,
   );
-  let credentialPayload = $derived(buildMcpHttpCredential(credentialDraft));
   let activeController: AbortController | null = null;
   let lifetime = 0;
 
@@ -38,14 +46,26 @@
       lifetime += 1;
       activeController?.abort();
       activeController = null;
-      credentialDraft = { ...credentialDraft, secret: "" };
+      credentialDraft = clearGraphqlSecret(credentialDraft);
     };
   });
 
+  function changeAuthType() {
+    credentialDraft = {
+      ...credentialDraft,
+      headerName: "",
+      username: "",
+      secret: "",
+    };
+  }
+
   async function connect(event: SubmitEvent) {
     event.preventDefault();
-    const currentCredential = credentialPayload;
-    if (busy || localOptInMissing || currentCredential === null) return;
+    const currentCredential = credential;
+    const currentEndpoint = normalizedEndpoint;
+    if (busy || localOptInMissing || currentCredential === undefined || currentEndpoint === null) {
+      return;
+    }
 
     activeController?.abort();
     const controller = new AbortController();
@@ -53,18 +73,17 @@
     activeController = controller;
     busy = true;
     error = null;
-    const settled = await createMcpHttpSource(
+    credentialDraft = clearGraphqlSecret(credentialDraft);
+    const settled = await create(
       {
-        kind: "mcp_http",
+        kind: "graphql",
         displayName: displayName.trim(),
+        ...(preferredSlug.trim() ? { preferredSlug: preferredSlug.trim() } : {}),
         ...(description.trim() ? { description: description.trim() } : {}),
-        endpoint: endpoint.trim(),
+        endpoint: currentEndpoint,
         allowPrivateNetwork,
-        ...(currentCredential.credential === null
-          ? {}
-          : { credential: currentCredential.credential }),
+        ...(currentCredential === null ? {} : { credential: currentCredential }),
       },
-      undefined,
       controller.signal,
     ).then(
       (result) => ({ ok: true, result }) as const,
@@ -73,7 +92,6 @@
     if (owner !== lifetime || activeController !== controller || controller.signal.aborted) return;
     activeController = null;
     busy = false;
-    credentialDraft = { ...credentialDraft, secret: "" };
 
     if (!settled.ok) {
       error = unexpectedRequestError();
@@ -91,38 +109,49 @@
     const source = settled.result.value;
     endpoint = "";
     displayName = "";
+    preferredSlug = "";
     description = "";
     allowPrivateNetwork = false;
-    credentialDraft = { type: "none", headerName: "", username: "", secret: "" };
+    credentialDraft = emptyGraphqlAuthDraft();
     oncreated(source);
   }
 
   async function focusError() {
     await tick();
-    document.getElementById("mcp-http-error")?.focus();
+    document.getElementById("graphql-source-error")?.focus();
   }
 </script>
 
-<form class="mcp-form" onsubmit={connect} aria-labelledby="mcp-http-form-title">
+<form class="graphql-form" onsubmit={connect} aria-labelledby="graphql-form-title">
   <fieldset disabled={busy}>
-    <legend id="mcp-http-form-title">MCP Streamable HTTP</legend>
-    <p>
-      Connect a remote or local MCP server. Executor negotiates the protocol and imports its tool
-      catalog.
-    </p>
+    <legend id="graphql-form-title">GraphQL API</legend>
+    <p>Connect an introspection-enabled GraphQL endpoint and import its queries and mutations.</p>
     <label>
       Endpoint
       <input
         type="url"
         required
         bind:value={endpoint}
-        placeholder="https://mcp.example.com/mcp"
-        aria-describedby="mcp-http-connection-policy"
+        placeholder="https://api.example.com/graphql"
+        aria-invalid={endpointInvalid}
+        aria-describedby={endpointInvalid
+          ? "graphql-endpoint-error graphql-connection-policy"
+          : "graphql-connection-policy"}
       />
     </label>
+    {#if endpointInvalid}
+      <p id="graphql-endpoint-error" class="field-error">
+        Use HTTPS without user info, query parameters, or fragments. Plain HTTP is allowed only for
+        loopback development. Put secrets in Authentication.
+      </p>
+    {/if}
     <label>
       Source name
-      <input required maxlength="120" bind:value={displayName} placeholder="Issue tracker" />
+      <input required maxlength="120" bind:value={displayName} placeholder="Product API" />
+    </label>
+    <label>
+      Preferred slug (optional)
+      <input maxlength="80" autocomplete="off" bind:value={preferredSlug} placeholder="product" />
     </label>
     <label>
       Description (optional)
@@ -140,16 +169,7 @@
       <legend>Authentication</legend>
       <label>
         Method
-        <select
-          bind:value={credentialDraft.type}
-          onchange={() =>
-            (credentialDraft = {
-              ...credentialDraft,
-              headerName: "",
-              username: "",
-              secret: "",
-            })}
-        >
+        <select bind:value={credentialDraft.type} onchange={changeAuthType}>
           <option value="none">None</option>
           <option value="bearer">Bearer token</option>
           <option value="basic">Basic auth</option>
@@ -181,6 +201,9 @@
           <input type="password" required autocomplete="off" bind:value={credentialDraft.secret} />
         </label>
       {/if}
+      {#if credentialDraft.type === "oauth_access_token"}
+        <p class="field-help">Paste an access token managed outside Executor.</p>
+      {/if}
       <p class="field-help">Credentials are encrypted locally and never shown again.</p>
     </fieldset>
     {#if localOptInMissing}
@@ -190,10 +213,10 @@
     {/if}
   </fieldset>
 
-  <dl id="mcp-http-connection-policy" class="connection-policy">
+  <dl id="graphql-connection-policy" class="connection-policy">
     <div>
-      <dt>Sessions</dt>
-      <dd>Kept in memory and never displayed</dd>
+      <dt>Introspection</dt>
+      <dd>Required when connecting and refreshing</dd>
     </div>
     <div>
       <dt>Redirects</dt>
@@ -206,19 +229,23 @@
   </dl>
 
   {#if error !== null}
-    <div id="mcp-http-error" tabindex="-1"><ErrorNotice {error} /></div>
+    <div id="graphql-source-error" tabindex="-1"><ErrorNotice {error} /></div>
   {/if}
+  <p class="field-help">
+    Queries start Enabled, mutations start Ask, and deprecated operations start Disabled. Review or
+    change any mode from Tools after connecting.
+  </p>
   <button
     class="primary"
     type="submit"
-    disabled={busy || localOptInMissing || credentialPayload === null}
+    disabled={busy || localOptInMissing || normalizedEndpoint === null || credential === undefined}
   >
     {busy ? "Connecting..." : "Connect source"}
   </button>
 </form>
 
 <style>
-  .mcp-form {
+  .graphql-form {
     display: grid;
     gap: 1rem;
     padding: 1.3rem;
@@ -269,18 +296,18 @@
   dt {
     color: #8f9bb1;
     font-size: 0.65rem;
-    font-weight: 750;
-    letter-spacing: 0.06em;
+    font-weight: 800;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
   }
 
   dd {
-    margin: 0.3rem 0 0;
-    color: #d7dde8;
-    font-size: 0.76rem;
+    margin: 0.35rem 0 0;
+    color: #d9deea;
+    font-size: 0.78rem;
   }
 
-  @media (max-width: 640px) {
+  @media (max-width: 720px) {
     .connection-policy {
       grid-template-columns: 1fr;
     }

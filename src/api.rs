@@ -30,6 +30,7 @@ use crate::{
     execution::ExecutionService,
     invocation::ToolCallService,
     mcp::downstream::McpState,
+    oauth::OAuthService,
     protocols::SourceService,
     request_logs::RequestLogSink,
     tasks::TaskTracker,
@@ -38,6 +39,7 @@ use crate::{
 
 mod approvals;
 mod catalog;
+mod oauth;
 pub(crate) mod openapi;
 mod protocols;
 
@@ -71,6 +73,7 @@ struct AppState {
     tool_calls: ToolCallService,
     execution: ExecutionService,
     mcp: McpState,
+    oauth: OAuthService,
     request_logs: RequestLogSink,
     origin: Arc<str>,
     session_ttl_seconds: i64,
@@ -428,6 +431,7 @@ pub(crate) struct ApiServices {
     tool_calls: ToolCallService,
     execution: ExecutionService,
     mcp: McpState,
+    oauth: OAuthService,
 }
 
 impl ApiServices {
@@ -436,12 +440,14 @@ impl ApiServices {
         tool_calls: ToolCallService,
         execution: ExecutionService,
         mcp: McpState,
+        oauth: OAuthService,
     ) -> Self {
         Self {
             sources,
             tool_calls,
             execution,
             mcp,
+            oauth,
         }
     }
 }
@@ -521,6 +527,7 @@ pub(crate) fn router(
         tool_calls: services.tool_calls,
         execution: services.execution,
         mcp: services.mcp,
+        oauth: services.oauth,
         request_logs,
         origin: Arc::from(config.public_origin()),
         session_ttl_seconds: config.session_ttl_seconds,
@@ -547,6 +554,7 @@ pub(crate) fn router(
         .merge(approvals::router())
         .merge(protocols::router())
         .merge(openapi::router())
+        .merge(oauth::router())
         .merge(crate::mcp::downstream::router(state.mcp.clone()))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

@@ -24,6 +24,7 @@ use crate::{
         RequestOutcome, RequestSurface, ToolMode,
     },
     crypto::Keyring,
+    oauth::{OAuthBinding, OAuthError, OAuthService},
     outbound::OutboundError,
     protocols::{
         PreparedProtocolInvocation, ProtocolError, ProtocolInvocationError, ProtocolRegistry,
@@ -117,6 +118,7 @@ pub struct ToolCallService {
     approval_queries: ApprovalQueries,
     idempotency: GatewayIdempotencyStore,
     request_logs: RequestLogSink,
+    oauth: OAuthService,
     approval_notifications: ApprovalNotificationRegistry,
     global_approval_notify: Arc<Notify>,
     expiry_slot: Arc<Semaphore>,
@@ -718,6 +720,7 @@ impl ToolCallService {
         pool: SqlitePool,
         keyring: Keyring,
         request_logs: RequestLogSink,
+        oauth: OAuthService,
     ) -> Self {
         let idempotency = GatewayIdempotencyStore::new(pool.clone(), keyring.clone());
         let approvals = ApprovalStore::system(pool, keyring);
@@ -730,6 +733,7 @@ impl ToolCallService {
             approvals,
             idempotency,
             request_logs,
+            oauth,
             approval_notifications: Arc::new(Mutex::new(HashMap::new())),
             global_approval_notify: Arc::new(Notify::new()),
             expiry_slot: Arc::new(Semaphore::new(1)),
@@ -1057,6 +1061,11 @@ impl ToolCallService {
         if lookup.requires_approval {
             let input_schema = preflight.input_schema().clone();
             drop(preflight);
+            let oauth_bindings = self
+                .oauth
+                .bindings_for_source(&lookup.source_id)
+                .await
+                .map_err(oauth_tool_error)?;
             let invocation_snapshot = json!({
                 "version": 1,
                 "requestId": call.request_id.clone(),
@@ -1069,6 +1078,7 @@ impl ToolCallService {
                 "path": lookup.callable_path.clone(),
                 "sourceId": lookup.source_id.clone(),
                 "toolId": lookup.tool_id.clone(),
+                "oauthBindings": oauth_bindings,
             });
             let service = self.clone();
             let (completed, result) = oneshot::channel();
@@ -1140,7 +1150,7 @@ impl ToolCallService {
             .revalidate_invocation(&token)
             .await?
             .ok_or(ToolCallError::Stale)?;
-        let result = execute_with_lease(&self.protocols, lease, &call.arguments).await;
+        let result = execute_with_lease(&self.protocols, lease, &call.arguments, None).await;
         match result {
             Ok(result) => {
                 self.record_attempt(
@@ -1152,7 +1162,7 @@ impl ToolCallService {
                     } else {
                         RequestOutcome::Failed
                     },
-                    (!result.ok).then_some("upstream_http_error"),
+                    completed_failure_code(&result),
                     None,
                     started,
                 );
@@ -1263,6 +1273,11 @@ impl ToolCallService {
         if lookup.requires_approval {
             let input_schema = preflight.input_schema().clone();
             drop(preflight);
+            let oauth_bindings = self
+                .oauth
+                .bindings_for_source(&lookup.source_id)
+                .await
+                .map_err(oauth_tool_error)?;
             let invocation_snapshot = json!({
                 "version": 1,
                 "requestId": call.request_id.clone(),
@@ -1275,6 +1290,7 @@ impl ToolCallService {
                 "path": lookup.callable_path.clone(),
                 "sourceId": lookup.source_id.clone(),
                 "toolId": lookup.tool_id.clone(),
+                "oauthBindings": oauth_bindings,
             });
             let pending = self
                 .approvals
@@ -1338,7 +1354,8 @@ impl ToolCallService {
                 return Err(ToolCallError::Stale.into());
             }
         };
-        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments) {
+        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments, None).await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.idempotency
@@ -1566,6 +1583,11 @@ impl ToolCallService {
 
         if lookup.requires_approval {
             let input_schema = preflight.input_schema().clone();
+            let oauth_bindings = self
+                .oauth
+                .bindings_for_source(&lookup.source_id)
+                .await
+                .map_err(oauth_tool_error)?;
             let invocation_snapshot = json!({
                 "version": 1,
                 "requestId": call.request_id.clone(),
@@ -1578,6 +1600,7 @@ impl ToolCallService {
                 "path": lookup.callable_path.clone(),
                 "sourceId": lookup.source_id.clone(),
                 "toolId": lookup.tool_id.clone(),
+                "oauthBindings": oauth_bindings,
             });
             let pending = match self
                 .approvals
@@ -1700,7 +1723,8 @@ impl ToolCallService {
                 return Err(ToolCallError::Catalog(error).into());
             }
         };
-        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments) {
+        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments, None).await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.idempotency
@@ -1784,7 +1808,7 @@ impl ToolCallService {
             } else {
                 RequestOutcome::Failed
             },
-            (!result.ok).then_some("upstream_http_error"),
+            completed_failure_code(&result),
             None,
             started,
         );
@@ -2749,6 +2773,38 @@ impl ToolCallService {
             return Ok(());
         }
         let expected_revision = record.revision;
+        let expected_oauth_bindings = match self
+            .approvals
+            .invocation_snapshot(approval_id)
+            .await?
+            .and_then(|snapshot| snapshot.get("oauthBindings").cloned())
+            .map(serde_json::from_value::<Vec<OAuthBinding>>)
+        {
+            Some(Ok(bindings)) => bindings,
+            Some(Err(_)) | None => {
+                self.approvals
+                    .mark_stale(approval_id, expected_revision, "oauth_binding_stale")
+                    .await?;
+                self.schedule_approval_log_flush();
+                self.notify_approval(approval_id);
+                self.wait_for_delivery_release(approval_id).await?;
+                return Ok(());
+            }
+        };
+        if !self
+            .oauth
+            .bindings_match(&record.revisions.source_id, &expected_oauth_bindings)
+            .await
+            .unwrap_or(false)
+        {
+            self.approvals
+                .mark_stale(approval_id, expected_revision, "oauth_binding_stale")
+                .await?;
+            self.schedule_approval_log_flush();
+            self.notify_approval(approval_id);
+            self.wait_for_delivery_release(approval_id).await?;
+            return Ok(());
+        }
         let token = record.revisions.clone().into();
         let lease = match self.catalog.revalidate_invocation(&token).await {
             Ok(Some(lease)) => lease,
@@ -2877,10 +2933,22 @@ impl ToolCallService {
                 http: None,
             })
         } else {
-            execute_with_lease(&self.protocols, lease, &snapshot.arguments).await
+            execute_with_lease(
+                &self.protocols,
+                lease,
+                &snapshot.arguments,
+                Some(&expected_oauth_bindings),
+            )
+            .await
         };
         #[cfg(not(test))]
-        let result = execute_with_lease(&self.protocols, lease, &snapshot.arguments).await;
+        let result = execute_with_lease(
+            &self.protocols,
+            lease,
+            &snapshot.arguments,
+            Some(&expected_oauth_bindings),
+        )
+        .await;
         if result.is_err()
             && let Some(execution) = mcp_idempotency_execution.as_mut()
         {
@@ -2890,12 +2958,16 @@ impl ToolCallService {
                 .map_err(idempotency_tool_call_error)?;
             execution.disarm();
         }
+        let completed_failure_code = result
+            .as_ref()
+            .ok()
+            .and_then(|result| completed_failure_code(result).map(str::to_owned));
         let (tool_result, outcome, failure_code) = match result {
             Ok(result) if result.ok => (result, ExecutionOutcome::Succeeded, None),
             Ok(result) => (
                 result,
                 ExecutionOutcome::Failed,
-                Some("upstream_http_error"),
+                completed_failure_code.as_deref(),
             ),
             Err(error) => (
                 error_result(&error),
@@ -3104,22 +3176,32 @@ fn notify_registry(registry: &ApprovalNotificationRegistry, approval_id: &str) {
     }
 }
 
+fn oauth_tool_error(_error: OAuthError) -> ToolCallError {
+    ToolCallError::Adapter {
+        code: "oauth_connection_failed",
+        message: "The managed OAuth connection could not be resolved safely.".to_owned(),
+    }
+}
+
 pub(crate) async fn execute_with_lease(
     protocols: &ProtocolRegistry,
     lease: InvocationLease,
     arguments: &Value,
+    expected_oauth_bindings: Option<&[OAuthBinding]>,
 ) -> Result<ToolResult, ToolCallError> {
-    let prepared = prepare_with_lease(protocols, lease, arguments)?;
+    let prepared = prepare_with_lease(protocols, lease, arguments, expected_oauth_bindings).await?;
     execute_prepared(protocols, prepared).await
 }
 
-fn prepare_with_lease(
+async fn prepare_with_lease(
     protocols: &ProtocolRegistry,
     lease: InvocationLease,
     arguments: &Value,
+    expected_oauth_bindings: Option<&[OAuthBinding]>,
 ) -> Result<PreparedProtocolInvocation, ToolCallError> {
     protocols
-        .prepare_invocation(lease, arguments)
+        .prepare_invocation(lease, arguments, expected_oauth_bindings)
+        .await
         .map_err(ToolCallError::Protocol)
 }
 
@@ -3131,7 +3213,22 @@ async fn execute_prepared(
         .execute_invocation(prepared)
         .await
         .map_err(|error| match error {
-            ProtocolInvocationError::Outbound(error) => ToolCallError::Outbound(error),
+            ProtocolInvocationError::OpenApi(error) => ToolCallError::Adapter {
+                code: if error.outcome_unknown() {
+                    "openapi_outcome_unknown"
+                } else {
+                    error.code()
+                },
+                message: "The upstream OpenAPI operation could not be completed safely.".to_owned(),
+            },
+            ProtocolInvocationError::Graphql(error) => ToolCallError::Adapter {
+                code: if error.outcome_unknown() {
+                    "graphql_outcome_unknown"
+                } else {
+                    "graphql_invocation_failed"
+                },
+                message: "The upstream GraphQL operation could not be completed safely.".to_owned(),
+            },
             ProtocolInvocationError::Mcp(error) => ToolCallError::Adapter {
                 code: if error.outcome_unknown() {
                     "mcp_outcome_unknown"
@@ -3158,6 +3255,16 @@ async fn execute_prepared(
         return Err(ToolCallError::ResultTooLarge);
     }
     Ok(result)
+}
+
+fn completed_failure_code(result: &ToolResult) -> Option<&str> {
+    (!result.ok).then(|| {
+        result
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str())
+            .unwrap_or("upstream_http_error")
+    })
 }
 
 fn tool_result_response(result: &ToolResult) -> Result<IdempotencyResponse, IdempotencyError> {
@@ -3393,6 +3500,20 @@ mod idempotency_guard_tests {
     };
 
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+    #[test]
+    fn completed_protocol_failures_preserve_their_stable_error_code() {
+        let result = ToolResult {
+            ok: false,
+            data: None,
+            error: Some(PublicToolError {
+                code: "graphql_error".to_owned(),
+                message: "sanitized".to_owned(),
+            }),
+            http: None,
+        };
+        assert_eq!(completed_failure_code(&result), Some("graphql_error"));
+    }
 
     async fn app_with_mcp_ask_tool_at(server_url: &str) -> (tempfile::TempDir, ExecutorApp) {
         let directory = tempfile::tempdir().expect("temporary directory");

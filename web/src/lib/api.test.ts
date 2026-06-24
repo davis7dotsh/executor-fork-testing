@@ -2,18 +2,23 @@ import { describe, expect, it } from "@effect/vitest";
 import { Schema } from "effect";
 import {
   ApiError,
+  authorizeOAuthConnection,
   bulkSetToolModes,
+  createGraphqlSource,
   createMcpHttpSource,
   createMcpStdioSource,
   createOpenApiSource,
   createToken,
   decideApproval,
+  deleteOAuthConnection,
   deleteOpenApiCredentials,
   getApproval,
   getOpenApiCredentials,
   getSourceCredentials,
   getBootstrap,
+  disconnectOAuthConnection,
   listApprovals,
+  listOAuthConnections,
   listMcpStdioTemplates,
   listRequestLogs,
   listSources,
@@ -24,6 +29,8 @@ import {
   putOpenApiCredentials,
   putMcpHttpCredentials,
   putMcpStdioCredentials,
+  putOAuthConnection,
+  putGraphqlCredentials,
   refreshOpenApiSource,
   setSourceMode,
 } from "./api";
@@ -356,7 +363,7 @@ describe("dashboard API client", () => {
     );
 
     expect(result.ok && result.value.sources[0]?.configuration).toEqual({
-      endpoint: "https://mcp.example.test/mcp",
+      endpoint: "https://mcp.example.test",
       allowPrivateNetwork: false,
     });
     expect(JSON.stringify(result)).not.toContain(secret);
@@ -602,6 +609,78 @@ describe("dashboard API client", () => {
     );
   });
 
+  it("creates GraphQL sources with the flattened credential contract and redacted public endpoint", async () => {
+    const secret = "graphql-query-secret";
+    let body: unknown;
+    const result = await createGraphqlSource(
+      {
+        kind: "graphql",
+        displayName: "Product API",
+        preferredSlug: "product",
+        endpoint: `https://api.example.test/graphql?token=${secret}`,
+        allowPrivateNetwork: false,
+        credential: { type: "bearer", token: "bearer-secret" },
+      },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources");
+        body = decodeJson(String(init?.body));
+        return Response.json(
+          {
+            ...sourceFixture(),
+            kind: "graphql",
+            slug: "product",
+            displayName: "Product API",
+            configuration: {
+              endpoint: `https://api.example.test/graphql?token=${secret}`,
+              allowPrivateNetwork: false,
+              encryptedEndpoint: secret,
+            },
+          },
+          { status: 201 },
+        );
+      },
+    );
+
+    expect(body).toEqual({
+      kind: "graphql",
+      displayName: "Product API",
+      preferredSlug: "product",
+      endpoint: `https://api.example.test/graphql?token=${secret}`,
+      allowPrivateNetwork: false,
+      credential: { type: "bearer", token: "bearer-secret" },
+    });
+    expect(result.ok && result.value.configuration).toEqual({
+      endpoint: "https://api.example.test",
+      allowPrivateNetwork: false,
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain("bearer-secret");
+  });
+
+  it("strips path credentials from source endpoints before browser state", async () => {
+    const pathSecret = "path-secret-never-render";
+    const result = await listSources(async () =>
+      Response.json({
+        sources: [
+          {
+            ...sourceFixture(),
+            kind: "graphql",
+            configuration: {
+              endpoint: `https://api.example.test/graphql/${pathSecret}`,
+              allowPrivateNetwork: false,
+            },
+          },
+        ],
+        catalogRevision: 12,
+      }),
+    );
+
+    expect(result.ok && result.value.sources[0]?.configuration.endpoint).toBe(
+      "https://api.example.test",
+    );
+    expect(JSON.stringify(result)).not.toContain(pathSecret);
+  });
+
   it("lists trusted stdio templates without decoding raw process configuration", async () => {
     const secret = "raw-process-secret";
     const result = await listMcpStdioTemplates(async (input) => {
@@ -709,6 +788,147 @@ describe("dashboard API client", () => {
         credential: { secretValues: { TOKEN: " exact secret " } },
       },
     ]);
+  });
+
+  it("sends GraphQL replacement and clear credentials without an extra envelope", async () => {
+    const bodies: unknown[] = [];
+    await putGraphqlCredentials(
+      "graphql/source",
+      7,
+      { type: "api_key_header", name: "X-Service-Key", value: " exact secret " },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources/graphql%2Fsource/credentials");
+        bodies.push(decodeJson(String(init?.body)));
+        return Response.json({
+          revision: 8,
+          configuredSchemes: [{ name: "default", credentialType: "api_key_header" }],
+        });
+      },
+    );
+    await putGraphqlCredentials("graphql/source", 8, null, async (_input, init) => {
+      bodies.push(decodeJson(String(init?.body)));
+      return Response.json({ revision: 9, configuredSchemes: [] });
+    });
+
+    expect(bodies).toEqual([
+      {
+        expectedRevision: 7,
+        credential: {
+          type: "api_key_header",
+          name: "X-Service-Key",
+          value: " exact secret ",
+        },
+      },
+      { expectedRevision: 8, credential: null },
+    ]);
+  });
+
+  it("strictly decodes managed OAuth metadata and sends credential-keyed CAS operations", async () => {
+    const secret = "oauth-secret-never-decode";
+    const connection = {
+      id: "connection-1",
+      credentialKey: "oauth/scheme",
+      revision: 4,
+      status: "connected",
+      issuer: "https://identity.example.test/",
+      clientId: "executor-client",
+      clientAuthMethod: "client_secret_basic",
+      callbackUrl: "https://executor.example.test/api/v1/oauth/callback/connection-1",
+      requestedScopes: ["read"],
+      grantedScopes: ["read"],
+      hasClientSecret: true,
+      hasRefreshToken: true,
+      accessExpiresAt: 900,
+      authorizedAt: 100,
+      lastRefreshedAt: 200,
+      errorCode: null,
+      managedOAuthEligible: true,
+    } as const;
+    const listed = await listOAuthConnections("source/1", async (input) => {
+      expect(String(input)).toBe("/api/v1/sources/source%2F1/oauth");
+      return Response.json({
+        connections: [
+          {
+            ...connection,
+            managedOAuthEligible: false,
+            accessToken: secret,
+            clientSecret: secret,
+          },
+        ],
+        availableCredentials: [
+          {
+            credentialKey: "oauth/scheme",
+            protocol: "openapi",
+            requestedScopes: ["read"],
+            managedOAuthEligible: true,
+            providerMetadata: secret,
+          },
+        ],
+        tokenResponse: secret,
+      });
+    });
+    expect(listed.ok).toBe(true);
+    expect(listed.ok && listed.value.connections[0]?.managedOAuthEligible).toBe(false);
+    expect(JSON.stringify(listed)).not.toContain(secret);
+
+    const bodies: unknown[] = [];
+    const saveInput = {
+      expectedRevision: 4,
+      discovery: { type: "issuer" as const, issuer: "https://identity.example.test/" },
+      client: {
+        clientId: "executor-client",
+        authentication: "client_secret_basic" as const,
+        clientSecret: { action: "preserve" as const },
+      },
+      scopes: ["read"],
+    };
+    await putOAuthConnection("source/1", "oauth/scheme", saveInput, async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/source%2F1/oauth/oauth%2Fscheme");
+      bodies.push(decodeJson(String(init?.body)));
+      return Response.json({ ...connection, revision: 5 });
+    });
+    await authorizeOAuthConnection(
+      "source/1",
+      "oauth/scheme",
+      { expectedRevision: 5 },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources/source%2F1/oauth/oauth%2Fscheme/authorize");
+        bodies.push(decodeJson(String(init?.body)));
+        return Response.json({
+          authorizationUrl: "https://identity.example.test/authorize?state=opaque",
+          state: secret,
+        });
+      },
+    );
+    const disconnected = await disconnectOAuthConnection(
+      "source/1",
+      "oauth/scheme",
+      { expectedRevision: 5 },
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources/source%2F1/oauth/oauth%2Fscheme/disconnect");
+        bodies.push(decodeJson(String(init?.body)));
+        return Response.json({
+          ...connection,
+          revision: 6,
+          status: "ready_to_connect",
+          managedOAuthEligible: false,
+        });
+      },
+    );
+    expect(disconnected.ok && disconnected.value.managedOAuthEligible).toBe(false);
+    await deleteOAuthConnection(
+      "source/1",
+      "oauth/scheme",
+      { expectedRevision: 6 },
+      async (input, init) => {
+        expect(String(input)).toBe(
+          "/api/v1/sources/source%2F1/oauth/oauth%2Fscheme?expectedRevision=6",
+        );
+        expect(init?.method).toBe("DELETE");
+        return new Response(null, { status: 204 });
+      },
+    );
+    expect(bodies).toEqual([saveInput, { expectedRevision: 5 }, { expectedRevision: 5 }]);
   });
 
   it("decodes OpenAPI refresh counts", async () => {

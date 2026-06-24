@@ -6,7 +6,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
     routing::get,
 };
-use executor::catalog::{AuditContext, CreateSource, SourceKind, ToolMode};
+use executor::catalog::{AuditContext, ToolMode};
 use executor::{AppConfig, ExecutorApp};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -663,53 +663,12 @@ async fn large_body_routes_authenticate_before_parsing_json() {
 }
 
 #[tokio::test]
-async fn openapi_credentials_reject_other_protocols_and_unknown_schema_versions() {
+async fn openapi_credentials_reject_unknown_schema_versions() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
         .await
         .expect("Executor should open");
     let admin = setup(&app).await;
-    let graphql = app
-        .catalog()
-        .create_source(
-            CreateSource {
-                kind: SourceKind::Graphql,
-                preferred_slug: "graphql".to_owned(),
-                display_name: "GraphQL".to_owned(),
-                description: None,
-                configuration: serde_json::Map::new(),
-            },
-            AuditContext::system(Some("protocol-credential-contract")),
-        )
-        .await
-        .expect("GraphQL source should create");
-    let response = send(
-        app.router(),
-        Method::GET,
-        &format!("/api/v1/sources/{}/credentials", graphql.id),
-        json!(null),
-        &[(header::COOKIE.as_str(), admin.cookie.as_str())],
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body(response).await["error"]["code"],
-        "unsupported_source_kind"
-    );
-    let response = send(
-        app.router(),
-        Method::PUT,
-        &format!("/api/v1/sources/{}/credentials", graphql.id),
-        json!({ "expectedRevision": 0, "credential": {} }),
-        &admin_headers(&admin),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body(response).await["error"]["code"],
-        "unsupported_source_kind"
-    );
-
     let specification = json!({
         "openapi": "3.1.0",
         "info": { "title": "Credential schema" },

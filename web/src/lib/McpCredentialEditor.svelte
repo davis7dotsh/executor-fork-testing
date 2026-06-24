@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
   import {
     getSourceCredentials,
@@ -21,7 +21,11 @@
     type McpTemplateField,
   } from "$lib/mcp-source-state";
 
-  let { source, disabled = false }: { source: Source; disabled?: boolean } = $props();
+  let {
+    source,
+    disabled = false,
+    onbusychange,
+  }: { source: Source; disabled?: boolean; onbusychange?: (busy: boolean) => void } = $props();
 
   const auth = useAuthState();
   const latest = createLatestRequest();
@@ -42,6 +46,7 @@
   let cleanupLoad: (() => void) | null = null;
   let saveController: AbortController | null = null;
   let lifetime = 0;
+  let reportedBusy = false;
   let httpCredential = $derived(buildMcpHttpCredential(httpDraft));
   let stdioCredential = $derived(validateTemplateDraft(stdioFields, stdioSecrets));
 
@@ -51,10 +56,32 @@
       lifetime += 1;
       cleanupLoad?.();
       saveController?.abort();
+      if (reportedBusy) onbusychange?.(false);
     };
   });
 
+  $effect(() => {
+    const busy = loading || saving;
+    if (busy === reportedBusy) return;
+    reportedBusy = busy;
+    onbusychange?.(busy);
+  });
+
+  $effect(() => {
+    if (!disabled) return;
+    untrack(() => {
+      cleanupLoad?.();
+      cleanupLoad = null;
+      saveController?.abort();
+      saveController = null;
+      loading = false;
+      saving = false;
+      clearSecretDrafts();
+    });
+  });
+
   function toggle() {
+    if (disabled) return;
     if (open) {
       closeEditor();
       return;
@@ -65,6 +92,7 @@
   }
 
   function loadEditor() {
+    if (disabled) return;
     loading = true;
     error = null;
     revision = null;
@@ -135,7 +163,7 @@
     const expectedRevision = revision;
     const currentHttpCredential = httpCredential;
     const currentStdioCredential = stdioCredential;
-    if (saving || expectedRevision === null) return;
+    if (disabled || saving || expectedRevision === null) return;
     if (source.kind !== "mcp_http" && source.kind !== "mcp_stdio") return;
     if (source.kind === "mcp_http" && currentHttpCredential === null) return;
     if (source.kind === "mcp_stdio" && currentStdioCredential === null) return;
@@ -259,7 +287,7 @@
     {#if loading}
       <p aria-live="polite">Loading credential metadata...</p>
     {:else if revision !== null && source.kind === "mcp_http"}
-      <fieldset disabled={saving}>
+      <fieldset disabled={saving || disabled}>
         <legend>HTTP authentication</legend>
         <label>
           Method
@@ -272,7 +300,7 @@
             <option value="bearer">Bearer token</option>
             <option value="basic">Basic auth</option>
             <option value="api_key_header">API key header</option>
-            <option value="oauth_access_token">OAuth access token</option>
+            <option value="oauth_access_token">OAuth access token (manual, advanced)</option>
           </select>
         </label>
         {#if httpDraft.type === "api_key_header"}
@@ -301,7 +329,7 @@
         {/if}
       </fieldset>
     {:else if revision !== null && source.kind === "mcp_stdio"}
-      <fieldset disabled={saving}>
+      <fieldset disabled={saving || disabled}>
         <legend>Template secrets</legend>
         {#each stdioFields as field (field.key)}
           <label>
@@ -325,12 +353,13 @@
       <div id={`mcp-credential-error-${source.id}`} tabindex="-1"><ErrorNotice {error} /></div>
     {/if}
     <div class="button-row">
-      <button type="button" disabled={saving} onclick={closeEditor}>Cancel</button>
+      <button type="button" disabled={saving || disabled} onclick={closeEditor}>Cancel</button>
       <button
         type="submit"
         class="primary"
         disabled={loading ||
           saving ||
+          disabled ||
           revision === null ||
           (source.kind === "mcp_http" ? httpCredential === null : stdioCredential === null)}
       >

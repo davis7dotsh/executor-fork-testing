@@ -1,4 +1,20 @@
 import { Option, Schema } from "effect";
+import type { GraphqlCredential, GraphqlSourceInput } from "$lib/graphql-source-state";
+import type {
+  OAuthAuthorization,
+  OAuthConnectionInput,
+  OAuthConnectionList,
+  OAuthConnectionSummary,
+} from "$lib/oauth-connection-state";
+
+export type { GraphqlCredential, GraphqlSourceInput } from "$lib/graphql-source-state";
+export type {
+  OAuthAuthorization,
+  OAuthAvailableCredential,
+  OAuthConnectionInput,
+  OAuthConnectionList,
+  OAuthConnectionSummary,
+} from "$lib/oauth-connection-state";
 
 const BootstrapSchema = Schema.Struct({
   setupRequired: Schema.Boolean,
@@ -137,6 +153,49 @@ const McpStdioTemplateListSchema = Schema.Struct({
     }),
   ),
 });
+
+const OAuthConnectionStatusSchema = Schema.Literals([
+  "not_configured",
+  "ready_to_connect",
+  "connecting",
+  "connected",
+  "reauthorization_required",
+  "error",
+]);
+
+const OAuthConnectionSummarySchema = Schema.Struct({
+  id: Schema.String,
+  credentialKey: Schema.String,
+  revision: Schema.Number,
+  status: OAuthConnectionStatusSchema,
+  issuer: Schema.String,
+  clientId: Schema.String,
+  clientAuthMethod: Schema.Literals(["none", "client_secret_basic", "client_secret_post"]),
+  callbackUrl: Schema.String,
+  requestedScopes: Schema.Array(Schema.String),
+  grantedScopes: Schema.Array(Schema.String),
+  hasClientSecret: Schema.Boolean,
+  hasRefreshToken: Schema.Boolean,
+  accessExpiresAt: Schema.NullOr(Schema.Number),
+  authorizedAt: Schema.NullOr(Schema.Number),
+  lastRefreshedAt: Schema.NullOr(Schema.Number),
+  errorCode: Schema.NullOr(Schema.String),
+  managedOAuthEligible: Schema.Boolean,
+});
+
+const OAuthAvailableCredentialSchema = Schema.Struct({
+  credentialKey: Schema.String,
+  protocol: Schema.Literals(["openapi", "graphql", "mcp_http"]),
+  requestedScopes: Schema.Array(Schema.String),
+  managedOAuthEligible: Schema.Literal(true),
+});
+
+const OAuthConnectionListSchema = Schema.Struct({
+  connections: Schema.Array(OAuthConnectionSummarySchema),
+  availableCredentials: Schema.Array(OAuthAvailableCredentialSchema),
+});
+
+const OAuthAuthorizationSchema = Schema.Struct({ authorizationUrl: Schema.String });
 
 const CatalogSyncResultSchema = Schema.Struct({
   sourceId: Schema.String,
@@ -318,8 +377,17 @@ const decodeBootstrap = Schema.decodeUnknownOption(Schema.fromJsonString(Bootstr
 const decodeSession = Schema.decodeUnknownOption(Schema.fromJsonString(SessionSchema));
 const decodeCreatedToken = Schema.decodeUnknownOption(Schema.fromJsonString(CreatedTokenSchema));
 const decodeTokenList = Schema.decodeUnknownOption(Schema.fromJsonString(TokenListSchema));
-const decodeSource = Schema.decodeUnknownOption(Schema.fromJsonString(SourceSchema));
-const decodeSourceList = Schema.decodeUnknownOption(Schema.fromJsonString(SourceListSchema));
+const decodeRawSource = Schema.decodeUnknownOption(Schema.fromJsonString(SourceSchema));
+const decodeRawSourceList = Schema.decodeUnknownOption(Schema.fromJsonString(SourceListSchema));
+const decodeSource = (text: string) => sanitizeDecodedSource(decodeRawSource(text));
+const decodeSourceList = (text: string) => {
+  const decoded = decodeRawSourceList(text);
+  if (Option.isNone(decoded)) return decoded;
+  return Option.some({
+    ...decoded.value,
+    sources: decoded.value.sources.map(sanitizeSource),
+  });
+};
 const decodeOpenApiPreview = Schema.decodeUnknownOption(
   Schema.fromJsonString(OpenApiPreviewSchema),
 );
@@ -331,6 +399,15 @@ const decodeCredentialMetadata = Schema.decodeUnknownOption(
 );
 const decodeMcpStdioTemplateList = Schema.decodeUnknownOption(
   Schema.fromJsonString(McpStdioTemplateListSchema),
+);
+const decodeOAuthConnection = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OAuthConnectionSummarySchema),
+);
+const decodeOAuthConnectionList = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OAuthConnectionListSchema),
+);
+const decodeOAuthAuthorization = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OAuthAuthorizationSchema),
 );
 const decodeToolRecord = Schema.decodeUnknownOption(Schema.fromJsonString(ToolRecordSchema));
 const decodeToolPage = Schema.decodeUnknownOption(Schema.fromJsonString(ToolPageSchema));
@@ -572,6 +649,20 @@ export async function createMcpHttpSource(
   return decodeResponse(response.value, decodeSource);
 }
 
+export async function createGraphqlSource(
+  input: GraphqlSourceInput,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/sources",
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSource);
+}
+
 export async function listMcpStdioTemplates(fetcher: Fetcher = fetch, signal?: AbortSignal) {
   const response = await request("/api/v1/mcp/stdio/templates", { signal }, fetcher);
   if (!response.ok) return response;
@@ -666,6 +757,104 @@ export async function putMcpStdioCredentials(
   signal?: AbortSignal,
 ) {
   return putProtocolCredentials(sourceId, expectedRevision, credential, fetcher, signal);
+}
+
+export async function putGraphqlCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  credential: GraphqlCredential,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ expectedRevision, credential }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export async function listOAuthConnections(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<ApiResult<OAuthConnectionList>> {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/oauth`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeOAuthConnectionList);
+}
+
+export async function putOAuthConnection(
+  sourceId: string,
+  credentialKey: string,
+  input: OAuthConnectionInput,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<ApiResult<OAuthConnectionSummary>> {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/oauth/${encodeURIComponent(credentialKey)}`,
+    { method: "PUT", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeOAuthConnection);
+}
+
+export async function authorizeOAuthConnection(
+  sourceId: string,
+  credentialKey: string,
+  input: { readonly expectedRevision: number },
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<ApiResult<OAuthAuthorization>> {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/oauth/${encodeURIComponent(credentialKey)}/authorize`,
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeOAuthAuthorization);
+}
+
+export async function disconnectOAuthConnection(
+  sourceId: string,
+  credentialKey: string,
+  input: { readonly expectedRevision: number },
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<ApiResult<OAuthConnectionSummary>> {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/oauth/${encodeURIComponent(credentialKey)}/disconnect`,
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeOAuthConnection);
+}
+
+export async function deleteOAuthConnection(
+  sourceId: string,
+  credentialKey: string,
+  input: { readonly expectedRevision: number },
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<ApiResult<void>> {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/oauth/${encodeURIComponent(credentialKey)}?expectedRevision=${encodeURIComponent(String(input.expectedRevision))}`,
+    { method: "DELETE", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return { ok: true, value: undefined };
 }
 
 export async function putOpenApiCredentials(
@@ -992,4 +1181,34 @@ function readCookie(name: string) {
     if (cookieName === name) return valueParts.join("=");
   }
   return null;
+}
+
+function sanitizeDecodedSource(decoded: Option.Option<Source>) {
+  return Option.isNone(decoded) ? decoded : Option.some(sanitizeSource(decoded.value));
+}
+
+function sanitizeSource(source: Source): Source {
+  const endpoint = source.configuration.endpoint;
+  return {
+    ...source,
+    configuration: {
+      ...(endpoint === undefined ? {} : publicEndpoint(endpoint)),
+      ...(source.configuration.allowPrivateNetwork === undefined
+        ? {}
+        : { allowPrivateNetwork: source.configuration.allowPrivateNetwork }),
+      ...(source.configuration.templateName === undefined
+        ? {}
+        : { templateName: source.configuration.templateName }),
+      ...(source.configuration.negotiatedProtocolVersion === undefined
+        ? {}
+        : { negotiatedProtocolVersion: source.configuration.negotiatedProtocolVersion }),
+    },
+  };
+}
+
+function publicEndpoint(endpoint: string) {
+  if (!URL.canParse(endpoint)) return {};
+  const url = new URL(endpoint);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return {};
+  return { endpoint: url.origin };
 }

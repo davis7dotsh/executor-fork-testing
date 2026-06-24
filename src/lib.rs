@@ -20,8 +20,10 @@ pub mod cli;
 pub mod crypto;
 mod database;
 pub mod execution;
+pub mod graphql;
 pub use approval::invocation;
 pub(crate) mod mcp;
+pub(crate) mod oauth;
 pub mod openapi;
 pub mod outbound;
 pub(crate) mod protocols;
@@ -176,16 +178,28 @@ impl ExecutorApp {
         let opened = database::Database::open(&config).await?;
         let pool = opened.database.pool.clone();
         let catalog = catalog::CatalogStore::new(pool.clone(), opened.database.keyring.clone());
-        let sources = protocols::SourceService::new(catalog.clone(), mcp_connections.clone());
-        let protocol_registry = sources.registry().clone();
         let request_logs =
             request_logs::RequestLogSink::new(opened.database.clone(), catalog.clone());
+        let oauth = oauth::OAuthService::new(
+            pool.clone(),
+            opened.database.keyring.clone(),
+            config.public_origin(),
+            outbound::OutboundPolicy::default(),
+        );
+        oauth
+            .recover_startup()
+            .await
+            .map_err(|_| DatabaseError::OAuthInitialization)?;
+        let sources =
+            protocols::SourceService::new(catalog.clone(), mcp_connections.clone(), oauth.clone());
+        let protocol_registry = sources.registry().clone();
         let tool_calls = invocation::ToolCallService::new(
             catalog.clone(),
             protocol_registry,
             pool.clone(),
             opened.database.keyring.clone(),
             request_logs.clone(),
+            oauth.clone(),
         );
         tool_calls.recover_startup().await?;
         let api_tasks = tasks::TaskTracker::default();
@@ -212,7 +226,13 @@ impl ExecutorApp {
         let router = api::router(
             opened.database,
             catalog.clone(),
-            api::ApiServices::new(sources, tool_calls.clone(), execution.clone(), mcp.clone()),
+            api::ApiServices::new(
+                sources,
+                tool_calls.clone(),
+                execution.clone(),
+                mcp.clone(),
+                oauth.clone(),
+            ),
             request_logs,
             api_tasks.clone(),
             &config,

@@ -16,8 +16,8 @@ use super::{
 use crate::{
     catalog::{
         AuditContext, CatalogStore, CatalogSyncResult, CreateSource, CredentialPayload,
-        InitialCatalogSnapshot, McpToolBindingV1, SourceHealth, SourceKind, SourceRecord,
-        StoredCredential,
+        InitialCatalogSnapshot, McpToolBindingV1, OAuthBindingExpectation, SourceHealth,
+        SourceKind, SourceRecord, StoredCredential,
     },
     mcp::{
         discovery::{
@@ -37,6 +37,7 @@ use crate::{
             },
         },
     },
+    oauth::{OAuthBinding, OAuthError, OAuthService},
 };
 
 const MCP_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
@@ -81,14 +82,16 @@ impl McpHttpCredential {
             | Self::OAuthAccessToken {
                 access_token: token,
             } => {
-                let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
                     .map_err(|_| invalid_credentials("The MCP bearer credential is invalid."))?;
+                value.set_sensitive(true);
                 headers.insert(AUTHORIZATION, value);
             }
             Self::Basic { username, password } => {
                 let encoded = STANDARD.encode(format!("{username}:{password}"));
-                let value = HeaderValue::from_str(&format!("Basic {encoded}"))
+                let mut value = HeaderValue::from_str(&format!("Basic {encoded}"))
                     .map_err(|_| invalid_credentials("The MCP basic credential is invalid."))?;
+                value.set_sensitive(true);
                 headers.insert(AUTHORIZATION, value);
             }
             Self::ApiKeyHeader { name, value } => {
@@ -99,8 +102,9 @@ impl McpHttpCredential {
                         "The MCP API key cannot use a protected HTTP header.",
                     ));
                 }
-                let value = HeaderValue::from_str(value)
+                let mut value = HeaderValue::from_str(value)
                     .map_err(|_| invalid_credentials("The MCP API key header value is invalid."))?;
+                value.set_sensitive(true);
                 headers.insert(name, value);
             }
         }
@@ -212,7 +216,7 @@ struct McpStdioSourceConfigurationV1 {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StoredMcpHttpCredentialV1 {
+pub(super) struct StoredMcpHttpCredentialV1 {
     endpoint: String,
     credential: Option<McpHttpCredential>,
 }
@@ -227,6 +231,7 @@ struct StoredMcpStdioCredentialV1 {
 #[derive(Clone)]
 pub struct McpAdapter {
     connections: Arc<McpConnectionManager>,
+    oauth: Option<OAuthService>,
 }
 
 impl Default for McpAdapter {
@@ -239,6 +244,7 @@ impl McpAdapter {
     pub fn new(stdio_templates: StdioTemplateRegistry) -> Self {
         Self {
             connections: Arc::new(McpConnectionManager::new(stdio_templates)),
+            oauth: None,
         }
     }
 
@@ -247,7 +253,20 @@ impl McpAdapter {
     }
 
     pub(crate) fn with_connection_manager(connections: Arc<McpConnectionManager>) -> Self {
-        Self { connections }
+        Self {
+            connections,
+            oauth: None,
+        }
+    }
+
+    pub(crate) fn with_services(
+        connections: Arc<McpConnectionManager>,
+        oauth: OAuthService,
+    ) -> Self {
+        Self {
+            connections,
+            oauth: Some(oauth),
+        }
     }
 
     pub async fn create_http_source(
@@ -263,32 +282,63 @@ impl McpAdapter {
             credential: input.credential,
         };
         let _operation = self.connections.begin_operation().map_err(shutting_down)?;
-        let plan = discover_http(&stored, input.allow_private_network, 0, Some(0)).await?;
+        let discovery =
+            discover_http_for_create(&stored, input.allow_private_network, 0, Some(0)).await?;
         let configuration = McpHttpSourceConfigurationV1 {
             endpoint: display_endpoint(&endpoint),
             allow_private_network: input.allow_private_network,
-            negotiated_protocol_version: plan.basis.protocol_version.clone(),
+            negotiated_protocol_version: discovery.protocol_version().to_owned(),
         };
         let preferred_slug = input
             .preferred_slug
             .unwrap_or_else(|| input.display_name.clone());
-        let (source, _) = catalog
-            .create_source_with_catalog(
-                CreateSource {
-                    kind: SourceKind::McpHttp,
-                    preferred_slug,
-                    display_name: input.display_name,
-                    description: input.description,
-                    configuration: encode_configuration(&configuration)?,
-                },
-                &stored.payload()?,
-                plan.initial_catalog_snapshot(),
-                plan.bindings,
-                audit,
-            )
-            .await
-            .map_err(protocol_catalog_error)?;
-        self.install_source_watcher(catalog, &source).await;
+        let create = CreateSource {
+            kind: SourceKind::McpHttp,
+            preferred_slug,
+            display_name: input.display_name,
+            description: input.description,
+            configuration: encode_configuration(&configuration)?,
+        };
+        let credential = stored.payload()?;
+        let (source, authorization_required) = match discovery {
+            HttpCreateDiscovery::Ready(plan) => {
+                let plan = *plan;
+                (
+                    catalog
+                        .create_source_with_catalog(
+                            create,
+                            &credential,
+                            plan.initial_catalog_snapshot(),
+                            plan.bindings,
+                            audit,
+                        )
+                        .await
+                        .map_err(protocol_catalog_error)?
+                        .0,
+                    false,
+                )
+            }
+            HttpCreateDiscovery::AuthorizationRequired => (
+                catalog
+                    .create_authorization_required_source_with_catalog(
+                        create,
+                        &credential,
+                        InitialCatalogSnapshot {
+                            artifacts: Vec::new(),
+                            tools: Vec::new(),
+                        },
+                        Vec::new(),
+                        audit,
+                    )
+                    .await
+                    .map_err(protocol_catalog_error)?
+                    .0,
+                true,
+            ),
+        };
+        if !authorization_required {
+            self.install_source_watcher(catalog, &source).await;
+        }
         Ok(source)
     }
 
@@ -382,8 +432,16 @@ impl McpAdapter {
         let result = match self.refresh_source_core(catalog, source, audit).await {
             Ok(result) => result,
             Err(error) => {
+                if error.code == "oauth_binding_changed" {
+                    return Err(error);
+                }
+                let health_code = if error.code == "authorization_required" {
+                    "authorization_required"
+                } else {
+                    "mcp_refresh_failed"
+                };
                 let _ = catalog
-                    .mark_source_error(&source_id, "mcp_refresh_failed", source_revision, audit)
+                    .mark_source_error(&source_id, health_code, source_revision, audit)
                     .await;
                 return Err(error);
             }
@@ -404,11 +462,12 @@ impl McpAdapter {
     ) -> Result<CatalogSyncResult, ProtocolError> {
         let stored = required_stored_credential(catalog, &source.id).await?;
         let _operation = self.connections.begin_operation().map_err(shutting_down)?;
-        let plan = match source.kind {
+        let (plan, oauth_expectation) = match source.kind {
             SourceKind::McpHttp => {
                 let configuration = McpHttpSourceConfigurationV1::decode(&source.configuration)?;
                 let credential = StoredMcpHttpCredentialV1::decode(&stored)?;
-                discover_http(
+                self.discover_http_source(
+                    &source.id,
                     &credential,
                     configuration.allow_private_network,
                     source.revision,
@@ -426,13 +485,16 @@ impl McpAdapter {
                     .stdio_templates()
                     .template(&credential.template_name)
                     .map_err(stored_template_error)?;
-                discover_stdio(
-                    self.connections.stdio_templates(),
-                    &credential,
-                    source.revision,
-                    Some(stored.revision),
+                (
+                    discover_stdio(
+                        self.connections.stdio_templates(),
+                        &credential,
+                        source.revision,
+                        Some(stored.revision),
+                    )
+                    .await?,
+                    None,
                 )
-                .await?
             }
             SourceKind::Openapi | SourceKind::Graphql => {
                 return Err(ProtocolError::corrupt(
@@ -441,10 +503,30 @@ impl McpAdapter {
                 ));
             }
         };
-        let result = catalog
-            .sync_catalog_with_bindings(&source.id, plan.catalog_snapshot(), plan.bindings, audit)
-            .await
-            .map_err(protocol_catalog_error)?;
+        let result = match oauth_expectation {
+            Some(expectation) => {
+                catalog
+                    .sync_catalog_with_bindings_and_oauth_binding(
+                        &source.id,
+                        plan.catalog_snapshot(),
+                        plan.bindings,
+                        expectation,
+                        audit,
+                    )
+                    .await
+            }
+            None => {
+                catalog
+                    .sync_catalog_with_bindings(
+                        &source.id,
+                        plan.catalog_snapshot(),
+                        plan.bindings,
+                        audit,
+                    )
+                    .await
+            }
+        }
+        .map_err(protocol_catalog_error)?;
         Ok(result)
     }
 
@@ -534,23 +616,31 @@ impl McpAdapter {
             .map_err(protocol_catalog_error)?;
         let configuration = McpHttpSourceConfigurationV1::decode(&source.configuration)?;
         credential.credential = None;
-        let anonymous_discovery = discover_http(
-            &credential,
-            configuration.allow_private_network,
-            source.revision,
-            Some(stored.revision),
-        )
-        .await;
+        let anonymous_discovery = self
+            .discover_http_source(
+                source_id,
+                &credential,
+                configuration.allow_private_network,
+                source.revision,
+                Some(stored.revision),
+            )
+            .await
+            .and_then(|(plan, expectation)| {
+                expectation
+                    .map(|expectation| (plan, expectation))
+                    .ok_or_else(corrupt_configuration)
+            });
         self.connections
             .stop_watcher_and_wait_at_revision(source_id, source.revision)
             .await;
         let committed = match anonymous_discovery {
-            Ok(plan) => catalog
-                .replace_credential_and_sync_catalog(
+            Ok((plan, expectation)) => catalog
+                .replace_credential_and_sync_catalog_with_oauth_binding(
                     source_id,
                     &credential.payload()?,
                     plan.catalog_snapshot(),
                     plan.bindings,
+                    expectation,
                     audit,
                 )
                 .await
@@ -750,6 +840,7 @@ impl McpAdapter {
         let source_revision = source.revision;
         let credential_revision = stored.revision;
         let connections = self.connections.clone();
+        let oauth = self.oauth.clone();
         let catalog = catalog.clone();
         let installed = match source.kind {
             SourceKind::McpHttp => {
@@ -784,6 +875,7 @@ impl McpAdapter {
                             run_http_watcher(
                                 HttpWatcherContext {
                                     connections,
+                                    oauth,
                                     catalog,
                                     source_id,
                                     credential,
@@ -902,13 +994,71 @@ impl McpAdapter {
         self.connections.unretire_source(source_id).await;
     }
 
+    pub(super) async fn oauth_binding_observation(
+        &self,
+        source_id: &str,
+        source_kind: SourceKind,
+        stored: Option<&StoredCredential>,
+        expected_bindings: Option<&[OAuthBinding]>,
+    ) -> Result<McpOAuthBindingObservation, ProtocolError> {
+        if source_kind == SourceKind::McpStdio {
+            return Ok(McpOAuthBindingObservation::NotApplicable);
+        }
+        if source_kind != SourceKind::McpHttp {
+            return Err(ProtocolError::corrupt(
+                "source_protocol_mismatch",
+                "The stored source does not match the MCP protocol.",
+            ));
+        }
+        let stored = stored.ok_or_else(|| {
+            ProtocolError::corrupt(
+                "source_credentials_missing",
+                "The source credential state is missing.",
+            )
+        })?;
+        let credential = StoredMcpHttpCredentialV1::decode_for_invocation(stored)?;
+        if credential.credential.is_some() {
+            return Ok(McpOAuthBindingObservation::Static);
+        }
+        if let Some(expected_bindings) = expected_bindings {
+            let mut defaults = expected_bindings
+                .iter()
+                .filter(|binding| binding.credential_key == "default");
+            let binding = defaults.next().cloned();
+            if defaults.next().is_some() {
+                return Err(ProtocolError::corrupt(
+                    "source_authorization_mismatch",
+                    "The prepared MCP authorization state is inconsistent.",
+                ));
+            }
+            return Ok(binding.map_or(
+                McpOAuthBindingObservation::Anonymous,
+                McpOAuthBindingObservation::Managed,
+            ));
+        }
+        let Some(oauth) = &self.oauth else {
+            return Ok(McpOAuthBindingObservation::Anonymous);
+        };
+        Ok(oauth
+            .binding(source_id, "default")
+            .await
+            .map_err(mcp_oauth_error)?
+            .map_or(
+                McpOAuthBindingObservation::Anonymous,
+                McpOAuthBindingObservation::Managed,
+            ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_invocation(
         &self,
+        source_id: &str,
         source_kind: SourceKind,
         binding: &McpToolBindingV1,
         source_configuration: &Map<String, Value>,
         stored: Option<&StoredCredential>,
         arguments: &Value,
+        oauth_binding: McpOAuthBindingObservation,
     ) -> Result<PreparedMcpInvocation, ProtocolError> {
         if binding.version != 1 || binding.tool_name.is_empty() {
             return Err(ProtocolError::corrupt(
@@ -935,14 +1085,35 @@ impl McpAdapter {
                 let credential = StoredMcpHttpCredentialV1::decode_for_invocation(stored)?;
                 let config =
                     http_transport_config(&credential, configuration.allow_private_network)?;
-                StreamableHttpTransport::new(config.clone()).map_err(http_configuration_error)?;
+                StreamableHttpTransport::new(config).map_err(http_configuration_error)?;
+                let authorization_matches = matches!(
+                    (&credential.credential, &oauth_binding),
+                    (Some(_), McpOAuthBindingObservation::Static)
+                        | (None, McpOAuthBindingObservation::Anonymous)
+                        | (None, McpOAuthBindingObservation::Managed(_))
+                );
+                if !authorization_matches {
+                    return Err(ProtocolError::corrupt(
+                        "source_authorization_mismatch",
+                        "The prepared MCP authorization state is inconsistent.",
+                    ));
+                }
                 Ok(PreparedMcpInvocation::Http {
-                    config,
+                    source_id: source_id.to_owned(),
+                    credential,
+                    allow_private_network: configuration.allow_private_network,
+                    oauth_binding,
                     tool_name: binding.tool_name.clone(),
                     arguments: arguments.clone(),
                 })
             }
             SourceKind::McpStdio => {
+                if !matches!(oauth_binding, McpOAuthBindingObservation::NotApplicable) {
+                    return Err(ProtocolError::corrupt(
+                        "source_authorization_mismatch",
+                        "The prepared MCP authorization state is inconsistent.",
+                    ));
+                }
                 let configuration = McpStdioSourceConfigurationV1::decode(source_configuration)?;
                 let credential = StoredMcpStdioCredentialV1::decode_for_invocation(stored)?;
                 if configuration.template_name != credential.template_name {
@@ -977,6 +1148,30 @@ impl McpAdapter {
         }
     }
 
+    async fn discover_http_source(
+        &self,
+        source_id: &str,
+        stored: &StoredMcpHttpCredentialV1,
+        allow_private_network: bool,
+        source_revision: i64,
+        credential_revision: Option<i64>,
+    ) -> Result<(DiscoveryPlan, Option<OAuthBindingExpectation>), ProtocolError> {
+        let (config, oauth_revision) = self
+            .http_transport_config_for_source(source_id, stored, allow_private_network)
+            .await?;
+        let plan = discover_http_config(
+            config,
+            source_revision,
+            credential_revision,
+            stored.credential.is_none(),
+        )
+        .await?;
+        Ok((
+            plan,
+            catalog_oauth_expectation(stored, oauth_revision.as_ref()),
+        ))
+    }
+
     pub(super) async fn execute_invocation(
         &self,
         prepared: PreparedMcpInvocation,
@@ -987,10 +1182,24 @@ impl McpAdapter {
             .map_err(|_| McpInvocationError::ShuttingDown)?;
         match prepared {
             PreparedMcpInvocation::Http {
-                config,
+                source_id,
+                credential,
+                allow_private_network,
+                oauth_binding,
                 tool_name,
                 arguments,
-            } => execute_http(config, &tool_name, arguments).await,
+            } => {
+                let config = http_transport_config_for_observation(
+                    self.oauth.as_ref(),
+                    &source_id,
+                    &credential,
+                    allow_private_network,
+                    &oauth_binding,
+                )
+                .await
+                .map_err(McpInvocationError::AuthorizationSetup)?;
+                execute_http(config, &tool_name, arguments).await
+            }
             PreparedMcpInvocation::Stdio {
                 template_name,
                 secret_values,
@@ -1008,10 +1217,58 @@ impl McpAdapter {
             }
         }
     }
+
+    async fn http_transport_config_for_source(
+        &self,
+        source_id: &str,
+        stored: &StoredMcpHttpCredentialV1,
+        allow_private_network: bool,
+    ) -> Result<(StreamableHttpConfig, Option<OAuthTransportRevision>), ProtocolError> {
+        http_transport_config_for_source(
+            self.oauth.as_ref(),
+            source_id,
+            stored,
+            allow_private_network,
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OAuthTransportRevision {
+    binding: OAuthBinding,
+    secret_revision: i64,
+}
+
+fn catalog_oauth_expectation(
+    stored: &StoredMcpHttpCredentialV1,
+    revision: Option<&OAuthTransportRevision>,
+) -> Option<OAuthBindingExpectation> {
+    if stored.credential.is_some() {
+        return None;
+    }
+    Some(match revision {
+        Some(revision) => OAuthBindingExpectation::Exact {
+            credential_key: "default".to_owned(),
+            connection_id: revision.binding.connection_id.clone(),
+            config_revision: revision.binding.config_revision,
+        },
+        None => OAuthBindingExpectation::Absent {
+            credential_key: "default".to_owned(),
+        },
+    })
+}
+
+fn oauth_transport_changed(
+    active: Option<&OAuthTransportRevision>,
+    current: Option<&OAuthTransportRevision>,
+) -> bool {
+    active != current
 }
 
 struct HttpWatcherContext {
     connections: Arc<McpConnectionManager>,
+    oauth: Option<OAuthService>,
     catalog: CatalogStore,
     source_id: String,
     credential: StoredMcpHttpCredentialV1,
@@ -1027,6 +1284,7 @@ async fn run_http_watcher(
 ) {
     let HttpWatcherContext {
         connections,
+        oauth,
         catalog,
         source_id,
         credential,
@@ -1043,7 +1301,14 @@ async fn run_http_watcher(
             Ok(operation) => operation,
             Err(_) => return,
         };
-        let config = match http_transport_config(&credential, allow_private_network) {
+        let (config, oauth_revision) = match http_transport_config_for_source(
+            oauth.as_ref(),
+            &source_id,
+            &credential,
+            allow_private_network,
+        )
+        .await
+        {
             Ok(config) => config,
             Err(error) => {
                 tracing::warn!(
@@ -1051,9 +1316,40 @@ async fn run_http_watcher(
                     code = error.code,
                     "MCP HTTP watcher configuration failed"
                 );
-                return;
+                let authorization_required = error.code == "authorization_required";
+                if authorization_required {
+                    mark_watcher_authorization_required(
+                        &catalog,
+                        &source_id,
+                        &revision_lease,
+                        &revisions,
+                    )
+                    .await;
+                    drop(operation);
+                    if wait_for_http_authorization_change(
+                        oauth.as_ref(),
+                        &source_id,
+                        &credential,
+                        allow_private_network,
+                        None,
+                        &mut canceled,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    retry_delay = Duration::from_secs(1);
+                    continue;
+                }
+                drop(operation);
+                if watcher_retry_or_cancel(&mut canceled, retry_delay).await {
+                    return;
+                }
+                retry_delay = next_watcher_backoff(retry_delay);
+                continue;
             }
         };
+        let oauth_expectation = catalog_oauth_expectation(&credential, oauth_revision.as_ref());
         let transport = match StreamableHttpTransport::new(config) {
             Ok(transport) => transport,
             Err(_) => {
@@ -1064,8 +1360,32 @@ async fn run_http_watcher(
         let mut changed = transport.subscribe_tool_list_changed();
         let initialized = match transport.initialize().await {
             Ok(initialized) => initialized,
-            Err(_) => {
+            Err(error) => {
                 tracing::warn!(source_id, "MCP HTTP watcher initialization failed");
+                if credential.credential.is_none() && http_authorization_denied(&error) {
+                    mark_watcher_authorization_required(
+                        &catalog,
+                        &source_id,
+                        &revision_lease,
+                        &revisions,
+                    )
+                    .await;
+                    drop(operation);
+                    if wait_for_http_authorization_change(
+                        oauth.as_ref(),
+                        &source_id,
+                        &credential,
+                        allow_private_network,
+                        oauth_revision.as_ref(),
+                        &mut canceled,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    retry_delay = Duration::from_secs(1);
+                    continue;
+                }
                 drop(operation);
                 if watcher_retry_or_cancel(&mut canceled, retry_delay).await {
                     return;
@@ -1092,9 +1412,22 @@ async fn run_http_watcher(
             tokio::spawn(async move { listener_transport.listen_notifications().await });
         let reconciled = {
             let reconciliation = reconcile_watcher_session(async {
-                let plan = discover_http_session(&transport, &mut changed, basis.clone()).await?;
-                commit_watcher_discovery(&catalog, &source_id, plan, &revision_lease, &revisions)
-                    .await
+                let plan = discover_http_session(
+                    &transport,
+                    &mut changed,
+                    basis.clone(),
+                    credential.credential.is_none(),
+                )
+                .await?;
+                commit_watcher_discovery(
+                    &catalog,
+                    &source_id,
+                    plan,
+                    oauth_expectation.clone(),
+                    &revision_lease,
+                    &revisions,
+                )
+                .await
             });
             tokio::pin!(reconciliation);
             tokio::select! {
@@ -1147,9 +1480,35 @@ async fn run_http_watcher(
                     code = error.code,
                     "MCP HTTP watcher startup reconciliation failed"
                 );
+                let authorization_required = error.code == "authorization_required";
+                if authorization_required {
+                    mark_watcher_authorization_required(
+                        &catalog,
+                        &source_id,
+                        &revision_lease,
+                        &revisions,
+                    )
+                    .await;
+                }
                 abort_and_join(&mut listener).await;
                 let _ = transport.terminate().await;
                 drop(operation);
+                if authorization_required {
+                    if wait_for_http_authorization_change(
+                        oauth.as_ref(),
+                        &source_id,
+                        &credential,
+                        allow_private_network,
+                        oauth_revision.as_ref(),
+                        &mut canceled,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    retry_delay = Duration::from_secs(1);
+                    continue;
+                }
                 if watcher_retry_or_cancel(&mut canceled, retry_delay).await {
                     return;
                 }
@@ -1158,6 +1517,10 @@ async fn run_http_watcher(
             }
         }
         let coalescer = ListChangedCoalescer::default();
+        let mut oauth_revision_check = tokio::time::interval(Duration::from_secs(30));
+        oauth_revision_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        oauth_revision_check.tick().await;
+        let mut authorization_blocked = false;
         while !reconnect {
             tokio::select! {
                 _ = &mut canceled => {
@@ -1176,6 +1539,40 @@ async fn run_http_watcher(
                     }
                     reconnect = true;
                 }
+                _ = oauth_revision_check.tick(), if credential.credential.is_none() && oauth.is_some() => {
+                    match http_transport_config_for_source(
+                        oauth.as_ref(),
+                        &source_id,
+                        &credential,
+                        allow_private_network,
+                    )
+                    .await
+                    {
+                        Ok((_, current_revision))
+                            if !oauth_transport_changed(
+                                oauth_revision.as_ref(),
+                                current_revision.as_ref(),
+                            ) => {}
+                        Ok(_) => {
+                            tracing::debug!(source_id, "MCP HTTP OAuth token changed; reconnecting");
+                            reconnect = true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(source_id, code = error.code, "MCP HTTP OAuth token check failed");
+                            if error.code == "authorization_required" {
+                                mark_watcher_authorization_required(
+                                    &catalog,
+                                    &source_id,
+                                    &revision_lease,
+                                    &revisions,
+                                )
+                                .await;
+                                authorization_blocked = true;
+                            }
+                            reconnect = true;
+                        }
+                    }
+                }
                 signal = changed.recv() => {
                     match signal {
                         Ok(()) | Err(RecvError::Lagged(_)) => {
@@ -1188,6 +1585,7 @@ async fn run_http_watcher(
                                     source_id.clone(),
                                     transport.clone(),
                                     basis.clone(),
+                                    oauth_expectation.clone(),
                                     connections.clone(),
                                     revision_lease.clone(),
                                     revisions.clone(),
@@ -1220,6 +1618,23 @@ async fn run_http_watcher(
                                 WatcherRefreshWait::Completed(result) => {
                                     if let Err(error) = result {
                                         tracing::warn!(source_id, code = error.code, "MCP HTTP notification refresh failed");
+                                        if error.code == "authorization_required" {
+                                            mark_watcher_authorization_required(
+                                                &catalog,
+                                                &source_id,
+                                                &revision_lease,
+                                                &revisions,
+                                            )
+                                            .await;
+                                            authorization_blocked = true;
+                                        }
+                                        if matches!(
+                                            error.code,
+                                            "authorization_required" | "oauth_binding_changed"
+                                        ) {
+                                            reconnect = true;
+                                            continue;
+                                        }
                                         let mut refresh_delay = Duration::from_secs(1);
                                         'http_refresh_retries: while coalescer.has_pending() {
                                             match wait_for_watcher_refresh(
@@ -1257,6 +1672,7 @@ async fn run_http_watcher(
                                                     source_id.clone(),
                                                     transport.clone(),
                                                     basis.clone(),
+                                                    oauth_expectation.clone(),
                                                     connections.clone(),
                                                     revision_lease.clone(),
                                                     revisions.clone(),
@@ -1288,8 +1704,29 @@ async fn run_http_watcher(
                                                     break 'http_refresh_retries;
                                                 }
                                                 WatcherRefreshWait::Completed(result) => {
-                                                    if result.is_ok() {
-                                                        break 'http_refresh_retries;
+                                                    match result {
+                                                        Ok(_) => break 'http_refresh_retries,
+                                                        Err(error)
+                                                            if matches!(
+                                                                error.code,
+                                                                "authorization_required"
+                                                                    | "oauth_binding_changed"
+                                                            ) =>
+                                                        {
+                                                            if error.code == "authorization_required" {
+                                                                mark_watcher_authorization_required(
+                                                                    &catalog,
+                                                                    &source_id,
+                                                                    &revision_lease,
+                                                                    &revisions,
+                                                                )
+                                                                .await;
+                                                                authorization_blocked = true;
+                                                            }
+                                                            reconnect = true;
+                                                            break 'http_refresh_retries;
+                                                        }
+                                                        Err(_) => {}
                                                     }
                                                 }
                                             }
@@ -1309,6 +1746,22 @@ async fn run_http_watcher(
         }
         let _ = transport.terminate().await;
         drop(operation);
+        if authorization_blocked {
+            if wait_for_http_authorization_change(
+                oauth.as_ref(),
+                &source_id,
+                &credential,
+                allow_private_network,
+                oauth_revision.as_ref(),
+                &mut canceled,
+            )
+            .await
+            {
+                return;
+            }
+            retry_delay = Duration::from_secs(1);
+            continue;
+        }
         if watcher_retry_or_cancel(&mut canceled, retry_delay).await {
             return;
         }
@@ -1319,6 +1772,74 @@ async fn run_http_watcher(
 async fn abort_and_join<T>(task: &mut tokio::task::JoinHandle<T>) {
     task.abort();
     let _ = task.await;
+}
+
+async fn mark_watcher_authorization_required(
+    catalog: &CatalogStore,
+    source_id: &str,
+    revision_lease: &WatcherRevisionLease,
+    revisions: &std::sync::atomic::AtomicI64,
+) {
+    let expected_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+    let Some(revision_guard) = revision_lease.lock_revision(expected_revision).await else {
+        return;
+    };
+    let source = match catalog
+        .mark_source_error(
+            source_id,
+            "authorization_required",
+            expected_revision,
+            AuditContext::system(None),
+        )
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::debug!(
+                source_id,
+                error = %error,
+                "MCP authorization health transition was superseded"
+            );
+            return;
+        }
+    };
+    if revision_guard.advance(source.revision) {
+        revisions.store(source.revision, std::sync::atomic::Ordering::Release);
+    }
+}
+
+async fn wait_for_http_authorization_change(
+    oauth: Option<&OAuthService>,
+    source_id: &str,
+    credential: &StoredMcpHttpCredentialV1,
+    allow_private_network: bool,
+    active_revision: Option<&OAuthTransportRevision>,
+    canceled: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    if credential.credential.is_some() || oauth.is_none() {
+        return true;
+    }
+    let mut poll = tokio::time::interval(Duration::from_secs(30));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll.tick().await;
+    loop {
+        tokio::select! {
+            _ = &mut *canceled => return true,
+            _ = poll.tick() => {
+                if let Ok((_, current_revision)) = http_transport_config_for_source(
+                    oauth,
+                    source_id,
+                    credential,
+                    allow_private_network,
+                )
+                .await
+                    && oauth_transport_changed(active_revision, current_revision.as_ref())
+                {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 struct StdioWatcherContext {
@@ -1409,8 +1930,15 @@ async fn run_stdio_watcher(
         match watcher_reconcile_or_cancel(&mut canceled, || {
             reconcile_watcher_session(async {
                 let plan = discover_stdio_session(&client, &mut changed, basis.clone()).await?;
-                commit_watcher_discovery(&catalog, &source_id, plan, &revision_lease, &revisions)
-                    .await
+                commit_watcher_discovery(
+                    &catalog,
+                    &source_id,
+                    plan,
+                    None,
+                    &revision_lease,
+                    &revisions,
+                )
+                .await
             })
         })
         .await
@@ -1587,20 +2115,36 @@ fn drain_change_signals(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refresh_http_watcher_session(
     catalog: CatalogStore,
     source_id: String,
     transport: StreamableHttpTransport,
     mut basis: DiscoveryBasis,
+    oauth_expectation: Option<OAuthBindingExpectation>,
     connections: Arc<McpConnectionManager>,
     revision_lease: WatcherRevisionLease,
     revisions: Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<(), ProtocolError> {
     basis.expected_source_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
     let mut changed = transport.subscribe_tool_list_changed();
-    let plan = discover_http_session(&transport, &mut changed, basis).await?;
-    let (_, supports_list_changed) =
-        commit_watcher_discovery(&catalog, &source_id, plan, &revision_lease, &revisions).await?;
+    let authorization_required_on_denial = oauth_expectation.is_some();
+    let plan = discover_http_session(
+        &transport,
+        &mut changed,
+        basis,
+        authorization_required_on_denial,
+    )
+    .await?;
+    let (_, supports_list_changed) = commit_watcher_discovery(
+        &catalog,
+        &source_id,
+        plan,
+        oauth_expectation,
+        &revision_lease,
+        &revisions,
+    )
+    .await?;
     if !supports_list_changed {
         connections
             .stop_watcher_at_revision(
@@ -1626,8 +2170,15 @@ async fn refresh_stdio_watcher_session(
     let client = client.as_ref().ok_or_else(stale_watcher_reconciliation)?;
     let mut changed = client.subscribe_tool_list_changed();
     let plan = discover_stdio_session(client, &mut changed, basis).await?;
-    let (_, supports_list_changed) =
-        commit_watcher_discovery(&catalog, &source_id, plan, &revision_lease, &revisions).await?;
+    let (_, supports_list_changed) = commit_watcher_discovery(
+        &catalog,
+        &source_id,
+        plan,
+        None,
+        &revision_lease,
+        &revisions,
+    )
+    .await?;
     if !supports_list_changed {
         connections
             .stop_watcher_at_revision(
@@ -1682,6 +2233,7 @@ async fn commit_watcher_discovery(
     catalog: &CatalogStore,
     source_id: &str,
     plan: DiscoveryPlan,
+    oauth_expectation: Option<OAuthBindingExpectation>,
     revision_lease: &WatcherRevisionLease,
     revisions: &std::sync::atomic::AtomicI64,
 ) -> Result<(CatalogSyncResult, bool), ProtocolError> {
@@ -1691,15 +2243,30 @@ async fn commit_watcher_discovery(
         .lock_revision(expected_revision)
         .await
         .ok_or_else(stale_watcher_reconciliation)?;
-    let result = catalog
-        .sync_catalog_with_bindings(
-            source_id,
-            plan.catalog_snapshot(),
-            plan.bindings,
-            AuditContext::system(None),
-        )
-        .await
-        .map_err(protocol_catalog_error)?;
+    let result = match oauth_expectation {
+        Some(expectation) => {
+            catalog
+                .sync_catalog_with_bindings_and_oauth_binding(
+                    source_id,
+                    plan.catalog_snapshot(),
+                    plan.bindings,
+                    expectation,
+                    AuditContext::system(None),
+                )
+                .await
+        }
+        None => {
+            catalog
+                .sync_catalog_with_bindings(
+                    source_id,
+                    plan.catalog_snapshot(),
+                    plan.bindings,
+                    AuditContext::system(None),
+                )
+                .await
+        }
+    }
+    .map_err(protocol_catalog_error)?;
     if !revision_guard.advance(result.source_revision) {
         return Err(stale_watcher_reconciliation());
     }
@@ -1772,10 +2339,21 @@ fn permanent_http_notification_error(error: &StreamableHttpError) -> bool {
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum McpOAuthBindingObservation {
+    NotApplicable,
+    Static,
+    Anonymous,
+    Managed(OAuthBinding),
+}
+
 #[must_use = "a prepared MCP invocation must be executed or explicitly discarded"]
 pub(super) enum PreparedMcpInvocation {
     Http {
-        config: StreamableHttpConfig,
+        source_id: String,
+        credential: StoredMcpHttpCredentialV1,
+        allow_private_network: bool,
+        oauth_binding: McpOAuthBindingObservation,
         tool_name: String,
         arguments: Value,
     },
@@ -1789,6 +2367,8 @@ pub(super) enum PreparedMcpInvocation {
 
 #[derive(Debug, Error)]
 pub enum McpInvocationError {
+    #[error("MCP authorization setup failed")]
+    AuthorizationSetup(#[source] ProtocolError),
     #[error("MCP Streamable HTTP session setup failed")]
     HttpSetup(#[source] StreamableHttpError),
     #[error("MCP Streamable HTTP tool call failed and its outcome is unknown")]
@@ -1957,15 +2537,87 @@ async fn discover_http(
     credential_revision: Option<i64>,
 ) -> Result<DiscoveryPlan, ProtocolError> {
     let config = http_transport_config(stored, allow_private_network)?;
+    discover_http_config(
+        config,
+        source_revision,
+        credential_revision,
+        stored.credential.is_none(),
+    )
+    .await
+}
+
+async fn discover_http_config(
+    config: StreamableHttpConfig,
+    source_revision: i64,
+    credential_revision: Option<i64>,
+    authorization_required_on_denial: bool,
+) -> Result<DiscoveryPlan, ProtocolError> {
     let transport = StreamableHttpTransport::new(config).map_err(http_protocol_error)?;
     let mut changed = transport.subscribe_tool_list_changed();
-    let initialized = transport.initialize().await.map_err(http_protocol_error)?;
+    let initialized = transport.initialize().await.map_err(|error| {
+        http_protocol_error_for_authorization(error, authorization_required_on_denial)
+    })?;
     let plan = match http_discovery_basis(initialized, source_revision, credential_revision) {
-        Ok(basis) => discover_http_session(&transport, &mut changed, basis).await,
+        Ok(basis) => {
+            discover_http_session(
+                &transport,
+                &mut changed,
+                basis,
+                authorization_required_on_denial,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     let _ = transport.terminate().await;
     plan
+}
+
+enum HttpCreateDiscovery {
+    Ready(Box<DiscoveryPlan>),
+    AuthorizationRequired,
+}
+
+impl HttpCreateDiscovery {
+    fn protocol_version(&self) -> &str {
+        match self {
+            Self::Ready(plan) => &plan.basis.protocol_version,
+            Self::AuthorizationRequired => HTTP_PROTOCOL_VERSION,
+        }
+    }
+}
+
+async fn discover_http_for_create(
+    stored: &StoredMcpHttpCredentialV1,
+    allow_private_network: bool,
+    source_revision: i64,
+    credential_revision: Option<i64>,
+) -> Result<HttpCreateDiscovery, ProtocolError> {
+    let config = http_transport_config(stored, allow_private_network)?;
+    let transport = StreamableHttpTransport::new(config).map_err(http_protocol_error)?;
+    let mut changed = transport.subscribe_tool_list_changed();
+    let initialized = match transport.initialize().await {
+        Ok(initialized) => initialized,
+        Err(error) if stored.credential.is_none() && http_authorization_denied(&error) => {
+            return Ok(HttpCreateDiscovery::AuthorizationRequired);
+        }
+        Err(error) => return Err(http_protocol_error(error)),
+    };
+    let plan = match http_discovery_basis(initialized, source_revision, credential_revision) {
+        Ok(basis) => {
+            discover_http_session(&transport, &mut changed, basis, stored.credential.is_none())
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let _ = transport.terminate().await;
+    match plan {
+        Ok(plan) => Ok(HttpCreateDiscovery::Ready(Box::new(plan))),
+        Err(error) if stored.credential.is_none() && error.code == "authorization_required" => {
+            Ok(HttpCreateDiscovery::AuthorizationRequired)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn discover_stdio(
@@ -2009,6 +2661,7 @@ async fn discover_http_session(
     transport: &StreamableHttpTransport,
     changed: &mut tokio::sync::broadcast::Receiver<()>,
     basis: DiscoveryBasis,
+    authorization_required_on_denial: bool,
 ) -> Result<DiscoveryPlan, ProtocolError> {
     tokio::time::timeout(DISCOVERY_DEADLINE, async {
         let mut generation = 0_usize;
@@ -2022,6 +2675,7 @@ async fn discover_http_session(
             let mut fetcher = HttpPageFetcher {
                 transport,
                 next_request_id,
+                authorization_required_on_denial,
             };
             let plan = discover(&mut fetcher, basis.clone())
                 .await
@@ -2090,6 +2744,7 @@ fn bindings_for_stdio(plan: DiscoveryPlan) -> DiscoveryPlan {
 struct HttpPageFetcher<'a> {
     transport: &'a StreamableHttpTransport,
     next_request_id: u64,
+    authorization_required_on_denial: bool,
 }
 
 #[async_trait]
@@ -2103,7 +2758,13 @@ impl ToolPageFetcher for HttpPageFetcher<'_> {
             .transport
             .list_tools(cursor, json!(id))
             .await
-            .map_err(McpPageFetchError::Http)?;
+            .map_err(|error| {
+                if self.authorization_required_on_denial && http_authorization_denied(&error) {
+                    McpPageFetchError::AuthorizationRequired
+                } else {
+                    McpPageFetchError::Http(error)
+                }
+            })?;
         let tools = page
             .tools
             .into_iter()
@@ -2160,6 +2821,8 @@ impl ToolPageFetcher for StdioPageFetcher<'_> {
 
 #[derive(Debug, Error)]
 enum McpPageFetchError {
+    #[error("MCP authorization is required")]
+    AuthorizationRequired,
     #[error("MCP HTTP tools/list failed")]
     Http(#[source] StreamableHttpError),
     #[error("MCP stdio tools/list failed")]
@@ -2270,6 +2933,150 @@ fn http_transport_config(
         config.headers = credential.headers()?;
     }
     Ok(config)
+}
+
+async fn http_transport_config_for_source(
+    oauth: Option<&OAuthService>,
+    source_id: &str,
+    stored: &StoredMcpHttpCredentialV1,
+    allow_private_network: bool,
+) -> Result<(StreamableHttpConfig, Option<OAuthTransportRevision>), ProtocolError> {
+    let config = http_transport_config(stored, allow_private_network)?;
+    if stored.credential.is_some() {
+        return Ok((config, None));
+    }
+    let Some(oauth) = oauth else {
+        return Ok((config, None));
+    };
+    let Some(binding) = oauth
+        .binding(source_id, "default")
+        .await
+        .map_err(mcp_oauth_error)?
+    else {
+        return Ok((config, None));
+    };
+    http_transport_config_for_binding(
+        Some(oauth),
+        source_id,
+        stored,
+        allow_private_network,
+        Some(&binding),
+    )
+    .await
+}
+
+async fn http_transport_config_for_binding(
+    oauth: Option<&OAuthService>,
+    source_id: &str,
+    stored: &StoredMcpHttpCredentialV1,
+    allow_private_network: bool,
+    binding: Option<&OAuthBinding>,
+) -> Result<(StreamableHttpConfig, Option<OAuthTransportRevision>), ProtocolError> {
+    let mut config = http_transport_config(stored, allow_private_network)?;
+    if stored.credential.is_some() || binding.is_none() {
+        return Ok((config, None));
+    }
+    let oauth = oauth.ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "authorization_required",
+            "The MCP source requires OAuth authorization.",
+        )
+    })?;
+    let binding = binding.expect("binding presence checked");
+    if binding.credential_key != "default" {
+        return Err(ProtocolError::corrupt(
+            "source_authorization_mismatch",
+            "The prepared MCP authorization state is inconsistent.",
+        ));
+    }
+    let current = oauth
+        .binding(source_id, "default")
+        .await
+        .map_err(mcp_oauth_error)?;
+    if current.as_ref() != Some(binding) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "oauth_binding_changed",
+            "The managed OAuth connection changed. Retry the operation.",
+        ));
+    }
+    let token = oauth
+        .access_token_for_binding(binding)
+        .await
+        .map_err(mcp_oauth_error)?;
+    if token.connection_id() != binding.connection_id
+        || token.config_revision() != binding.config_revision
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "oauth_binding_changed",
+            "The managed OAuth connection changed. Retry the operation.",
+        ));
+    }
+    let mut authorization =
+        HeaderValue::from_str(&format!("Bearer {}", token.expose())).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCategory::Upstream,
+                "invalid_oauth_access_token",
+                "The OAuth provider returned an access token that cannot be used safely.",
+            )
+        })?;
+    authorization.set_sensitive(true);
+    config.headers.insert(AUTHORIZATION, authorization);
+    Ok((
+        config,
+        Some(OAuthTransportRevision {
+            binding: binding.clone(),
+            secret_revision: token.secret_revision(),
+        }),
+    ))
+}
+
+async fn http_transport_config_for_observation(
+    oauth: Option<&OAuthService>,
+    source_id: &str,
+    stored: &StoredMcpHttpCredentialV1,
+    allow_private_network: bool,
+    observation: &McpOAuthBindingObservation,
+) -> Result<StreamableHttpConfig, ProtocolError> {
+    match observation {
+        McpOAuthBindingObservation::Static if stored.credential.is_some() => {
+            http_transport_config(stored, allow_private_network)
+        }
+        McpOAuthBindingObservation::Anonymous if stored.credential.is_none() => {
+            let current = match oauth {
+                Some(oauth) => oauth
+                    .binding(source_id, "default")
+                    .await
+                    .map_err(mcp_oauth_error)?,
+                None => None,
+            };
+            if current.is_some() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCategory::Conflict,
+                    "oauth_binding_changed",
+                    "The managed OAuth connection changed. Retry the operation.",
+                ));
+            }
+            http_transport_config(stored, allow_private_network)
+        }
+        McpOAuthBindingObservation::Managed(binding) if stored.credential.is_none() => {
+            http_transport_config_for_binding(
+                oauth,
+                source_id,
+                stored,
+                allow_private_network,
+                Some(binding),
+            )
+            .await
+            .map(|(config, _)| config)
+        }
+        _ => Err(ProtocolError::corrupt(
+            "source_authorization_mismatch",
+            "The prepared MCP authorization state is inconsistent.",
+        )),
+    }
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<Url, ProtocolError> {
@@ -2499,6 +3306,17 @@ fn require_revision(expected: i64, actual: i64) -> Result<(), ProtocolError> {
 }
 
 fn discovery_protocol_error(error: DiscoveryError) -> ProtocolError {
+    if let DiscoveryError::Fetch(source) = &error
+        && source
+            .downcast_ref::<McpPageFetchError>()
+            .is_some_and(|error| matches!(error, McpPageFetchError::AuthorizationRequired))
+    {
+        return ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "authorization_required",
+            "The MCP source requires authorization.",
+        );
+    }
     let (code, message) = match error {
         DiscoveryError::Fetch(_) => (
             "mcp_discovery_failed",
@@ -2560,6 +3378,32 @@ fn http_protocol_error(error: StreamableHttpError) -> ProtocolError {
             "mcp_transport_error",
             "The MCP HTTP server could not be reached or returned an invalid response.",
         ),
+    }
+}
+
+fn http_authorization_denied(error: &StreamableHttpError) -> bool {
+    matches!(
+        error,
+        StreamableHttpError::HttpStatus(status)
+            if matches!(
+                *status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+    )
+}
+
+fn http_protocol_error_for_authorization(
+    error: StreamableHttpError,
+    authorization_required_on_denial: bool,
+) -> ProtocolError {
+    if authorization_required_on_denial && http_authorization_denied(&error) {
+        ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "authorization_required",
+            "The MCP source requires authorization.",
+        )
+    } else {
+        http_protocol_error(error)
     }
 }
 
@@ -2635,6 +3479,47 @@ fn invalid_credentials(message: &'static str) -> ProtocolError {
     )
 }
 
+fn mcp_oauth_error(error: OAuthError) -> ProtocolError {
+    match error {
+        OAuthError::Validation { code, message } => {
+            ProtocolError::new(ProtocolErrorCategory::InvalidInput, code, message)
+        }
+        OAuthError::NotFound | OAuthError::AuthorizationDenied { .. } => ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "authorization_required",
+            "The MCP source requires OAuth authorization.",
+        ),
+        OAuthError::Conflict {
+            code: "oauth_reauthorization_required",
+            ..
+        } => ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "authorization_required",
+            "The MCP source requires OAuth authorization.",
+        ),
+        OAuthError::Conflict { .. } => ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "oauth_binding_changed",
+            "The managed OAuth connection changed. Retry the operation.",
+        ),
+        OAuthError::UnauthorizedTransaction => ProtocolError::new(
+            ProtocolErrorCategory::Internal,
+            "oauth_internal_error",
+            "The managed OAuth credential could not be resolved.",
+        ),
+        OAuthError::Upstream { code } => ProtocolError::new(
+            ProtocolErrorCategory::Upstream,
+            code,
+            "The OAuth provider request failed.",
+        ),
+        OAuthError::Internal => ProtocolError::new(
+            ProtocolErrorCategory::Internal,
+            "oauth_internal_error",
+            "The managed OAuth credential could not be resolved.",
+        ),
+    }
+}
+
 fn corrupt_configuration() -> ProtocolError {
     ProtocolError::corrupt(
         "invalid_source_configuration",
@@ -2661,10 +3546,21 @@ fn internal_error() -> ProtocolError {
 mod tests {
     use std::{collections::VecDeque, convert::Infallible};
 
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
     use crate::{
         AppConfig, ExecutorApp,
         catalog::{CreateSource, CredentialPayload, ListToolsFilter, StoredCredential},
+        crypto::Keyring,
+        oauth::{
+            model::{OAuthClientAuthentication, OAuthConnectionConfig, OAuthSecretSet},
+            store::OAuthStore,
+        },
+        outbound::OutboundPolicy,
     };
 
     struct ReconciliationFetcher {
@@ -2782,6 +3678,14 @@ mod tests {
             token: "highly-secret".to_owned(),
         };
         credential.validate().expect("bearer validates");
+        assert!(
+            credential
+                .headers()
+                .expect("bearer headers encode")
+                .get(AUTHORIZATION)
+                .expect("authorization header exists")
+                .is_sensitive()
+        );
         let stored = StoredMcpHttpCredentialV1 {
             endpoint: "https://example.com/mcp".to_owned(),
             credential: Some(credential),
@@ -2900,6 +3804,375 @@ mod tests {
         assert_eq!(error.category, ProtocolErrorCategory::CorruptData);
     }
 
+    #[tokio::test]
+    async fn anonymous_create_can_defer_discovery_for_an_oauth_protected_resource() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        for (status, reason) in [(401, "Unauthorized"), (403, "Forbidden")] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fixture listener binds");
+            let address = listener.local_addr().expect("fixture address exists");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("fixture accepts request");
+                let mut request = vec![0_u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("fixture reads request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with("POST /mcp HTTP/1.1"));
+                assert!(!request.to_ascii_lowercase().contains("authorization:"));
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nWWW-Authenticate: Bearer resource_metadata=\"https://auth.example/.well-known/oauth-protected-resource\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("fixture writes response");
+            });
+            let source = McpAdapter::default()
+                .create_http_source(
+                    app.catalog(),
+                    CreateMcpHttpSource {
+                        display_name: format!("OAuth fixture {status}"),
+                        preferred_slug: Some(format!("oauth_fixture_{status}")),
+                        description: None,
+                        endpoint: format!("http://{address}/mcp"),
+                        allow_private_network: true,
+                        credential: None,
+                    },
+                    AuditContext::system(Some("oauth-protected-create")),
+                )
+                .await
+                .expect("OAuth-protected source creation is deferred");
+
+            assert_eq!(source.health_status, SourceHealth::Error);
+            assert_eq!(
+                source.health_error_code.as_deref(),
+                Some("authorization_required")
+            );
+            let tools = app
+                .catalog()
+                .list_tools(ListToolsFilter {
+                    source_id: Some(source.id),
+                    include_tombstoned: true,
+                    limit: 100,
+                    ..ListToolsFilter::default()
+                })
+                .await
+                .expect("deferred source catalog remains readable");
+            assert!(tools.items.is_empty());
+            server.await.expect("fixture server joins");
+        }
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn credentialless_create_defers_when_tools_list_is_forbidden() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener binds");
+        let address = listener.local_addr().expect("fixture address exists");
+        let server = tokio::spawn(async move {
+            let initialize_body = json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "protocolVersion": HTTP_PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "fixture", "version": "1" }
+                }
+            })
+            .to_string();
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("fixture accepts request");
+                let mut request = vec![0_u8; 8192];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("fixture reads request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let response = match step {
+                    0 => {
+                        assert!(request.contains("\"method\":\"initialize\""));
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{initialize_body}",
+                            initialize_body.len()
+                        )
+                    }
+                    1 => {
+                        assert!(request.contains("notifications/initialized"));
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                    }
+                    _ => {
+                        assert!(request.contains("\"method\":\"tools/list\""));
+                        "HTTP/1.1 403 Forbidden\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                    }
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("fixture writes response");
+            }
+        });
+
+        let source = McpAdapter::default()
+            .create_http_source(
+                app.catalog(),
+                CreateMcpHttpSource {
+                    display_name: "Split auth fixture".to_owned(),
+                    preferred_slug: Some("split_auth_fixture".to_owned()),
+                    description: None,
+                    endpoint: format!("http://{address}/mcp"),
+                    allow_private_network: true,
+                    credential: None,
+                },
+                AuditContext::system(Some("split-auth-create")),
+            )
+            .await
+            .expect("tools/list denial defers source creation");
+
+        assert_eq!(source.health_status, SourceHealth::Error);
+        assert_eq!(
+            source.health_error_code.as_deref(),
+            Some("authorization_required")
+        );
+        server.await.expect("fixture server joins");
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn managed_oauth_is_resolved_just_in_time_and_static_credentials_take_precedence() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let master_key = [42_u8; 32];
+        let master_key_file = directory.path().join("fixture-master.key");
+        std::fs::write(&master_key_file, master_key).expect("fixture master key is written");
+        let app = ExecutorApp::open(
+            AppConfig::new(directory.path().join("data"))
+                .with_master_key_file(Some(master_key_file)),
+        )
+        .await
+        .expect("test app opens");
+        let stored = StoredMcpHttpCredentialV1 {
+            endpoint: "https://mcp.example.test/rpc".to_owned(),
+            credential: None,
+        };
+        let (source, _) = app
+            .catalog()
+            .create_source_with_catalog_health(
+                CreateSource {
+                    kind: SourceKind::McpHttp,
+                    preferred_slug: "managed_oauth".to_owned(),
+                    display_name: "Managed OAuth".to_owned(),
+                    description: None,
+                    configuration: json!({
+                        "endpoint": "https://mcp.example.test/rpc",
+                        "allowPrivateNetwork": false,
+                        "negotiatedProtocolVersion": HTTP_PROTOCOL_VERSION,
+                    })
+                    .as_object()
+                    .expect("configuration is an object")
+                    .clone(),
+                },
+                &stored.payload().expect("credential encodes"),
+                InitialCatalogSnapshot {
+                    artifacts: Vec::new(),
+                    tools: Vec::new(),
+                },
+                Vec::new(),
+                SourceHealth::Unknown,
+                AuditContext::system(Some("managed-oauth-source")),
+            )
+            .await
+            .expect("fixture source is created");
+        let keyring = Keyring::from_master_key(master_key).expect("fixture keyring derives");
+        OAuthStore::new(app.pool().clone(), keyring.clone())
+            .create_connection(
+                &source.id,
+                "default",
+                &OAuthConnectionConfig {
+                    issuer: "https://auth.example.test".to_owned(),
+                    authorization_endpoint: "https://auth.example.test/authorize".to_owned(),
+                    token_endpoint: "https://auth.example.test/token".to_owned(),
+                    client_id: "fixture-client".to_owned(),
+                    client_authentication: OAuthClientAuthentication::None,
+                    token_endpoint_auth_methods_supported: vec!["none".to_owned()],
+                    scopes: vec!["tools:read".to_owned()],
+                    allow_private_network: false,
+                    resource: Some("https://mcp.example.test/rpc".to_owned()),
+                },
+                Some(&OAuthSecretSet {
+                    access_token: Some("managed-secret-token".to_owned()),
+                    granted_scopes: vec!["tools:read".to_owned()],
+                    ..OAuthSecretSet::default()
+                }),
+                1,
+            )
+            .await
+            .expect("managed OAuth connection is created");
+        let oauth = OAuthService::new(
+            app.pool().clone(),
+            keyring,
+            "http://127.0.0.1:4788".to_owned(),
+            OutboundPolicy::default(),
+        );
+
+        let (managed, revision) =
+            http_transport_config_for_source(Some(&oauth), &source.id, &stored, false)
+                .await
+                .expect("managed OAuth token resolves");
+        assert_eq!(
+            managed
+                .headers
+                .get(AUTHORIZATION)
+                .expect("authorization header exists"),
+            "Bearer managed-secret-token"
+        );
+        assert!(
+            managed
+                .headers
+                .get(AUTHORIZATION)
+                .expect("authorization header exists")
+                .is_sensitive()
+        );
+        assert!(!format!("{:?}", managed.headers).contains("managed-secret-token"));
+        assert_eq!(
+            revision.expect("managed revision exists").secret_revision,
+            1
+        );
+        let source_credential = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("source credential remains readable")
+            .expect("source credential exists");
+        let source_payload = serde_json::to_string(&source_credential.credential.payload)
+            .expect("source credential serializes");
+        assert!(!source_payload.contains("managed-secret-token"));
+        assert!(!source_payload.contains("access_token"));
+        let mut stale_binding = oauth
+            .binding(&source.id, "default")
+            .await
+            .expect("binding lookup succeeds")
+            .expect("managed binding exists");
+        stale_binding.config_revision += 1;
+        let stale = match http_transport_config_for_binding(
+            Some(&oauth),
+            &source.id,
+            &stored,
+            false,
+            Some(&stale_binding),
+        )
+        .await
+        {
+            Ok(_) => panic!("a stale approval binding must be rejected before transport setup"),
+            Err(error) => error,
+        };
+        assert_eq!(stale.code, "oauth_binding_changed");
+        let anonymous = match http_transport_config_for_observation(
+            Some(&oauth),
+            &source.id,
+            &stored,
+            false,
+            &McpOAuthBindingObservation::Anonymous,
+        )
+        .await
+        {
+            Ok(_) => panic!("observed OAuth absence must be fenced at execution"),
+            Err(error) => error,
+        };
+        assert_eq!(anonymous.code, "oauth_binding_changed");
+
+        let static_stored = StoredMcpHttpCredentialV1 {
+            endpoint: stored.endpoint,
+            credential: Some(McpHttpCredential::Bearer {
+                token: "static-secret-token".to_owned(),
+            }),
+        };
+        let (static_config, revision) =
+            http_transport_config_for_source(Some(&oauth), &source.id, &static_stored, false)
+                .await
+                .expect("static credential resolves without managed OAuth");
+        assert_eq!(
+            static_config
+                .headers
+                .get(AUTHORIZATION)
+                .expect("authorization header exists"),
+            "Bearer static-secret-token"
+        );
+        assert!(revision.is_none());
+        app.shutdown().await;
+    }
+
+    #[test]
+    fn oauth_config_or_secret_rotation_requires_a_new_http_session() {
+        let active = OAuthTransportRevision {
+            binding: OAuthBinding {
+                connection_id: "connection".to_owned(),
+                credential_key: "default".to_owned(),
+                config_revision: 4,
+            },
+            secret_revision: 7,
+        };
+        let anonymous_stored = StoredMcpHttpCredentialV1 {
+            endpoint: "https://mcp.example.test".to_owned(),
+            credential: None,
+        };
+        assert!(matches!(
+            catalog_oauth_expectation(&anonymous_stored, None),
+            Some(OAuthBindingExpectation::Absent { credential_key })
+                if credential_key == "default"
+        ));
+        assert!(matches!(
+            catalog_oauth_expectation(&anonymous_stored, Some(&active)),
+            Some(OAuthBindingExpectation::Exact {
+                credential_key,
+                connection_id,
+                config_revision: 4,
+            }) if credential_key == "default" && connection_id == "connection"
+        ));
+        assert!(
+            catalog_oauth_expectation(
+                &StoredMcpHttpCredentialV1 {
+                    endpoint: anonymous_stored.endpoint.clone(),
+                    credential: Some(McpHttpCredential::Bearer {
+                        token: "static".to_owned(),
+                    }),
+                },
+                Some(&active),
+            )
+            .is_none()
+        );
+        assert!(!oauth_transport_changed(Some(&active), Some(&active)));
+        assert!(oauth_transport_changed(
+            Some(&active),
+            Some(&OAuthTransportRevision {
+                binding: OAuthBinding {
+                    config_revision: 5,
+                    ..active.binding.clone()
+                },
+                secret_revision: active.secret_revision,
+            })
+        ));
+        assert!(oauth_transport_changed(
+            Some(&active),
+            Some(&OAuthTransportRevision {
+                binding: active.binding.clone(),
+                secret_revision: 8,
+            })
+        ));
+        assert!(oauth_transport_changed(None, Some(&active)));
+    }
+
     #[test]
     fn preparation_is_network_free_and_preserves_secret_values() {
         let adapter = McpAdapter::default();
@@ -2924,6 +4197,7 @@ mod tests {
         };
         let prepared = adapter
             .prepare_invocation(
+                "source-id",
                 SourceKind::McpHttp,
                 &McpToolBindingV1 {
                     version: 1,
@@ -2932,13 +4206,14 @@ mod tests {
                 &configuration,
                 Some(&stored),
                 &json!({}),
+                McpOAuthBindingObservation::Static,
             )
             .expect("preparation succeeds without transport I/O");
-        let PreparedMcpInvocation::Http { config, .. } = prepared else {
+        let PreparedMcpInvocation::Http { credential, .. } = prepared else {
             panic!("HTTP invocation is prepared")
         };
-        assert!(config.endpoint.contains("secret=query"));
-        assert!(config.headers.contains_key(AUTHORIZATION));
+        assert!(credential.endpoint.contains("secret=query"));
+        assert!(credential.credential.is_some());
     }
 
     #[test]
@@ -3145,9 +4420,10 @@ mod tests {
         let stale = reconciliation_plan(source.revision, "stale").await;
         let revisions = std::sync::atomic::AtomicI64::new(source.revision);
 
-        let error = commit_watcher_discovery(app.catalog(), &source.id, stale, &lease, &revisions)
-            .await
-            .expect_err("stale watcher CAS is rejected");
+        let error =
+            commit_watcher_discovery(app.catalog(), &source.id, stale, None, &lease, &revisions)
+                .await
+                .expect_err("stale watcher CAS is rejected");
         assert_eq!(error.code, "revision_conflict");
         assert_eq!(
             app.catalog()
@@ -3239,6 +4515,7 @@ mod tests {
             app.catalog(),
             &source.id,
             stale_plan,
+            None,
             &stale_lease,
             &revisions,
         )
@@ -3324,6 +4601,101 @@ mod tests {
         assert!(stale.lock_revision(8).await.is_none());
         assert!(manager.stop_watcher_and_wait_at_revision("source", 8).await);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watcher_authorization_failure_updates_health_and_revision_fence() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let (source, _) = app
+            .catalog()
+            .create_source_with_catalog_health(
+                CreateSource {
+                    kind: SourceKind::McpHttp,
+                    preferred_slug: "watcher_oauth_health".to_owned(),
+                    display_name: "Watcher OAuth health".to_owned(),
+                    description: None,
+                    configuration: Map::new(),
+                },
+                &CredentialPayload {
+                    schema_version: MCP_CREDENTIAL_SCHEMA_VERSION,
+                    payload: json!({}),
+                },
+                InitialCatalogSnapshot {
+                    artifacts: Vec::new(),
+                    tools: Vec::new(),
+                },
+                Vec::new(),
+                SourceHealth::Unknown,
+                AuditContext::system(Some("watcher-oauth-health-create")),
+            )
+            .await
+            .expect("fixture source is created");
+        let manager = Arc::new(McpConnectionManager::new(StdioTemplateRegistry::default()));
+        let (lease_sender, lease_receiver) = tokio::sync::oneshot::channel();
+        manager
+            .replace_watcher(
+                source.id.clone(),
+                source.revision,
+                move |mut canceled, lease| async move {
+                    lease_sender.send(lease).ok();
+                    let _ = (&mut canceled).await;
+                },
+            )
+            .await
+            .expect("watcher installs");
+        let lease = lease_receiver.await.expect("watcher lease is available");
+        let revisions = std::sync::atomic::AtomicI64::new(source.revision);
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert_eq!(
+                http_protocol_error_for_authorization(
+                    StreamableHttpError::HttpStatus(status),
+                    true,
+                )
+                .code,
+                "authorization_required"
+            );
+            assert_eq!(
+                http_protocol_error_for_authorization(
+                    StreamableHttpError::HttpStatus(status),
+                    false,
+                )
+                .code,
+                "mcp_transport_error"
+            );
+        }
+        assert_eq!(
+            discovery_protocol_error(DiscoveryError::Fetch(Box::new(
+                McpPageFetchError::AuthorizationRequired,
+            )))
+            .code,
+            "authorization_required"
+        );
+
+        mark_watcher_authorization_required(app.catalog(), &source.id, &lease, &revisions).await;
+
+        let current = app
+            .catalog()
+            .source(&source.id)
+            .await
+            .expect("source remains readable");
+        assert_eq!(current.health_status, SourceHealth::Error);
+        assert_eq!(
+            current.health_error_code.as_deref(),
+            Some("authorization_required")
+        );
+        assert_eq!(
+            revisions.load(std::sync::atomic::Ordering::Acquire),
+            current.revision
+        );
+        assert!(lease.lock_revision(current.revision).await.is_some());
+        manager.shutdown().await;
+        app.shutdown().await;
     }
 
     #[tokio::test]

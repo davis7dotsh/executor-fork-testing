@@ -6,6 +6,14 @@ import type { Source } from "./api";
 
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
+function deferred<Value>() {
+  let resolve = (_value: Value) => {};
+  const promise = new Promise<Value>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 function source(kind: "mcp_http" | "mcp_stdio"): Source {
   return {
     id: `${kind}-source`,
@@ -36,6 +44,46 @@ afterEach(() => {
 });
 
 describe("MCP credential editor", () => {
+  it("reports busy state and aborts an in-flight save when externally disabled", async () => {
+    const replacement = deferred<Response>();
+    const request = { signal: null as AbortSignal | null };
+    const onbusychange = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((_input, init) => {
+        if (init?.method !== "PUT") {
+          return Promise.resolve(
+            Response.json({
+              revision: 4,
+              configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+            }),
+          );
+        }
+        request.signal = init.signal ?? null;
+        return replacement.promise;
+      }),
+    );
+    const mounted = render(McpCredentialEditor, {
+      source: source("mcp_http"),
+      onbusychange,
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    const token = await screen.findByLabelText<HTMLInputElement>("Bearer token");
+    await fireEvent.input(token, { target: { value: "must-be-cleared" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
+    await waitFor(() => expect(request.signal).not.toBeNull());
+    expect(onbusychange).toHaveBeenCalledWith(true);
+
+    await mounted.rerender({
+      source: source("mcp_http"),
+      disabled: true,
+      onbusychange,
+    });
+    await waitFor(() => expect(request.signal?.aborted).toBe(true));
+    expect(screen.getByLabelText<HTMLInputElement>("Bearer token").value).toBe("");
+    await waitFor(() => expect(onbusychange).toHaveBeenLastCalledWith(false));
+  });
+
   it("replaces HTTP API-key auth with the viewed CAS revision", async () => {
     const bodies: unknown[] = [];
     vi.stubGlobal(

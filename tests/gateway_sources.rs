@@ -8,7 +8,11 @@ use axum::{
 };
 use executor::{
     AppConfig, ExecutorApp,
-    catalog::{AuditContext, CatalogSnapshot, CreateSource, SourceKind, StagedTool, ToolMode},
+    catalog::{
+        AuditContext, CatalogSnapshot, CreateSource, SourceKind, StagedTool, StagedToolBinding,
+        ToolBinding, ToolMode,
+    },
+    graphql::{GraphqlBindingV1, GraphqlOperation},
 };
 use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
@@ -132,7 +136,7 @@ async fn create_gateway_token(app: &ExecutorApp, admin: &AdminSession) -> String
 
 fn staged_tool(stable_key: &str, mode: ToolMode) -> StagedTool {
     StagedTool {
-        stable_key: stable_key.to_owned(),
+        stable_key: format!("graphql:v1:query:{stable_key}"),
         preferred_name: stable_key.to_owned(),
         display_name: stable_key.to_owned(),
         description: None,
@@ -166,19 +170,39 @@ async fn create_source(
         )
         .await
         .expect("source should be created");
+    let tools = modes
+        .iter()
+        .enumerate()
+        .map(|(index, mode)| staged_tool(&format!("tool_{index}"), *mode))
+        .collect::<Vec<_>>();
+    let bindings = tools
+        .iter()
+        .map(|tool| StagedToolBinding {
+            stable_key: tool.stable_key.clone(),
+            binding: ToolBinding::GraphqlV1(GraphqlBindingV1 {
+                version: 1,
+                operation: GraphqlOperation::Query,
+                field_name: tool.preferred_name.clone(),
+                operation_name: "ExecutorOperation".to_owned(),
+                variables: Vec::new(),
+                selection: Vec::new(),
+                document: format!(
+                    "query ExecutorOperation {{ result: {} }}",
+                    tool.preferred_name
+                ),
+            }),
+        })
+        .collect();
     app.catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: source.revision,
                 expected_credential_revision: None,
                 artifacts: Vec::new(),
-                tools: modes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, mode)| staged_tool(&format!("tool_{index}"), *mode))
-                    .collect(),
+                tools,
             },
+            bindings,
             AuditContext::system(None),
         )
         .await

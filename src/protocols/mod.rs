@@ -1,3 +1,4 @@
+pub mod graphql;
 pub mod mcp;
 pub mod openapi;
 
@@ -12,6 +13,7 @@ use crate::{
         AuditContext, CatalogError, CatalogStore, CatalogSyncResult, InvocationLease, SourceKind,
         SourceRecord,
     },
+    oauth::OAuthBinding,
     outbound::OutboundError,
 };
 
@@ -46,19 +48,22 @@ pub struct PreparedProtocolInvocation {
 
 enum PreparedProtocolExecution {
     OpenApi(openapi::PreparedOpenApiInvocation),
+    Graphql(graphql::PreparedGraphqlInvocation),
     Mcp(mcp::PreparedMcpInvocation),
 }
 
 #[derive(Debug)]
 pub enum ProtocolInvocationError {
-    Outbound(OutboundError),
+    OpenApi(openapi::OpenApiExecutionError),
+    Graphql(graphql::GraphqlInvocationError),
     Mcp(mcp::McpInvocationError),
 }
 
 impl fmt::Display for ProtocolInvocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Outbound(error) => error.fmt(formatter),
+            Self::OpenApi(error) => error.fmt(formatter),
+            Self::Graphql(error) => error.fmt(formatter),
             Self::Mcp(error) => error.fmt(formatter),
         }
     }
@@ -67,7 +72,8 @@ impl fmt::Display for ProtocolInvocationError {
 impl std::error::Error for ProtocolInvocationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Outbound(error) => Some(error),
+            Self::OpenApi(error) => Some(error),
+            Self::Graphql(error) => Some(error),
             Self::Mcp(error) => Some(error),
         }
     }
@@ -85,6 +91,16 @@ pub struct CredentialMetadata {
 pub struct ConfiguredCredential {
     pub name: String,
     pub credential_type: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableOAuthCredential {
+    pub credential_key: String,
+    pub protocol: &'static str,
+    pub requested_scopes: Vec<String>,
+    #[serde(rename = "managedOAuthEligible")]
+    pub managed_oauth_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +150,7 @@ impl std::error::Error for ProtocolError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolRegistration {
     OpenApi,
-    GraphqlUnsupported,
+    Graphql,
     McpHttp,
     McpStdio,
 }
@@ -142,29 +158,40 @@ pub enum ProtocolRegistration {
 #[derive(Clone)]
 pub struct ProtocolRegistry {
     openapi: openapi::OpenApiAdapter,
+    graphql: graphql::GraphqlAdapter,
     mcp: mcp::McpAdapter,
 }
 
 impl Default for ProtocolRegistry {
     fn default() -> Self {
-        Self::new(Arc::new(crate::mcp::manager::McpConnectionManager::new(
-            crate::mcp::upstream::stdio::StdioTemplateRegistry::default(),
-        )))
+        Self {
+            openapi: openapi::OpenApiAdapter::default(),
+            graphql: graphql::GraphqlAdapter::default(),
+            mcp: mcp::McpAdapter::with_connection_manager(Arc::new(
+                crate::mcp::manager::McpConnectionManager::new(
+                    crate::mcp::upstream::stdio::StdioTemplateRegistry::default(),
+                ),
+            )),
+        }
     }
 }
 
 impl ProtocolRegistry {
-    pub(crate) fn new(connections: Arc<crate::mcp::manager::McpConnectionManager>) -> Self {
+    pub(crate) fn new(
+        connections: Arc<crate::mcp::manager::McpConnectionManager>,
+        oauth: crate::oauth::OAuthService,
+    ) -> Self {
         Self {
-            openapi: openapi::OpenApiAdapter,
-            mcp: mcp::McpAdapter::with_connection_manager(connections),
+            openapi: openapi::OpenApiAdapter::with_oauth(oauth.clone()),
+            graphql: graphql::GraphqlAdapter::with_oauth(oauth.clone()),
+            mcp: mcp::McpAdapter::with_services(connections, oauth),
         }
     }
 
     pub fn registration(&self, kind: SourceKind) -> ProtocolRegistration {
         match kind {
             SourceKind::Openapi => ProtocolRegistration::OpenApi,
-            SourceKind::Graphql => ProtocolRegistration::GraphqlUnsupported,
+            SourceKind::Graphql => ProtocolRegistration::Graphql,
             SourceKind::McpHttp => ProtocolRegistration::McpHttp,
             SourceKind::McpStdio => ProtocolRegistration::McpStdio,
         }
@@ -173,22 +200,20 @@ impl ProtocolRegistry {
     fn require_supported(&self, kind: SourceKind) -> Result<(), ProtocolError> {
         match self.registration(kind) {
             ProtocolRegistration::OpenApi
+            | ProtocolRegistration::Graphql
             | ProtocolRegistration::McpHttp
             | ProtocolRegistration::McpStdio => Ok(()),
-            ProtocolRegistration::GraphqlUnsupported => Err(ProtocolError::new(
-                ProtocolErrorCategory::Unsupported,
-                "unsupported_source_kind",
-                "This source protocol is not supported yet.",
-            )),
         }
     }
 
-    pub fn prepare_invocation(
+    pub async fn prepare_invocation(
         &self,
         lease: InvocationLease,
         arguments: &Value,
+        expected_oauth_bindings: Option<&[OAuthBinding]>,
     ) -> Result<PreparedProtocolInvocation, ProtocolError> {
         self.require_supported(lease.source_kind())?;
+        let source_id = lease.lookup().source_id.clone();
         let execution = match lease.source_kind() {
             SourceKind::Openapi => {
                 let binding = lease.binding().openapi().ok_or_else(|| {
@@ -197,12 +222,18 @@ impl ProtocolRegistry {
                         "The stored tool binding does not match its source protocol.",
                     )
                 })?;
-                PreparedProtocolExecution::OpenApi(self.openapi.prepare_invocation(
-                    binding,
-                    lease.source_configuration(),
-                    lease.credential(),
-                    arguments,
-                )?)
+                PreparedProtocolExecution::OpenApi(
+                    self.openapi
+                        .prepare_invocation(
+                            &source_id,
+                            binding,
+                            lease.source_configuration(),
+                            lease.credential(),
+                            arguments,
+                            expected_oauth_bindings,
+                        )
+                        .await?,
+                )
             }
             SourceKind::McpHttp | SourceKind::McpStdio => {
                 let binding = match (lease.source_kind(), lease.binding()) {
@@ -217,19 +248,47 @@ impl ProtocolRegistry {
                         ));
                     }
                 };
+                let oauth_binding = self
+                    .mcp
+                    .oauth_binding_observation(
+                        &source_id,
+                        lease.source_kind(),
+                        lease.credential(),
+                        expected_oauth_bindings,
+                    )
+                    .await?;
                 PreparedProtocolExecution::Mcp(self.mcp.prepare_invocation(
+                    &source_id,
                     lease.source_kind(),
                     binding,
                     lease.source_configuration(),
                     lease.credential(),
                     arguments,
+                    oauth_binding,
                 )?)
             }
             SourceKind::Graphql => {
-                return Err(ProtocolError::corrupt(
-                    "source_binding_mismatch",
-                    "The stored tool binding does not match its source protocol.",
-                ));
+                let binding = lease.binding().graphql().ok_or_else(|| {
+                    ProtocolError::corrupt(
+                        "source_binding_mismatch",
+                        "The stored tool binding does not match its source protocol.",
+                    )
+                })?;
+                let oauth_binding = self
+                    .graphql
+                    .oauth_binding_observation(
+                        &source_id,
+                        lease.credential(),
+                        expected_oauth_bindings,
+                    )
+                    .await?;
+                PreparedProtocolExecution::Graphql(self.graphql.prepare_invocation(
+                    binding,
+                    lease.source_configuration(),
+                    lease.credential(),
+                    arguments,
+                    oauth_binding,
+                )?)
             }
         };
         Ok(PreparedProtocolInvocation { lease, execution })
@@ -241,9 +300,16 @@ impl ProtocolRegistry {
     ) -> Result<ProtocolExecutionResponse, ProtocolInvocationError> {
         let PreparedProtocolInvocation { lease, execution } = prepared;
         let response = match execution {
-            PreparedProtocolExecution::OpenApi(prepared) => {
-                self.openapi.execute_invocation(prepared).await
-            }
+            PreparedProtocolExecution::OpenApi(prepared) => self
+                .openapi
+                .execute_invocation(prepared)
+                .await
+                .map_err(ProtocolInvocationError::OpenApi),
+            PreparedProtocolExecution::Graphql(prepared) => self
+                .graphql
+                .execute_invocation(prepared)
+                .await
+                .map_err(ProtocolInvocationError::Graphql),
             PreparedProtocolExecution::Mcp(prepared) => self
                 .mcp
                 .execute_invocation(prepared)
@@ -265,10 +331,11 @@ impl SourceService {
     pub(crate) fn new(
         catalog: CatalogStore,
         connections: Arc<crate::mcp::manager::McpConnectionManager>,
+        oauth: crate::oauth::OAuthService,
     ) -> Self {
         Self {
             catalog,
-            registry: ProtocolRegistry::new(connections),
+            registry: ProtocolRegistry::new(connections, oauth),
         }
     }
 
@@ -352,7 +419,11 @@ impl SourceService {
                     .await
             }
             SourceKind::Graphql => {
-                unreachable!("unsupported protocols return before create dispatch")
+                let input = decode_protocol_input(protocol)?;
+                self.registry
+                    .graphql
+                    .create_source(&self.catalog, input, audit)
+                    .await
             }
         }
     }
@@ -378,7 +449,10 @@ impl SourceService {
                     .await
             }
             SourceKind::Graphql => {
-                unreachable!("unsupported protocols return before refresh dispatch")
+                self.registry
+                    .graphql
+                    .refresh_source(&self.catalog, source, audit)
+                    .await
             }
         }
     }
@@ -403,9 +477,49 @@ impl SourceService {
                     .await
             }
             SourceKind::Graphql => {
-                unreachable!("unsupported protocols return before credential dispatch")
+                self.registry
+                    .graphql
+                    .credential_metadata(&self.catalog, &source.id)
+                    .await
             }
         }
+    }
+
+    pub async fn available_oauth_credentials(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<AvailableOAuthCredential>, ProtocolError> {
+        let source = self.source(source_id).await?;
+        self.registry.require_supported(source.kind)?;
+        let credentials = match source.kind {
+            SourceKind::Openapi => self
+                .registry
+                .openapi
+                .managed_oauth_options(&self.catalog, &source.id)
+                .await?
+                .into_iter()
+                .map(|option| AvailableOAuthCredential {
+                    credential_key: option.credential_key,
+                    protocol: "openapi",
+                    requested_scopes: option.scopes,
+                    managed_oauth_eligible: true,
+                })
+                .collect(),
+            SourceKind::Graphql => vec![AvailableOAuthCredential {
+                credential_key: "default".to_owned(),
+                protocol: "graphql",
+                requested_scopes: Vec::new(),
+                managed_oauth_eligible: true,
+            }],
+            SourceKind::McpHttp => vec![AvailableOAuthCredential {
+                credential_key: "default".to_owned(),
+                protocol: "mcp_http",
+                requested_scopes: Vec::new(),
+                managed_oauth_eligible: true,
+            }],
+            SourceKind::McpStdio => Vec::new(),
+        };
+        Ok(credentials)
     }
 
     pub async fn replace_credentials(
@@ -458,7 +572,17 @@ impl SourceService {
                     .await
             }
             SourceKind::Graphql => {
-                unreachable!("unsupported protocols return before credential dispatch")
+                let credential = decode_protocol_input(credential)?;
+                self.registry
+                    .graphql
+                    .replace_credentials(
+                        &self.catalog,
+                        &source.id,
+                        expected_revision,
+                        credential,
+                        audit,
+                    )
+                    .await
             }
         }
     }
@@ -485,7 +609,10 @@ impl SourceService {
                     .await
             }
             SourceKind::Graphql => {
-                unreachable!("unsupported protocols return before credential dispatch")
+                self.registry
+                    .graphql
+                    .clear_credentials(&self.catalog, &source.id, expected_revision, audit)
+                    .await
             }
         }
     }
@@ -586,7 +713,7 @@ mod tests {
     use crate::protocols::openapi::CreateOpenApiSource;
 
     #[test]
-    fn registry_supports_openapi_and_mcp_with_graphql_as_an_extension_slot() {
+    fn registry_supports_all_imported_protocols() {
         let registry = ProtocolRegistry::default();
         assert_eq!(
             registry.registration(SourceKind::Openapi),
@@ -594,7 +721,7 @@ mod tests {
         );
         assert_eq!(
             registry.registration(SourceKind::Graphql),
-            ProtocolRegistration::GraphqlUnsupported
+            ProtocolRegistration::Graphql
         );
         assert_eq!(
             registry.registration(SourceKind::McpHttp),
@@ -696,7 +823,8 @@ mod tests {
         };
         let registry = ProtocolRegistry::default();
         let prepared = registry
-            .prepare_invocation(lease, &json!({}))
+            .prepare_invocation(lease, &json!({}), None)
+            .await
             .expect("invocation preparation succeeds");
 
         assert!(

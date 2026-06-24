@@ -305,12 +305,15 @@ Approval APIs are:
 - `POST /api/v1/approvals/{id}/decision`
 - `GET` and `DELETE /api/v1/gateway/approvals/{id}`
 
-OAuth2 and OpenID Connect operations expose their declared flow metadata for a
-later OAuth setup UI. This slice accepts a manually supplied access token in
-the encrypted credential envelope, labeled `manual_oauth_access_token` in
-metadata. It does not yet claim a managed OAuth flow. State and PKCE handling,
-browser callbacks, authorization-code exchange, refresh-token rotation, and
-provider error recovery remain part of the dedicated OAuth slice.
+OAuth2 and OpenID Connect operations may still use a manually supplied access
+token in the encrypted credential envelope, labeled
+`manual_oauth_access_token` in metadata. Managed OAuth is available for
+OpenAPI authorization-code security schemes, GraphQL's `default` credential,
+and HTTP MCP's `default` credential. It uses provider-neutral discovery, PKCE,
+administrator-session-bound callback transactions, encrypted token storage,
+refresh-token rotation, and just-in-time access tokens. Managed token values
+are not copied into source credentials, approvals, or request logs. Static
+credentials take precedence when both forms are configured.
 
 ## MCP transport boundary
 

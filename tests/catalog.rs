@@ -50,7 +50,7 @@ impl TestExecutor {
     }
 
     async fn source(&self, preferred_slug: &str) -> executor::catalog::SourceRecord {
-        self.source_with_kind(preferred_slug, SourceKind::Graphql)
+        self.source_with_kind(preferred_slug, SourceKind::Openapi)
             .await
     }
 
@@ -93,9 +93,10 @@ impl TestExecutor {
             .await
             .expect("credential read should succeed")
             .map(|credential| credential.revision);
+        let bindings = openapi_bindings(&tools);
         self.app
             .catalog()
-            .sync_catalog(
+            .sync_catalog_with_bindings(
                 source_id,
                 CatalogSnapshot {
                     expected_source_revision: source.revision,
@@ -103,6 +104,7 @@ impl TestExecutor {
                     artifacts: Vec::new(),
                     tools,
                 },
+                bindings,
                 AuditContext::system(None),
             )
             .await
@@ -194,6 +196,58 @@ fn openapi_binding(stable_key: &str, method: &str) -> StagedToolBinding {
                 requirements: Vec::new(),
             }],
         }),
+    }
+}
+
+fn openapi_bindings(tools: &[StagedTool]) -> Vec<StagedToolBinding> {
+    tools
+        .iter()
+        .map(|tool| openapi_binding(&tool.stable_key, "GET"))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_imported_source_kind_requires_bindings_for_active_tools() {
+    let executor = TestExecutor::new().await;
+    for kind in [
+        SourceKind::Openapi,
+        SourceKind::Graphql,
+        SourceKind::McpHttp,
+        SourceKind::McpStdio,
+    ] {
+        let source = executor
+            .source_with_kind(&format!("binding-required-{}", kind.as_str()), kind)
+            .await;
+        let error = executor
+            .app
+            .catalog()
+            .sync_catalog(
+                &source.id,
+                CatalogSnapshot {
+                    expected_source_revision: source.revision,
+                    expected_credential_revision: None,
+                    artifacts: Vec::new(),
+                    tools: vec![staged("tool", "Tool", ToolMode::Enabled)],
+                },
+                AuditContext::system(None),
+            )
+            .await
+            .expect_err("active imported tools without bindings must fail closed");
+        assert!(matches!(
+            error,
+            CatalogError::Validation {
+                code: "incomplete_tool_bindings",
+                ..
+            }
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tools WHERE source_id = ?")
+                .bind(&source.id)
+                .fetch_one(executor.app.pool())
+                .await
+                .expect("failed sync leaves no tools"),
+            0
+        );
     }
 }
 
@@ -482,7 +536,7 @@ async fn source_health_failures_preserve_the_last_good_catalog_and_sync_restores
     let healthy = executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: source.revision,
@@ -494,6 +548,7 @@ async fn source_health_failures_preserve_the_last_good_catalog_and_sync_restores
                 }],
                 tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
             },
+            vec![openapi_binding("alpha", "GET")],
             AuditContext::system(None),
         )
         .await
@@ -626,7 +681,7 @@ async fn source_health_failures_preserve_the_last_good_catalog_and_sync_restores
     let restored = executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: failed.revision,
@@ -638,6 +693,7 @@ async fn source_health_failures_preserve_the_last_good_catalog_and_sync_restores
                 }],
                 tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
             },
+            vec![openapi_binding("alpha", "GET")],
             AuditContext::system(None),
         )
         .await
@@ -758,6 +814,96 @@ async fn deferred_source_creation_atomically_persists_an_unknown_empty_catalog()
             .await
             .expect("source count should read"),
         source_count
+    );
+}
+
+#[tokio::test]
+async fn authorization_required_source_creation_is_atomic_and_has_a_fixed_error_code() {
+    let executor = TestExecutor::new().await;
+    let (source, catalog) = executor
+        .app
+        .catalog()
+        .create_authorization_required_source_with_catalog(
+            CreateSource {
+                kind: SourceKind::McpHttp,
+                preferred_slug: "protected-mcp".to_owned(),
+                display_name: "Protected MCP".to_owned(),
+                description: None,
+                configuration: Map::new(),
+            },
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({}),
+            },
+            InitialCatalogSnapshot {
+                artifacts: Vec::new(),
+                tools: Vec::new(),
+            },
+            Vec::new(),
+            AuditContext::system(Some("authorization-required-create")),
+        )
+        .await
+        .expect("authorization-required source should commit in its final initial state");
+    assert_eq!(source.health_status, SourceHealth::Error);
+    assert_eq!(
+        source.health_error_code.as_deref(),
+        Some("authorization_required")
+    );
+    assert_eq!(source.last_refreshed_at, None);
+    assert_eq!(source.tool_count, 0);
+    assert_eq!(catalog.active_tool_count, 0);
+    assert_eq!(catalog.source_revision, source.revision);
+    assert_eq!(catalog.catalog_revision, source.catalog_revision);
+
+    let source_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("source count should read");
+    sqlx::query(
+        "CREATE TRIGGER reject_source_credentials BEFORE INSERT ON source_credentials \
+         BEGIN SELECT RAISE(ABORT, 'injected credential failure'); END",
+    )
+    .execute(executor.app.pool())
+    .await
+    .expect("failure injection trigger should install");
+
+    executor
+        .app
+        .catalog()
+        .create_authorization_required_source_with_catalog(
+            CreateSource {
+                kind: SourceKind::McpHttp,
+                preferred_slug: "must-not-leak".to_owned(),
+                display_name: "Must not leak".to_owned(),
+                description: None,
+                configuration: Map::new(),
+            },
+            &CredentialPayload {
+                schema_version: 1,
+                payload: json!({}),
+            },
+            InitialCatalogSnapshot {
+                artifacts: Vec::new(),
+                tools: Vec::new(),
+            },
+            Vec::new(),
+            AuditContext::system(Some("authorization-required-rollback")),
+        )
+        .await
+        .expect_err("a later write failure should roll back the source insertion");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+            .fetch_one(executor.app.pool())
+            .await
+            .expect("source count should read after rollback"),
+        source_count
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources WHERE slug = 'must_not_leak'")
+            .fetch_one(executor.app.pool())
+            .await
+            .expect("rolled-back source should not exist"),
+        0
     );
 }
 
@@ -1181,7 +1327,7 @@ async fn atomic_credential_sync_rolls_back_credential_on_late_catalog_failure() 
                 }],
                 tools: vec![staged("replacement", "Replacement", ToolMode::Enabled)],
             },
-            Vec::new(),
+            vec![openapi_binding("replacement", "GET")],
             AuditContext::system(Some("atomic-rollback")),
         )
         .await
@@ -1484,12 +1630,8 @@ async fn generic_sync_rejects_unbound_openapi_tools_without_changing_catalog_sta
 #[tokio::test]
 async fn non_openapi_sources_reject_openapi_bindings() {
     let executor = TestExecutor::new().await;
-    let source = executor.source("graphql-bindings").await;
-    executor
-        .sync(
-            &source.id,
-            vec![staged("query", "Query", ToolMode::Enabled)],
-        )
+    let source = executor
+        .source_with_kind("graphql-bindings", SourceKind::Graphql)
         .await;
     let current = executor
         .app
@@ -1641,7 +1783,7 @@ async fn refresh_cas_and_writer_lock_prevent_stale_or_partial_catalogs() {
     let stale_credential = executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: current.revision,
@@ -1653,6 +1795,7 @@ async fn refresh_cas_and_writer_lock_prevent_stale_or_partial_catalogs() {
                 }],
                 tools: vec![staged("new", "New", ToolMode::Enabled)],
             },
+            vec![openapi_binding("new", "GET")],
             AuditContext::system(None),
         )
         .await;
@@ -1699,14 +1842,16 @@ async fn refresh_cas_and_writer_lock_prevent_stale_or_partial_catalogs() {
     };
     let first_store = executor.app.catalog().clone();
     let second_store = executor.app.catalog().clone();
-    let first = first_store.sync_catalog(
+    let first = first_store.sync_catalog_with_bindings(
         &source.id,
         snapshot.clone(),
+        vec![openapi_binding("new", "GET")],
         AuditContext::system(Some("refresh-race-1")),
     );
-    let second = second_store.sync_catalog(
+    let second = second_store.sync_catalog_with_bindings(
         &source.id,
         snapshot,
+        vec![openapi_binding("new", "GET")],
         AuditContext::system(Some("refresh-race-2")),
     );
     let (first, second) = tokio::join!(first, second);
@@ -1920,7 +2065,7 @@ async fn refresh_audits_preserve_correlation_and_explicit_actor() {
     executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: source.revision,
@@ -1928,6 +2073,7 @@ async fn refresh_audits_preserve_correlation_and_explicit_actor() {
                 artifacts: Vec::new(),
                 tools: vec![staged("run", "Run", ToolMode::Enabled)],
             },
+            vec![openapi_binding("run", "GET")],
             AuditContext::system(Some("refresh-job-1")),
         )
         .await
@@ -1950,7 +2096,7 @@ async fn refresh_audits_preserve_correlation_and_explicit_actor() {
     executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: current.revision,
@@ -1958,6 +2104,7 @@ async fn refresh_audits_preserve_correlation_and_explicit_actor() {
                 artifacts: Vec::new(),
                 tools: vec![staged("run", "Run", ToolMode::Enabled)],
             },
+            vec![openapi_binding("run", "GET")],
             AuditContext::admin("admin-request-1", 1),
         )
         .await
@@ -2500,7 +2647,7 @@ async fn catalog_churn_rejects_tombstone_history_overflow_atomically() {
     let error = executor
         .app
         .catalog()
-        .sync_catalog(
+        .sync_catalog_with_bindings(
             &source.id,
             CatalogSnapshot {
                 expected_source_revision: before.revision,
@@ -2512,6 +2659,7 @@ async fn catalog_churn_rejects_tombstone_history_overflow_atomically() {
                 }],
                 tools: vec![staged("new-key", "New Tool", ToolMode::Enabled)],
             },
+            vec![openapi_binding("new-key", "GET")],
             AuditContext::system(None),
         )
         .await

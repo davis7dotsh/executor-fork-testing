@@ -1,18 +1,31 @@
 <script lang="ts">
+  import { replaceState } from "$app/navigation";
+  import { page } from "$app/state";
   import { tick, untrack } from "svelte";
   import DashboardShell from "$lib/DashboardShell.svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
+  import GraphqlCredentialEditor from "$lib/GraphqlCredentialEditor.svelte";
+  import GraphqlSourceForm from "$lib/GraphqlSourceForm.svelte";
   import McpCredentialEditor from "$lib/McpCredentialEditor.svelte";
   import McpHttpSourceForm from "$lib/McpHttpSourceForm.svelte";
   import McpStdioSourceForm from "$lib/McpStdioSourceForm.svelte";
+  import OAuthSourceConnections from "$lib/OAuthSourceConnections.svelte";
   import {
+    authorizeOAuthConnection,
+    createGraphqlSource,
     createOpenApiSource,
+    deleteOAuthConnection,
     deleteOpenApiCredentials,
     deleteSource,
+    disconnectOAuthConnection,
     getOpenApiCredentials,
+    getSourceCredentials,
     listSources,
+    listOAuthConnections,
     previewOpenApiSource,
     putOpenApiCredentials,
+    putOAuthConnection,
+    putGraphqlCredentials,
     refreshSourceCatalog,
     setSourceMode,
     type ApiError,
@@ -39,7 +52,14 @@
     type CredentialDraft,
     type SupportedCredentialType,
   } from "$lib/openapi-credentials";
+  import { safeGraphqlSourceDetails } from "$lib/graphql-source-state";
   import { safeMcpSourceDetails } from "$lib/mcp-source-state";
+  import {
+    oauthCallbackNoticeWithoutEligibleSources,
+    oauthCallbackRefreshKey,
+    type OAuthConnectionOperations,
+    withoutOAuthCallbackParameters,
+  } from "$lib/oauth-connection-state";
 
   const auth = useAuthState();
   const latest = createLatestRequest();
@@ -60,13 +80,19 @@
   let displayNameEdited = $state(false);
   let preferredSlug = $state("");
   let sourceDescription = $state("");
-  let sourceType = $state<"openapi" | "mcp_http" | "mcp_stdio">("openapi");
+  let sourceType = $state<"openapi" | "graphql" | "mcp_http" | "mcp_stdio">("openapi");
   let importCredentialRows = $state<CredentialDraft[]>([]);
   let credentialEditorSource = $state<string | null>(null);
   let confirmingCredentialClear = $state<string | null>(null);
   let credentialRevision = $state<number | null>(null);
   let credentialRows = $state<CredentialDraft[]>([]);
   let credentialBusySource = $state<string | null>(null);
+  let graphqlCredentialBusySourceIds = $state<string[]>([]);
+  let mcpCredentialBusySourceIds = $state<string[]>([]);
+  let oauthBusySourceIds = $state<string[]>([]);
+  let oauthCallbackCheckKey = $state<string | null>(null);
+  let oauthCallbackCheckedSourceIds = $state<string[]>([]);
+  let handledZeroSourceCallbackKey: string | null = null;
   let credentialFailure = $state<{ sourceId: string; error: ApiError } | null>(null);
   let credentialCleanup: (() => void) | null = null;
   let credentialCounter = 0;
@@ -77,10 +103,22 @@
   let importNotice = $state<string | null>(null);
   let previewBusy = $state(false);
   let createBusy = $state(false);
+  let oauthCallbackKey = $derived(oauthCallbackRefreshKey(page.url.searchParams));
   let previewCurrent = $derived(
     preview !== null && previewFingerprint === currentSpecFingerprint(),
   );
   const mutationControllers = new Map<string, AbortController>();
+  const oauthOperations: OAuthConnectionOperations = {
+    load: (sourceId, signal) => listOAuthConnections(sourceId, undefined, signal),
+    save: (sourceId, credentialKey, input, signal) =>
+      putOAuthConnection(sourceId, credentialKey, input, undefined, signal),
+    authorize: (sourceId, credentialKey, input, signal) =>
+      authorizeOAuthConnection(sourceId, credentialKey, input, undefined, signal),
+    disconnect: (sourceId, credentialKey, input, signal) =>
+      disconnectOAuthConnection(sourceId, credentialKey, input, undefined, signal),
+    remove: (sourceId, credentialKey, input, signal) =>
+      deleteOAuthConnection(sourceId, credentialKey, input, undefined, signal),
+  };
 
   $effect(() => {
     const requestKey = String(refreshKey);
@@ -99,6 +137,31 @@
         });
       },
     );
+  });
+
+  $effect(() => {
+    const callbackKey = oauthCallbackKey;
+    const sourceData = resource.data;
+    const sourceLoading = resource.loading;
+    const sourceError = resource.error;
+    if (
+      callbackKey === null ||
+      sourceData === null ||
+      sourceLoading ||
+      sourceError !== null ||
+      handledZeroSourceCallbackKey === callbackKey
+    )
+      return;
+    const notice = oauthCallbackNoticeWithoutEligibleSources(
+      callbackKey,
+      sourceData.sources.map((source) => source.kind),
+      sourceLoading,
+    );
+    if (notice === null) return;
+    handledZeroSourceCallbackKey = callbackKey;
+    importNotice = notice.message;
+    consumeOAuthCallback();
+    focusSourceStatus();
   });
 
   $effect(() => () => {
@@ -448,7 +511,7 @@
     if (type === "bearer") return "Bearer token";
     if (type === "basic") return "Basic auth";
     if (type === "oauth_access_token" || type === "manual_oauth_access_token") {
-      return "OAuth access token (manual)";
+      return "OAuth access token (manual, advanced)";
     }
     return type;
   }
@@ -487,16 +550,36 @@
     });
   }
 
-  function switchSourceType(next: "openapi" | "mcp_http" | "mcp_stdio") {
+  function switchSourceType(next: "openapi" | "graphql" | "mcp_http" | "mcp_stdio") {
     if (next === sourceType) return;
     if (sourceType === "openapi") clearImportForm();
     sourceType = next;
   }
 
-  function connectedMcpSource(source: SourceList["sources"][number]) {
+  function connectedSource(source: SourceList["sources"][number]) {
     importNotice = `${source.displayName} connected with ${source.toolCount} tools.`;
     refreshKey += 1;
     focusSourceStatus();
+  }
+
+  function connectGraphqlSource(
+    input: Parameters<typeof createGraphqlSource>[0],
+    signal: AbortSignal,
+  ) {
+    return createGraphqlSource(input, undefined, signal);
+  }
+
+  function loadGraphqlCredentials(sourceId: string, signal: AbortSignal) {
+    return getSourceCredentials(sourceId, undefined, signal);
+  }
+
+  function saveGraphqlCredentials(
+    sourceId: string,
+    expectedRevision: number,
+    credential: Parameters<typeof putGraphqlCredentials>[2],
+    signal: AbortSignal,
+  ) {
+    return putGraphqlCredentials(sourceId, expectedRevision, credential, undefined, signal);
   }
 
   function authenticatedPreviewWithoutCredentials() {
@@ -523,10 +606,62 @@
   function sourceOperationPending(sourceId: string) {
     return (
       resource.loading ||
-      (["mode", "refresh", "delete"] as const).some((operation) =>
-        pending.includes(sourceMutationId(operation, sourceId)),
-      )
+      sourceMutationPending(sourceId) ||
+      graphqlCredentialBusySourceIds.includes(sourceId) ||
+      mcpCredentialBusySourceIds.includes(sourceId) ||
+      oauthBusySourceIds.includes(sourceId)
     );
+  }
+
+  function sourceMutationPending(sourceId: string) {
+    return (["mode", "refresh", "delete"] as const).some((operation) =>
+      pending.includes(sourceMutationId(operation, sourceId)),
+    );
+  }
+
+  function setGraphqlCredentialBusy(sourceId: string, busy: boolean) {
+    graphqlCredentialBusySourceIds = busy
+      ? [...new Set([...graphqlCredentialBusySourceIds, sourceId])]
+      : graphqlCredentialBusySourceIds.filter((candidate) => candidate !== sourceId);
+  }
+
+  function setOAuthBusy(sourceId: string, busy: boolean) {
+    oauthBusySourceIds = busy
+      ? [...new Set([...oauthBusySourceIds, sourceId])]
+      : oauthBusySourceIds.filter((candidate) => candidate !== sourceId);
+  }
+
+  function setMcpCredentialBusy(sourceId: string, busy: boolean) {
+    mcpCredentialBusySourceIds = busy
+      ? [...new Set([...mcpCredentialBusySourceIds, sourceId])]
+      : mcpCredentialBusySourceIds.filter((candidate) => candidate !== sourceId);
+  }
+
+  function consumeOAuthCallback() {
+    if (oauthCallbackKey === null) return;
+    replaceState(withoutOAuthCallbackParameters(page.url), page.state);
+  }
+
+  function completeOAuthCallbackCheck(sourceId: string, matched: boolean) {
+    const callbackKey = oauthCallbackKey;
+    if (callbackKey === null) return;
+    if (oauthCallbackCheckKey !== callbackKey) {
+      oauthCallbackCheckKey = callbackKey;
+      oauthCallbackCheckedSourceIds = [];
+    }
+    if (matched) {
+      consumeOAuthCallback();
+      return;
+    }
+    oauthCallbackCheckedSourceIds = [...new Set([...oauthCallbackCheckedSourceIds, sourceId])];
+    const eligibleSourceCount =
+      resource.data?.sources.filter(
+        (source) =>
+          source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http",
+      ).length ?? 0;
+    if (eligibleSourceCount > 0 && oauthCallbackCheckedSourceIds.length >= eligibleSourceCount) {
+      consumeOAuthCallback();
+    }
   }
 
   function clearSourceMutationError(sourceId: string) {
@@ -624,6 +759,15 @@
         <input
           type="radio"
           name="source-type"
+          checked={sourceType === "graphql"}
+          onchange={() => switchSourceType("graphql")}
+        />
+        GraphQL API
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="source-type"
           checked={sourceType === "mcp_http"}
           onchange={() => switchSourceType("mcp_http")}
         />
@@ -639,8 +783,8 @@
         Trusted local MCP template
       </label>
       <p class="mode-impact">
-        OpenAPI compiles an API specification. MCP connects using Streamable HTTP or a locally
-        configured process template.
+        OpenAPI compiles an API specification. GraphQL imports an introspected schema. MCP connects
+        using Streamable HTTP or a locally configured process template.
       </p>
     </fieldset>
     {#if sourceType === "openapi"}
@@ -788,8 +932,8 @@
                     {/if}
                     {#if row?.enabled && row.credentialType === "oauth_access_token"}
                       <p class="field-help wide-field">
-                        Supply an access token manually. Executor does not run authorization flows
-                        or refresh OAuth tokens yet.
+                        Advanced: supply an access token manually. Managed OAuth becomes available
+                        after import when this security scheme supports it.
                       </p>
                     {/if}
                   </div>
@@ -817,10 +961,12 @@
           <p class="field-help">Credentials are encrypted locally and are never shown again.</p>
         </form>
       {/if}
+    {:else if sourceType === "graphql"}
+      <GraphqlSourceForm create={connectGraphqlSource} oncreated={connectedSource} />
     {:else if sourceType === "mcp_http"}
-      <McpHttpSourceForm oncreated={connectedMcpSource} />
+      <McpHttpSourceForm oncreated={connectedSource} />
     {:else}
-      <McpStdioSourceForm oncreated={connectedMcpSource} />
+      <McpStdioSourceForm oncreated={connectedSource} />
     {/if}
   </details>
 
@@ -843,8 +989,8 @@
       <span class="number-chip">01</span>
       <h2>No sources connected</h2>
       <p>
-        This instance has no source data yet. Use the source connector above to add an API or MCP
-        server.
+        This instance has no source data yet. Use the source connector above to add an OpenAPI,
+        GraphQL, or MCP source.
       </p>
     </section>
   {:else if resource.data !== null}
@@ -883,6 +1029,26 @@
 
           {#if source.healthErrorCode !== null}
             <p class="source-error">Refresh error: <code>{source.healthErrorCode}</code></p>
+          {/if}
+
+          {#if source.kind === "graphql"}
+            {@const details = safeGraphqlSourceDetails(source.configuration)}
+            <dl class="detail-list">
+              {#if details.endpoint !== null}
+                <div>
+                  <dt>Endpoint</dt>
+                  <dd>{details.endpoint}</dd>
+                </div>
+              {/if}
+              <div>
+                <dt>Private network</dt>
+                <dd>{details.allowPrivateNetwork ? "Allowed" : "Blocked"}</dd>
+              </div>
+              <div>
+                <dt>Schema discovery</dt>
+                <dd>GraphQL introspection</dd>
+              </div>
+            </dl>
           {/if}
 
           {#if source.kind === "mcp_http" || source.kind === "mcp_stdio"}
@@ -986,7 +1152,7 @@
                 class:primary={stagedSourceMode(source.id, source.modeOverride) === "enabled"}
                 class:danger-button={stagedSourceMode(source.id, source.modeOverride) ===
                   "disabled"}
-                disabled={pending.includes(sourceMutationId("mode", source.id))}
+                disabled={sourceOperationPending(source.id)}
                 onkeydown={(event) => {
                   if (event.key === "Escape") void cancelSourceModeConfirmation(source.id);
                 }}
@@ -1008,7 +1174,7 @@
             <a class="button-link" href={`/tools?source=${encodeURIComponent(source.id)}`}>
               View tools
             </a>
-            {#if source.kind === "openapi" || source.kind === "mcp_http" || source.kind === "mcp_stdio"}
+            {#if source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http" || source.kind === "mcp_stdio"}
               <button
                 type="button"
                 disabled={sourceOperationPending(source.id) || credentialBusySource === source.id}
@@ -1018,7 +1184,9 @@
                   ? "Refreshing..."
                   : source.kind === "openapi"
                     ? "Refresh"
-                    : "Reconnect and refresh tools"}
+                    : source.kind === "graphql"
+                      ? "Refresh schema and tools"
+                      : "Reconnect and refresh tools"}
               </button>
             {/if}
             {#if source.kind === "openapi"}
@@ -1038,7 +1206,37 @@
               </button>
             {/if}
             {#if source.kind === "mcp_http" || source.kind === "mcp_stdio"}
-              <McpCredentialEditor {source} disabled={sourceOperationPending(source.id)} />
+              <McpCredentialEditor
+                {source}
+                disabled={sourceMutationPending(source.id) ||
+                  oauthBusySourceIds.includes(source.id) ||
+                  graphqlCredentialBusySourceIds.includes(source.id)}
+                onbusychange={(busy) => setMcpCredentialBusy(source.id, busy)}
+              />
+            {/if}
+            {#if source.kind === "graphql"}
+              <GraphqlCredentialEditor
+                {source}
+                load={loadGraphqlCredentials}
+                save={saveGraphqlCredentials}
+                disabled={sourceMutationPending(source.id) ||
+                  oauthBusySourceIds.includes(source.id) ||
+                  mcpCredentialBusySourceIds.includes(source.id)}
+                onbusychange={(busy) => setGraphqlCredentialBusy(source.id, busy)}
+              />
+            {/if}
+            {#if source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http"}
+              <OAuthSourceConnections
+                {source}
+                operations={oauthOperations}
+                callbackRefreshKey={oauthCallbackKey}
+                disabled={sourceMutationPending(source.id) ||
+                  graphqlCredentialBusySourceIds.includes(source.id) ||
+                  mcpCredentialBusySourceIds.includes(source.id) ||
+                  credentialBusySource === source.id}
+                onbusychange={(busy) => setOAuthBusy(source.id, busy)}
+                oncallbackchecked={(matched) => completeOAuthCallbackCheck(source.id, matched)}
+              />
             {/if}
             {#if confirmingDelete === source.id}
               <div class="inline-confirm" role="group" aria-label={`Delete ${source.displayName}`}>
@@ -1118,7 +1316,7 @@
                       ><option value="api_key">API key</option><option value="bearer"
                         >Bearer token</option
                       ><option value="basic">Basic auth</option><option value="oauth_access_token"
-                        >OAuth access token</option
+                        >OAuth access token (manual, advanced)</option
                       ></select
                     ></label
                   >
@@ -1139,8 +1337,8 @@
                   >
                   {#if row.credentialType === "oauth_access_token"}
                     <p class="field-help wide-field">
-                      Supply an access token manually. Executor does not run authorization flows or
-                      refresh OAuth tokens yet.
+                      Advanced: supply an access token manually. Managed OAuth is available above
+                      when this security scheme supports it.
                     </p>
                   {/if}
                   <button

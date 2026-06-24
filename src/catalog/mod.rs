@@ -9,6 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::crypto::CryptoError;
+use crate::graphql::GraphqlBindingV1;
 use crate::openapi::OpenApiBinding;
 
 pub use store::CatalogStore;
@@ -254,6 +255,18 @@ pub struct CatalogSnapshot {
     pub tools: Vec<StagedTool>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OAuthBindingExpectation {
+    Absent {
+        credential_key: String,
+    },
+    Exact {
+        credential_key: String,
+        connection_id: String,
+        config_revision: i64,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct StagedArtifact {
     pub kind: ArtifactKind,
@@ -271,6 +284,7 @@ pub struct StagedToolBinding {
 #[serde(tag = "kind", content = "definition", rename_all = "snake_case")]
 pub enum ToolBinding {
     OpenapiV1(OpenApiBinding),
+    GraphqlV1(GraphqlBindingV1),
     McpHttpV1(McpToolBindingV1),
     McpStdioV1(McpToolBindingV1),
 }
@@ -286,6 +300,7 @@ impl ToolBinding {
     pub const fn protocol(&self) -> &'static str {
         match self {
             Self::OpenapiV1(_) => "openapi",
+            Self::GraphqlV1(_) => "graphql",
             Self::McpHttpV1(_) => "mcp_http",
             Self::McpStdioV1(_) => "mcp_stdio",
         }
@@ -294,21 +309,28 @@ impl ToolBinding {
     pub const fn version(&self) -> i64 {
         match self {
             Self::OpenapiV1(_) => 1,
-            Self::McpHttpV1(_) | Self::McpStdioV1(_) => 1,
+            Self::GraphqlV1(_) | Self::McpHttpV1(_) | Self::McpStdioV1(_) => 1,
         }
     }
 
     pub fn openapi(&self) -> Option<&OpenApiBinding> {
         match self {
             Self::OpenapiV1(binding) => Some(binding),
-            Self::McpHttpV1(_) | Self::McpStdioV1(_) => None,
+            Self::GraphqlV1(_) | Self::McpHttpV1(_) | Self::McpStdioV1(_) => None,
+        }
+    }
+
+    pub fn graphql(&self) -> Option<&GraphqlBindingV1> {
+        match self {
+            Self::GraphqlV1(binding) => Some(binding),
+            Self::OpenapiV1(_) | Self::McpHttpV1(_) | Self::McpStdioV1(_) => None,
         }
     }
 
     pub fn mcp(&self) -> Option<&McpToolBindingV1> {
         match self {
             Self::McpHttpV1(binding) | Self::McpStdioV1(binding) => Some(binding),
-            Self::OpenapiV1(_) => None,
+            Self::OpenapiV1(_) | Self::GraphqlV1(_) => None,
         }
     }
 
@@ -326,6 +348,13 @@ impl ToolBinding {
                     ));
                 }
                 Ok(Self::OpenapiV1(binding))
+            }
+            ("graphql", 1) => {
+                let binding: GraphqlBindingV1 = serde_json::from_str(definition_json)?;
+                binding.validate().map_err(|_| {
+                    CatalogError::CorruptData("unsupported or invalid GraphQL binding")
+                })?;
+                Ok(Self::GraphqlV1(binding))
             }
             ("mcp_http", 1) | ("mcp_stdio", 1) => {
                 let binding: McpToolBindingV1 = serde_json::from_str(definition_json)?;

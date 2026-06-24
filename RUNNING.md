@@ -37,6 +37,29 @@ develop on its `main`, publish a bump, then bump the dependency here. The
 The e2e globalsetup files are the source of truth for "how do I boot a
 working instance of X" — read them before inventing a boot path.
 
+## Managed OAuth callbacks
+
+Managed OAuth callback URLs are built from the server's public origin. A
+loopback server derives that origin from its actual bind address. When users
+reach Executor through HTTPS, a reverse proxy, or a tailnet hostname, start the
+server with the exact browser-facing origin:
+
+```sh
+executor server --public-origin https://executor.example.com
+```
+
+`EXECUTOR_PUBLIC_ORIGIN` is the environment-variable equivalent. The value is
+an origin only, with no path, query, fragment, or credentials. It also controls
+setup links and the dashboard's host and origin checks, so it must match the
+URL used in the browser.
+
+After adding a source, open its Managed OAuth panel and save the provider's
+issuer or MCP discovery settings plus the OAuth client. Executor then displays
+the exact connection-specific callback URL. Register that exact URL with the
+provider before selecting **Connect OAuth**. Callback paths have the form
+`/api/v1/oauth/callback/<connection-id>` and must not be replaced with one
+shared path.
+
 ## E2E: running, viewing, sharing
 
 `e2e/AGENTS.md` covers writing scenarios. Operationally:

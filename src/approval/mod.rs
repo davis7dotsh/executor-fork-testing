@@ -395,6 +395,25 @@ impl ApprovalStore {
         }
     }
 
+    async fn invocation_snapshot(&self, approval_id: &str) -> Result<Option<Value>, ApprovalError> {
+        let ciphertext = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT invocation_snapshot_ciphertext FROM approvals WHERE id = ?",
+        )
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        ciphertext
+            .map(|ciphertext| {
+                decrypt_json(
+                    &self.keyring,
+                    "approval-invocation-snapshot",
+                    approval_id,
+                    &ciphertext,
+                )
+            })
+            .transpose()
+    }
+
     async fn create(&self, new: NewApproval) -> Result<ApprovalCreateResult, ApprovalError> {
         validate_new(&new)?;
         let observed_now = self.advance_clock().await?;

@@ -158,9 +158,13 @@ The HTTP credential is one of:
 { "type": "oauth_access_token", "accessToken": "secret" }
 ```
 
-The OAuth form is a manually supplied access token. Managed OAuth discovery,
-authorization callbacks, refresh-token rotation, and provider recovery are not
-implemented for MCP sources yet.
+The OAuth form above is a manually supplied access token. For managed OAuth,
+leave the static credential empty and configure the source's `default`
+credential in the dashboard's Managed OAuth panel. HTTP MCP sources use
+protected-resource and authorization-server discovery, PKCE authorization-code
+callbacks, encrypted refresh-token storage, and just-in-time access tokens.
+Static credentials take precedence when one is configured. Stdio MCP sources
+do not expose managed OAuth.
 
 Transport-owned headers cannot be used for `api_key_header`. This includes
 `Authorization`, `Host`, `Content-Type`, `Accept`, length and connection

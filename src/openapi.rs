@@ -276,6 +276,7 @@ pub struct OpenApiProtocolRequest {
     pub url: Url,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    pub selected_security_schemes: Vec<String>,
 }
 
 type CookieParameters = BTreeMap<String, Vec<(String, String)>>;
@@ -406,7 +407,16 @@ pub fn build_protocol_request_with_base(
         });
         match applied {
             Ok(()) => {
-                selected = Some((candidate_query, candidate_headers, candidate_cookies));
+                selected = Some((
+                    candidate_query,
+                    candidate_headers,
+                    candidate_cookies,
+                    alternative
+                        .requirements
+                        .iter()
+                        .map(|requirement| requirement.scheme_name.clone())
+                        .collect::<Vec<_>>(),
+                ));
                 break;
             }
             Err(error) => {
@@ -414,9 +424,10 @@ pub fn build_protocol_request_with_base(
             }
         };
     }
-    let (selected_query, selected_headers, selected_cookies) = selected.ok_or_else(|| {
-        first_security_error.unwrap_or(OpenApiInvocationError::UnsatisfiedSecurity)
-    })?;
+    let (selected_query, selected_headers, selected_cookies, selected_security_schemes) = selected
+        .ok_or_else(|| {
+            first_security_error.unwrap_or(OpenApiInvocationError::UnsatisfiedSecurity)
+        })?;
     query = selected_query;
     headers = selected_headers;
     cookies = selected_cookies;
@@ -493,6 +504,7 @@ pub fn build_protocol_request_with_base(
         url,
         headers,
         body,
+        selected_security_schemes,
     })
 }
 

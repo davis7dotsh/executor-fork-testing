@@ -33,6 +33,8 @@ pub enum DatabaseError {
     Crypto(#[from] CryptoError),
     #[error(transparent)]
     McpTemplates(#[from] crate::mcp::upstream::stdio::StdioTemplateError),
+    #[error("could not recover managed OAuth state")]
+    OAuthInitialization,
     #[error("could not configure the SQLite database: {0}")]
     Configuration(#[source] sqlx::Error),
     #[error("could not run embedded SQLite migrations: {0}")]
