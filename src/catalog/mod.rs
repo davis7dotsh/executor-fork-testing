@@ -457,9 +457,12 @@ pub struct DescribedTool {
 pub struct InvocationLookup {
     pub tool_id: String,
     pub source_id: String,
+    pub source_display_name: String,
+    pub tool_display_name: String,
     pub callable_path: String,
     pub sandbox_path: String,
     pub effective_mode: ToolMode,
+    pub mode_provenance: ModeProvenance,
     pub requires_approval: bool,
 }
 
@@ -477,12 +480,39 @@ pub struct InvocationRevisionToken {
 pub struct InvocationLease {
     pub(crate) lookup: InvocationLookup,
     pub(crate) revisions: InvocationRevisionToken,
+    pub(crate) source_kind: SourceKind,
     pub(crate) binding: ToolBinding,
     pub(crate) input_schema: Value,
     pub(crate) input_validator: jsonschema::Validator,
     pub(crate) source_configuration: serde_json::Map<String, Value>,
     pub(crate) credential: Option<StoredCredential>,
     pub(crate) _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+pub struct InvocationPreflight {
+    lookup: InvocationLookup,
+    revisions: InvocationRevisionToken,
+    input_schema: Value,
+    input_validator: jsonschema::Validator,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl InvocationPreflight {
+    pub fn lookup(&self) -> &InvocationLookup {
+        &self.lookup
+    }
+
+    pub fn revisions(&self) -> &InvocationRevisionToken {
+        &self.revisions
+    }
+
+    pub fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    pub fn arguments_are_valid(&self, arguments: &Value) -> bool {
+        self.input_validator.is_valid(arguments)
+    }
 }
 
 impl InvocationLease {
@@ -492,6 +522,10 @@ impl InvocationLease {
 
     pub fn revisions(&self) -> &InvocationRevisionToken {
         &self.revisions
+    }
+
+    pub const fn source_kind(&self) -> SourceKind {
+        self.source_kind
     }
 
     pub fn binding(&self) -> &ToolBinding {

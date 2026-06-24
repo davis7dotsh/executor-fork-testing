@@ -95,6 +95,7 @@ async fn invocation_preparation_is_one_typed_catalog_snapshot() {
 
     assert_eq!(lease.lookup().source_id, source_id);
     assert_eq!(lease.lookup().tool_id, tool_id);
+    assert_eq!(lease.source_kind(), SourceKind::Openapi);
     assert_eq!(lease.lookup().effective_mode, ToolMode::Enabled);
     assert!(!lease.lookup().requires_approval);
     assert_eq!(lease.revisions().source_revision, 1);
@@ -125,6 +126,60 @@ async fn invocation_preparation_is_one_typed_catalog_snapshot() {
             .method,
         "GET"
     );
+}
+
+#[tokio::test]
+async fn invocation_source_kind_corruption_fails_closed_for_prepare_and_revalidation() {
+    let (_directory, app, source_id, _tool_id) = imported_source().await;
+    let lease = app
+        .catalog()
+        .prepare_invocation("weather.get_weather")
+        .await
+        .expect("invocation should prepare before corruption");
+    let token = lease.revisions().clone();
+    drop(lease);
+
+    let mut connection = app
+        .pool()
+        .acquire()
+        .await
+        .expect("database connection should be acquired");
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *connection)
+        .await
+        .expect("test should temporarily permit corrupt data");
+    sqlx::query("UPDATE sources SET kind = 'corrupt' WHERE id = ?")
+        .bind(source_id)
+        .execute(&mut *connection)
+        .await
+        .expect("source kind should be corrupted for the test");
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(&mut *connection)
+        .await
+        .expect("source kind constraint should be restored");
+    drop(connection);
+
+    let prepare_error = match app
+        .catalog()
+        .prepare_invocation("weather.get_weather")
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("fresh preparation must reject an unknown source kind"),
+    };
+    assert!(matches!(
+        prepare_error,
+        executor::catalog::CatalogError::CorruptData("unknown source kind")
+    ));
+
+    let revalidation_error = match app.catalog().revalidate_invocation(&token).await {
+        Err(error) => error,
+        Ok(_) => panic!("revalidation must reject an unknown source kind"),
+    };
+    assert!(matches!(
+        revalidation_error,
+        executor::catalog::CatalogError::CorruptData("unknown source kind")
+    ));
 }
 
 #[tokio::test]
@@ -174,4 +229,45 @@ async fn invocation_lease_blocks_mutation_and_old_token_revalidation_fails_after
     assert!(fresh.lookup().requires_approval);
     assert!(fresh.revisions().tool_revision > token.tool_revision);
     assert!(fresh.revisions().source_revision > token.source_revision);
+}
+
+#[tokio::test]
+async fn ask_preflight_does_not_decrypt_source_credentials() {
+    let (_directory, app, _source_id, tool_id) = imported_source().await;
+    let tool = app
+        .catalog()
+        .tool(&tool_id)
+        .await
+        .expect("tool should read");
+    app.catalog()
+        .set_tool_mode(
+            &tool_id,
+            Some(ToolMode::Ask),
+            tool.revision,
+            AuditContext::system(Some("ask-preflight")),
+        )
+        .await
+        .expect("tool should become ask mode");
+    sqlx::query("UPDATE source_credentials SET payload_ciphertext = x'01020304'")
+        .execute(app.pool())
+        .await
+        .expect("credential ciphertext should be corrupted for the test");
+
+    let preflight = app
+        .catalog()
+        .preflight_invocation("weather.get_weather")
+        .await
+        .expect("ask preflight must not decrypt credentials");
+    assert!(preflight.lookup().requires_approval);
+    assert!(preflight.arguments_are_valid(&json!({ "query": {} })));
+
+    let result = app
+        .catalog()
+        .revalidate_invocation(preflight.revisions())
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("credential decryption is deferred until approved execution"),
+    };
+    assert!(matches!(error, executor::catalog::CatalogError::Crypto(_)));
 }

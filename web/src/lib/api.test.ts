@@ -5,9 +5,12 @@ import {
   bulkSetToolModes,
   createOpenApiSource,
   createToken,
+  decideApproval,
   deleteOpenApiCredentials,
+  getApproval,
   getOpenApiCredentials,
   getBootstrap,
+  listApprovals,
   listRequestLogs,
   listSources,
   listTokens,
@@ -76,6 +79,46 @@ function logFixture() {
     durationMs: 27,
     approvalId: null,
     createdAt: 200,
+  };
+}
+
+function approvalSummaryFixture() {
+  return {
+    id: "approval-1",
+    status: "pending",
+    revision: 4,
+    sourceId: "source-1",
+    toolId: "tool-1",
+    path: "tools.github.create_issue",
+    sourceDisplayName: "GitHub",
+    toolDisplayName: "Create issue",
+    actorKind: "api_token",
+    actorId: "token-1",
+    actorName: "Laptop",
+    actorLabel: "Laptop",
+    actorApiTokenId: "token-1",
+    actorTokenName: "Laptop",
+    surface: "gateway",
+    mode: "ask",
+    provenance: "tool_override",
+    executionId: "execution-1",
+    callId: "call-1",
+    createdAt: 100,
+    updatedAt: 101,
+    expiresAt: 700,
+    decidedAt: null,
+    startedAt: null,
+    completedAt: null,
+    decision: null,
+    failureCode: null,
+  };
+}
+
+function approvalDetailFixture() {
+  return {
+    ...approvalSummaryFixture(),
+    redactedArguments: { title: "Issue title", body: "[REDACTED]" },
+    inputSchema: { type: "object" },
   };
 }
 
@@ -492,5 +535,119 @@ describe("dashboard API client", () => {
     });
 
     expect(result.ok && result.value.configuredSchemes).toEqual([]);
+  });
+
+  it("lists and reads strict approval DTOs without retaining secret extras", async () => {
+    const secret = "approval-secret-sentinel";
+    const list = await listApprovals(
+      { status: "pending", cursor: "older/page", limit: 50 },
+      async (input) => {
+        expect(String(input)).toBe("/api/v1/approvals?limit=50&status=pending&cursor=older%2Fpage");
+        return Response.json({
+          items: [
+            {
+              ...approvalSummaryFixture(),
+              sourceDisplayName: null,
+              toolDisplayName: null,
+              actorKind: "system",
+              actorId: "local_cli",
+              actorName: null,
+              actorLabel: "Local CLI",
+              actorApiTokenId: null,
+              actorTokenName: null,
+              rawArguments: { password: secret },
+              encryptedArguments: secret,
+              credential: secret,
+            },
+          ],
+          nextCursor: "next",
+          internalKey: secret,
+        });
+      },
+    );
+    const detail = await getApproval("approval/1", async (input) => {
+      expect(String(input)).toBe("/api/v1/approvals/approval%2F1");
+      return Response.json({
+        ...approvalDetailFixture(),
+        rawArguments: { password: secret },
+        encryptedArguments: secret,
+        result: secret,
+      });
+    });
+
+    expect(list.ok).toBe(true);
+    expect(detail.ok).toBe(true);
+    expect(JSON.stringify(list)).not.toContain(secret);
+    expect(JSON.stringify(detail)).not.toContain(secret);
+    expect(list.ok && list.value.items[0]?.sourceDisplayName).toBeNull();
+    expect(list.ok && list.value.items[0]?.toolDisplayName).toBeNull();
+    expect(list.ok && list.value.items[0]?.actorTokenName).toBeNull();
+    expect(list.ok && list.value.items[0]?.actorKind).toBe("system");
+    expect(list.ok && list.value.items[0]?.actorLabel).toBe("Local CLI");
+    expect(list.ok && list.value.items[0]?.actorApiTokenId).toBeNull();
+    expect(detail.ok && detail.value.redactedArguments).toEqual({
+      title: "Issue title",
+      body: "[REDACTED]",
+    });
+  });
+
+  it("omits the approval status parameter for an all-status list", async () => {
+    await listApprovals({ status: null, cursor: null, limit: 50 }, async (input) => {
+      expect(String(input)).toBe("/api/v1/approvals?limit=50");
+      return Response.json({ items: [], nextCursor: null });
+    });
+  });
+
+  it("sends approval decisions once with the viewed CAS revision", async () => {
+    document.cookie = "executor_csrf=approval_csrf; Path=/";
+    let calls = 0;
+    let body: unknown;
+    let csrf: string | null = null;
+    const result = await decideApproval("approval/1", "approve", 4, async (input, init) => {
+      calls += 1;
+      expect(String(input)).toBe("/api/v1/approvals/approval%2F1/decision");
+      expect(init?.method).toBe("POST");
+      body = decodeJson(String(init?.body));
+      csrf = new Headers(init?.headers).get("x-executor-csrf");
+      return Response.json({
+        ...approvalDetailFixture(),
+        status: "approved",
+        revision: 5,
+        decidedAt: 150,
+      });
+    });
+
+    expect(calls).toBe(1);
+    expect(body).toEqual({ decision: "approve", expectedRevision: 4 });
+    expect(csrf).toBe("approval_csrf");
+    expect(result.ok && result.value.status).toBe("approved");
+  });
+
+  it("preserves an approval conflict for refetch and review without retrying", async () => {
+    let calls = 0;
+    const result = await decideApproval("approval-1", "deny", 4, async () => {
+      calls += 1;
+      return Response.json(
+        {
+          error: {
+            code: "revision_conflict",
+            message: "The approval changed.",
+            requestId: "request-conflict",
+          },
+        },
+        { status: 409 },
+      );
+    });
+
+    expect(calls).toBe(1);
+    expect(result).toEqual({
+      ok: false,
+      error: new ApiError({
+        code: "revision_conflict",
+        displayMessage: "The approval changed.",
+        requestId: "request-conflict",
+        status: 409,
+      }),
+    });
   });
 });

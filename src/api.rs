@@ -27,22 +27,24 @@ use crate::{
     catalog::CatalogStore,
     crypto::{generate_secret, hash_password, verify_password},
     database::{Database, SETUP_TOKEN_TTL_SECONDS},
+    execution::ExecutionService,
+    invocation::ToolCallService,
+    protocols::SourceService,
+    request_logs::RequestLogSink,
+    tasks::TaskTracker,
     unix_timestamp,
 };
 
+mod approvals;
 mod catalog;
-mod openapi;
+pub(crate) mod openapi;
 mod protocols;
-mod request_logs;
-
-use request_logs::GatewayRequestLogSink;
 
 const SESSION_COOKIE: &str = "executor_session";
 const CSRF_COOKIE: &str = "executor_csrf";
 const CSRF_HEADER: &str = "x-executor-csrf";
 const MAX_API_BODY_BYTES: usize = 16 * 1024;
 const PASSWORD_HASH_CONCURRENCY: usize = 2;
-const GATEWAY_SEARCH_CONCURRENCY: usize = 1;
 const MAX_USERNAME_CHARACTERS: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
 const MIN_PASSWORD_CHARACTERS: usize = 12;
@@ -64,7 +66,10 @@ const MAX_TOKEN_LAST_USED_ATTEMPTS: usize = 4096;
 struct AppState {
     database: Database,
     catalog: CatalogStore,
-    request_logs: GatewayRequestLogSink,
+    sources: SourceService,
+    tool_calls: ToolCallService,
+    execution: ExecutionService,
+    request_logs: RequestLogSink,
     origin: Arc<str>,
     session_ttl_seconds: i64,
     secure_cookies: bool,
@@ -74,6 +79,7 @@ struct AppState {
     login_rate_limiter: Arc<LoginRateLimiter>,
     token_last_used_tracker: Arc<TokenLastUsedTracker>,
     trusted_proxies: Arc<[IpNet]>,
+    background_tasks: TaskTracker,
 }
 
 #[derive(Clone)]
@@ -274,6 +280,7 @@ impl TokenLastUsedTracker {
         token_id: String,
         used_at: i64,
         request_id: String,
+        background_tasks: &TaskTracker,
     ) {
         let attempted_at = Instant::now();
         let mut attempts = self
@@ -302,7 +309,7 @@ impl TokenLastUsedTracker {
         drop(attempts);
 
         let tracker = Arc::clone(self);
-        tokio::spawn(async move {
+        background_tasks.spawn(async move {
             let _permit = permit;
             let database_guard = database;
             let result = sqlx::query(
@@ -410,7 +417,29 @@ struct GatewayIdentity {
 
 struct AdminMutation(i64);
 
+struct AdminAuthentication;
+
 struct GatewayAuthentication(GatewayIdentity);
+
+pub(crate) struct ApiServices {
+    sources: SourceService,
+    tool_calls: ToolCallService,
+    execution: ExecutionService,
+}
+
+impl ApiServices {
+    pub(crate) fn new(
+        sources: SourceService,
+        tool_calls: ToolCallService,
+        execution: ExecutionService,
+    ) -> Self {
+        Self {
+            sources,
+            tool_calls,
+            execution,
+        }
+    }
+}
 
 struct AdminSession {
     id: i64,
@@ -436,6 +465,23 @@ impl FromRequestParts<AppState> for AdminMutation {
     }
 }
 
+impl FromRequestParts<AppState> for AdminAuthentication {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .expect("request ID middleware runs before authentication")
+            .clone();
+        require_admin(&request_id, state, &parts.headers).await?;
+        Ok(Self)
+    }
+}
+
 impl FromRequestParts<AppState> for GatewayAuthentication {
     type Rejection = ApiError;
 
@@ -456,23 +502,30 @@ impl FromRequestParts<AppState> for GatewayAuthentication {
 pub(crate) fn router(
     database: Database,
     catalog: CatalogStore,
+    services: ApiServices,
+    request_logs: RequestLogSink,
+    background_tasks: TaskTracker,
     config: &AppConfig,
     dummy_password_hash: String,
 ) -> Router {
-    let request_logs = GatewayRequestLogSink::new(database.clone(), catalog.clone());
+    let gateway_search_slots = services.tool_calls.discovery_slots();
     let state = AppState {
         database,
         catalog,
+        sources: services.sources,
+        tool_calls: services.tool_calls,
+        execution: services.execution,
         request_logs,
         origin: Arc::from(config.public_origin()),
         session_ttl_seconds: config.session_ttl_seconds,
         secure_cookies: config.origin.scheme() == "https",
         password_hash_slots: Arc::new(Semaphore::new(PASSWORD_HASH_CONCURRENCY)),
-        gateway_search_slots: Arc::new(Semaphore::new(GATEWAY_SEARCH_CONCURRENCY)),
+        gateway_search_slots,
         dummy_password_hash: Arc::from(dummy_password_hash),
         login_rate_limiter: Arc::new(LoginRateLimiter::new()),
         token_last_used_tracker: Arc::new(TokenLastUsedTracker::new()),
         trusted_proxies: config.trusted_proxies.clone(),
+        background_tasks,
     };
     let middleware_state = state.clone();
 
@@ -485,6 +538,7 @@ pub(crate) fn router(
         .route("/api/v1/tokens/{id}", delete(revoke_token))
         .route("/api/v1/gateway/whoami", get(gateway_whoami))
         .merge(catalog::router())
+        .merge(approvals::router())
         .merge(protocols::router())
         .merge(openapi::router())
         .fallback(not_found)
@@ -960,15 +1014,12 @@ async fn revoke_token(
     Path(token_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin_mutation(&request_id, &state, &headers).await?;
-    let changed =
-        sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-            .bind(unix_timestamp())
-            .bind(token_id)
-            .execute(&state.database.pool)
-            .await
-            .map_err(|error| ApiError::internal_logged(&request_id, error))?
-            .rows_affected();
-    if changed == 0 {
+    let changed = state
+        .tool_calls
+        .revoke_owner_token(&token_id)
+        .await
+        .map_err(|error| ApiError::internal_logged(&request_id, error))?;
+    if !changed {
         return Err(ApiError::new(
             &request_id,
             StatusCode::NOT_FOUND,
@@ -976,6 +1027,7 @@ async fn revoke_token(
             "The API token was not found or was already revoked.",
         ));
     }
+    state.execution.revoke_owner(&token_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1019,6 +1071,7 @@ async fn require_gateway_token(
             identity.0.clone(),
             now,
             request_id.0.clone(),
+            &state.background_tasks,
         );
     }
     Ok(GatewayIdentity {
@@ -1285,6 +1338,7 @@ mod tests {
     use crate::{
         AppConfig,
         database::{Database, DatabaseError, OpenedDatabase},
+        tasks::TaskTracker,
     };
 
     async fn open_database() -> (TempDir, AppConfig, Database) {
@@ -1337,6 +1391,7 @@ mod tests {
         .expect("failure trigger is installed");
 
         let tracker = Arc::new(TokenLastUsedTracker::new());
+        let background_tasks = TaskTracker::default();
         let unrelated_attempt = Instant::now();
         tracker
             .attempts
@@ -1358,6 +1413,7 @@ mod tests {
             "retry-token".to_owned(),
             1_750_000_000,
             "failed-request".to_owned(),
+            &background_tasks,
         );
         wait_for_token_write(&tracker).await;
 
@@ -1383,6 +1439,7 @@ mod tests {
             "retry-token".to_owned(),
             1_750_000_001,
             "retry-request".to_owned(),
+            &background_tasks,
         );
         wait_for_token_write(&tracker).await;
 
@@ -1393,6 +1450,7 @@ mod tests {
         .await
         .expect("last-used timestamp is readable");
         assert_eq!(last_used, Some(1_750_000_001));
+        background_tasks.shutdown().await;
     }
 
     #[tokio::test]
@@ -1410,11 +1468,13 @@ mod tests {
             .expect("test writer holds the SQLite write lock");
 
         let tracker = Arc::new(TokenLastUsedTracker::new());
+        let background_tasks = TaskTracker::default();
         tracker.schedule(
             database.clone(),
             "guarded-token".to_owned(),
             1_750_000_000,
             "guarded-request".to_owned(),
+            &background_tasks,
         );
         drop(database);
 
@@ -1442,5 +1502,6 @@ mod tests {
         .await
         .expect("background write releases its instance-lock guard");
         reopened.pool.close().await;
+        background_tasks.shutdown().await;
     }
 }

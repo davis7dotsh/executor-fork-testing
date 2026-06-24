@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{
     ArtifactKind, AuditContext, BulkToolModeResult, CatalogError, CatalogSnapshot,
     CatalogSyncResult, CreateSource, CredentialPayload, DEFAULT_PAGE_LIMIT, DescribedTool,
-    DiscoveryPage, InitialCatalogSnapshot, InvocationLease, InvocationLookup,
+    DiscoveryPage, InitialCatalogSnapshot, InvocationLease, InvocationLookup, InvocationPreflight,
     InvocationRevisionToken, ListToolsFilter, MAX_PAGE_LIMIT, NewRequestLog, RequestLogPage,
     RequestLogRecord, RequestOutcome, RequestSurface, SourceHealth, SourceKind, SourceRecord,
     StagedToolBinding, StoredCredential, StoredToolBinding, ToolBinding, ToolMode, ToolPage,
@@ -22,7 +22,7 @@ use super::{
 use crate::{crypto::Keyring, unix_timestamp};
 
 const CREDENTIAL_PURPOSE: &str = "source-credential-v1";
-const RESERVED_SOURCE_SLUGS: [&str; 4] = ["tools", "search", "describe", "executor"];
+const RESERVED_SOURCE_SLUGS: [&str; 5] = ["tools", "search", "describe", "sources", "executor"];
 const TOOL_ERROR_TYPESCRIPT: &str =
     "{ code: string; message: string; status?: number; details?: unknown; retryable?: boolean }";
 const TOOL_HTTP_META_TYPESCRIPT: &str = "{ status: number; headers: { [k: string]: string; } }";
@@ -145,6 +145,8 @@ struct RequestLogRow {
 struct InvocationRow {
     tool_id: String,
     source_id: String,
+    source_display_name: String,
+    tool_display_name: String,
     source_kind: String,
     source_slug: String,
     local_name: String,
@@ -1425,12 +1427,16 @@ impl CatalogStore {
                 path: tool.sandbox_path,
             });
         }
+        let source_display_name = self.source(&tool.source_id).await?.display_name;
         Ok(InvocationLookup {
             tool_id: tool.id,
             source_id: tool.source_id,
+            source_display_name,
+            tool_display_name: tool.display_name,
             callable_path: tool.callable_path,
             sandbox_path: tool.sandbox_path,
             effective_mode: tool.effective_mode.mode,
+            mode_provenance: tool.effective_mode.provenance,
             requires_approval: tool.effective_mode.mode == ToolMode::Ask,
         })
     }
@@ -1453,6 +1459,34 @@ impl CatalogStore {
             path: normalize_sandbox_path(path),
         })?;
         self.invocation_lease(row, guard)
+    }
+
+    /// Resolves policy and validates the stored input schema without decrypting source credentials.
+    ///
+    /// Ask-mode callers must use this snapshot before creating an approval. The read guard keeps
+    /// the revision token coherent only for the duration of preflight and must not be retained while
+    /// an approval is pending.
+    pub async fn preflight_invocation(
+        &self,
+        path: &str,
+    ) -> Result<InvocationPreflight, CatalogError> {
+        let Some((source_slug, local_name)) = parse_tool_path(path) else {
+            return Err(CatalogError::ToolNotFound {
+                path: normalize_sandbox_path(path),
+            });
+        };
+        let guard = self.mutation_lock.clone().read_owned().await;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, InvocationRow>(INVOCATION_SELECT_BY_PATH)
+            .bind(source_slug)
+            .bind(local_name)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        let row = row.ok_or_else(|| CatalogError::ToolNotFound {
+            path: normalize_sandbox_path(path),
+        })?;
+        Self::invocation_preflight(row, guard)
     }
 
     pub async fn revalidate_invocation(
@@ -1484,12 +1518,12 @@ impl CatalogStore {
         if row.present == 0 {
             return Err(CatalogError::ToolNotFound { path: sandbox_path });
         }
-        let mode = effective_mode(
+        let effective_mode = effective_mode(
             ToolMode::from_str(&row.intrinsic_mode)?,
             parse_optional_mode(row.source_mode_override)?,
             parse_optional_mode(row.tool_mode_override)?,
-        )
-        .mode;
+        );
+        let mode = effective_mode.mode;
         if mode == ToolMode::Disabled {
             return Err(CatalogError::ToolDisabled { path: sandbox_path });
         }
@@ -1508,8 +1542,9 @@ impl CatalogStore {
             .binding_revision
             .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
         let binding = ToolBinding::decode(binding_protocol, binding_version, definition_json)?;
+        let source_kind = SourceKind::from_str(&row.source_kind)?;
         if !matches!(
-            (&binding, SourceKind::from_str(&row.source_kind)?),
+            (&binding, source_kind),
             (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
         ) {
             return Err(CatalogError::CorruptData(
@@ -1541,9 +1576,12 @@ impl CatalogStore {
         let lookup = InvocationLookup {
             tool_id: row.tool_id.clone(),
             source_id: row.source_id.clone(),
+            source_display_name: row.source_display_name,
+            tool_display_name: row.tool_display_name,
             callable_path,
             sandbox_path,
             effective_mode: mode,
+            mode_provenance: effective_mode.provenance,
             requires_approval: mode == ToolMode::Ask,
         };
         if row.input_schema_json.len() > MAX_SCHEMA_BYTES {
@@ -1563,11 +1601,85 @@ impl CatalogStore {
                 credential_revision: row.credential_revision,
             },
             lookup,
+            source_kind,
             binding,
             input_schema,
             input_validator,
             source_configuration: serde_json::from_str(&row.configuration_json)?,
             credential,
+            _guard: guard,
+        })
+    }
+
+    fn invocation_preflight(
+        row: InvocationRow,
+        guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<InvocationPreflight, CatalogError> {
+        let sandbox_path = format!("{}.{}", row.source_slug, row.local_name);
+        if row.present == 0 {
+            return Err(CatalogError::ToolNotFound { path: sandbox_path });
+        }
+        let effective_mode = effective_mode(
+            ToolMode::from_str(&row.intrinsic_mode)?,
+            parse_optional_mode(row.source_mode_override)?,
+            parse_optional_mode(row.tool_mode_override)?,
+        );
+        let mode = effective_mode.mode;
+        if mode == ToolMode::Disabled {
+            return Err(CatalogError::ToolDisabled { path: sandbox_path });
+        }
+        let binding_protocol = row
+            .binding_protocol
+            .as_deref()
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding_version = row
+            .binding_version
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let definition_json = row
+            .definition_json
+            .as_deref()
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding_revision = row
+            .binding_revision
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding = ToolBinding::decode(binding_protocol, binding_version, definition_json)?;
+        if !matches!(
+            (&binding, SourceKind::from_str(&row.source_kind)?),
+            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
+        ) {
+            return Err(CatalogError::CorruptData(
+                "tool binding does not match source kind",
+            ));
+        }
+        if row.input_schema_json.len() > MAX_SCHEMA_BYTES {
+            return Err(CatalogError::CorruptData("tool input schema is too large"));
+        }
+        let input_schema: Value = serde_json::from_str(&row.input_schema_json)?;
+        let input_validator = super::schema::compile(&input_schema)
+            .map_err(|()| CatalogError::CorruptData("tool input schema is invalid"))?;
+        Ok(InvocationPreflight {
+            revisions: InvocationRevisionToken {
+                source_id: row.source_id.clone(),
+                tool_id: row.tool_id.clone(),
+                source_revision: row.source_revision,
+                catalog_revision: row.catalog_revision,
+                tool_revision: row.tool_revision,
+                binding_revision,
+                credential_revision: row.credential_revision,
+            },
+            lookup: InvocationLookup {
+                tool_id: row.tool_id,
+                source_id: row.source_id,
+                source_display_name: row.source_display_name,
+                tool_display_name: row.tool_display_name,
+                callable_path: format!("tools.{sandbox_path}"),
+                sandbox_path,
+                effective_mode: mode,
+                mode_provenance: effective_mode.provenance,
+                requires_approval: mode == ToolMode::Ask,
+            },
+            input_schema,
+            input_validator,
             _guard: guard,
         })
     }
@@ -2000,6 +2112,7 @@ const TOOL_SUMMARY_SELECT_BY_PATH: &str = "SELECT tools.id, tools.source_id, sou
      WHERE sources.slug = ? AND tools.local_name = ?";
 
 const INVOCATION_SELECT_BY_PATH: &str = "SELECT tools.id AS tool_id, tools.source_id, \
+     sources.display_name AS source_display_name, tools.display_name AS tool_display_name, \
      sources.kind AS source_kind, sources.slug AS source_slug, tools.local_name, \
      tools.present, tools.intrinsic_mode, \
      tools.mode_override AS tool_mode_override, sources.mode_override AS source_mode_override, \
@@ -2016,6 +2129,7 @@ const INVOCATION_SELECT_BY_PATH: &str = "SELECT tools.id AS tool_id, tools.sourc
      WHERE sources.slug = ? AND tools.local_name = ?";
 
 const INVOCATION_SELECT_BY_REVISION: &str = "SELECT tools.id AS tool_id, tools.source_id, \
+     sources.display_name AS source_display_name, tools.display_name AS tool_display_name, \
      sources.kind AS source_kind, sources.slug AS source_slug, tools.local_name, \
      tools.present, tools.intrinsic_mode, \
      tools.mode_override AS tool_mode_override, sources.mode_override AS source_mode_override, \

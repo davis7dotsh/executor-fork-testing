@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::{
     AppConfig,
+    approval::ApprovalError,
     crypto::{CryptoError, Keyring, generate_secret, load_or_create_master_key},
     unix_timestamp,
 };
@@ -26,6 +27,8 @@ pub(crate) const SETUP_TOKEN_TTL_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    #[error(transparent)]
+    Approval(#[from] ApprovalError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("could not configure the SQLite database: {0}")]
@@ -202,6 +205,7 @@ async fn application_state_exists(pool: &SqlitePool) -> Result<bool, DatabaseErr
          OR EXISTS(SELECT 1 FROM tools) \
          OR EXISTS(SELECT 1 FROM request_logs) \
          OR EXISTS(SELECT 1 FROM audit_events) \
+         OR EXISTS(SELECT 1 FROM approvals) \
          OR EXISTS(SELECT 1 FROM catalog_state WHERE id = 1 AND revision <> 0) \
          OR EXISTS(SELECT 1 FROM instance_metadata WHERE key <> ?)",
     )

@@ -50,7 +50,7 @@ pub struct CompiledOpenApiTool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiBinding {
     pub version: u32,
     pub method: String,
@@ -62,7 +62,7 @@ pub struct OpenApiBinding {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiParameterBinding {
     pub name: String,
     pub location: OpenApiParameterLocation,
@@ -93,7 +93,7 @@ impl OpenApiParameterLocation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiRequestBodyBinding {
     pub required: bool,
     pub default_media_type: String,
@@ -101,13 +101,13 @@ pub struct OpenApiRequestBodyBinding {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiSecurityAlternative {
     pub requirements: Vec<OpenApiSecurityRequirement>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiSecurityRequirement {
     pub scheme_name: String,
     pub scopes: Vec<String>,
@@ -119,7 +119,8 @@ pub struct OpenApiSecurityRequirement {
 #[serde(
     tag = "type",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum OpenApiSecurityScheme {
     ApiKey {
@@ -138,7 +139,7 @@ pub enum OpenApiSecurityScheme {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiOAuthFlows {
     pub implicit: Option<OpenApiOAuthFlow>,
     pub password: Option<OpenApiOAuthFlow>,
@@ -147,7 +148,7 @@ pub struct OpenApiOAuthFlows {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiOAuthFlow {
     pub authorization_url: Option<String>,
     pub token_url: Option<String>,
@@ -182,9 +183,8 @@ pub enum OpenApiError {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenApiCredentialSet {
-    #[serde(default)]
     pub schemes: BTreeMap<String, OpenApiCredential>,
 }
 
@@ -192,7 +192,8 @@ pub struct OpenApiCredentialSet {
 #[serde(
     tag = "type",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum OpenApiCredential {
     ApiKey {
@@ -207,7 +208,7 @@ pub enum OpenApiCredential {
     },
     #[serde(rename = "oauth_access_token")]
     OAuthAccessToken {
-        #[serde(rename = "access_token", alias = "accessToken")]
+        #[serde(rename = "access_token")]
         access_token: String,
     },
 }

@@ -1,8 +1,8 @@
 use executor::{
     catalog::ToolMode,
     openapi::{
-        OpenApiCredential, OpenApiCredentialError, OpenApiCredentialSet, OpenApiError,
-        OpenApiInvocationError, OpenApiParameterLocation, OpenApiSecurityScheme,
+        OpenApiBinding, OpenApiCredential, OpenApiCredentialError, OpenApiCredentialSet,
+        OpenApiError, OpenApiInvocationError, OpenApiParameterLocation, OpenApiSecurityScheme,
         build_protocol_request, build_protocol_request_with_base, compile_document,
     },
 };
@@ -1103,10 +1103,7 @@ fn public_request_builder_rejects_identity_and_rewrite_headers() {
 
 #[test]
 fn canonical_credentials_validate_and_round_trip_every_supported_type() {
-    assert_eq!(
-        serde_json::from_value::<OpenApiCredentialSet>(json!({})).unwrap(),
-        OpenApiCredentialSet::default()
-    );
+    assert!(serde_json::from_value::<OpenApiCredentialSet>(json!({})).is_err());
     let credentials: OpenApiCredentialSet = serde_json::from_value(json!({
         "schemes": {
             "headerKey": { "type": "api_key", "value": "key" },
@@ -1151,6 +1148,74 @@ fn canonical_credentials_validate_and_round_trip_every_supported_type() {
         invalid.validate(),
         Err(OpenApiCredentialError::InvalidSchemeName)
     );
+}
+
+#[test]
+fn public_openapi_dtos_reject_unknown_or_legacy_credential_fields() {
+    for value in [
+        json!({ "scheme": {} }),
+        json!({ "schemes": {}, "unexpected": true }),
+        json!({ "schemes": { "key": { "type": "api_key", "value": "key", "typo": true } } }),
+        json!({ "schemes": { "bearer": { "type": "bearer", "token": "token", "typo": true } } }),
+        json!({ "schemes": { "basic": {
+            "type": "basic", "username": "user", "password": "password", "typo": true
+        } } }),
+        json!({ "schemes": { "oauth": {
+            "type": "oauth_access_token", "access_token": "token", "typo": true
+        } } }),
+        json!({ "schemes": { "oauth": {
+            "type": "oauth_access_token", "accessToken": "legacy-token"
+        } } }),
+    ] {
+        assert!(
+            serde_json::from_value::<OpenApiCredentialSet>(value).is_err(),
+            "unknown and legacy fields must be rejected"
+        );
+    }
+
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": { "title": "Strict binding DTO" },
+        "servers": [{ "url": "https://api.example.test" }],
+        "components": { "securitySchemes": {
+            "key": { "type": "apiKey", "in": "header", "name": "X-Api-Key" }
+        }},
+        "paths": { "/items": { "post": {
+            "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer" } }],
+            "requestBody": { "content": {
+                "application/json": { "schema": { "type": "object" } }
+            }},
+            "security": [{ "key": [] }],
+            "responses": {}
+        }}}
+    });
+    let compiled = compile_document(&serde_json::to_vec(&document).unwrap()).unwrap();
+    let binding = &compiled.tools[0].binding;
+    let serialized = serde_json::to_value(binding).unwrap();
+    assert_eq!(
+        serde_json::from_value::<OpenApiBinding>(serialized.clone()).unwrap(),
+        *binding
+    );
+
+    for pointer in [
+        "",
+        "/parameters/0",
+        "/requestBody",
+        "/security/0",
+        "/security/0/requirements/0",
+        "/security/0/requirements/0/scheme",
+    ] {
+        let mut invalid = serialized.clone();
+        invalid
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test pointer should select an object")
+            .insert("unexpected".to_owned(), json!(true));
+        assert!(
+            serde_json::from_value::<OpenApiBinding>(invalid).is_err(),
+            "unknown field at {pointer} must be rejected"
+        );
+    }
 }
 
 #[test]

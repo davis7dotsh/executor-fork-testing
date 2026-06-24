@@ -196,3 +196,25 @@ async fn malformed_input_schema_is_rejected_before_atomic_creation_writes() {
     assert_eq!(row_count(&app, "tools").await, 0);
     assert_eq!(app.catalog().global_revision().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn atomic_import_cannot_shadow_the_sources_builtin() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+        .await
+        .expect("Executor should open");
+    let mut source = source_input();
+    source.preferred_slug = "sources".to_owned();
+    let (source, _) = app
+        .catalog()
+        .create_source_with_catalog(
+            source,
+            &credential(),
+            snapshot(),
+            bindings(),
+            AuditContext::system(Some("reserved-sources-import")),
+        )
+        .await
+        .expect("reserved source import should allocate a safe suffix");
+    assert_eq!(source.slug, "sources_2");
+}

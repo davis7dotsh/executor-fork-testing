@@ -192,6 +192,60 @@ const RequestLogPageSchema = Schema.Struct({
   nextCursor: Schema.NullOr(Schema.String),
 });
 
+const ApprovalStatusSchema = Schema.Literals([
+  "pending",
+  "approved",
+  "executing",
+  "succeeded",
+  "failed",
+  "denied",
+  "canceled",
+  "expired",
+  "stale",
+  "interrupted",
+]);
+
+const ApprovalSummarySchema = Schema.Struct({
+  id: Schema.String,
+  status: ApprovalStatusSchema,
+  revision: Schema.Number,
+  sourceId: Schema.String,
+  toolId: Schema.String,
+  path: Schema.String,
+  sourceDisplayName: Schema.NullOr(Schema.String),
+  toolDisplayName: Schema.NullOr(Schema.String),
+  actorKind: Schema.Literals(["api_token", "admin", "system"]),
+  actorId: Schema.String,
+  actorName: Schema.NullOr(Schema.String),
+  actorLabel: Schema.String,
+  actorApiTokenId: Schema.NullOr(Schema.String),
+  actorTokenName: Schema.NullOr(Schema.String),
+  surface: Schema.Literals(["gateway", "cli", "mcp"]),
+  mode: Schema.Literal("ask"),
+  provenance: ModeProvenanceSchema,
+  executionId: Schema.String,
+  callId: Schema.String,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  expiresAt: Schema.Number,
+  decidedAt: Schema.NullOr(Schema.Number),
+  startedAt: Schema.NullOr(Schema.Number),
+  completedAt: Schema.NullOr(Schema.Number),
+  decision: Schema.NullOr(Schema.Literals(["approve", "deny"])),
+  failureCode: Schema.NullOr(Schema.String),
+});
+
+const ApprovalDetailSchema = Schema.Struct({
+  ...ApprovalSummarySchema.fields,
+  redactedArguments: Schema.Unknown,
+  inputSchema: Schema.Unknown,
+});
+
+const ApprovalPageSchema = Schema.Struct({
+  items: Schema.Array(ApprovalSummarySchema),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+
 const ErrorEnvelopeSchema = Schema.Struct({
   error: Schema.Struct({
     code: Schema.String,
@@ -216,6 +270,11 @@ export type ToolPage = typeof ToolPageSchema.Type;
 export type BulkToolModeResult = typeof BulkToolModeResultSchema.Type;
 export type RequestLog = typeof RequestLogSchema.Type;
 export type RequestLogPage = typeof RequestLogPageSchema.Type;
+export type ApprovalStatus = typeof ApprovalStatusSchema.Type;
+export type ApprovalSummary = typeof ApprovalSummarySchema.Type;
+export type ApprovalDetail = typeof ApprovalDetailSchema.Type;
+export type ApprovalPage = typeof ApprovalPageSchema.Type;
+export type ApprovalDecision = "approve" | "deny";
 
 export class ApiError extends Schema.TaggedErrorClass<ApiError>()("ApiError", {
   code: Schema.String,
@@ -255,6 +314,10 @@ const decodeRequestLog = Schema.decodeUnknownOption(Schema.fromJsonString(Reques
 const decodeRequestLogPage = Schema.decodeUnknownOption(
   Schema.fromJsonString(RequestLogPageSchema),
 );
+const decodeApprovalDetail = Schema.decodeUnknownOption(
+  Schema.fromJsonString(ApprovalDetailSchema),
+);
+const decodeApprovalPage = Schema.decodeUnknownOption(Schema.fromJsonString(ApprovalPageSchema));
 const decodeErrorEnvelope = Schema.decodeUnknownOption(Schema.fromJsonString(ErrorEnvelopeSchema));
 
 export async function getBootstrap(fetcher: Fetcher = fetch, signal?: AbortSignal) {
@@ -589,6 +652,57 @@ export async function getRequestLog(
   );
   if (!response.ok) return response;
   return decodeResponse(response.value, decodeRequestLog);
+}
+
+export async function listApprovals(
+  filters: {
+    readonly status: ApprovalStatus | null;
+    readonly cursor: string | null;
+    readonly limit: number;
+  },
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const parameters = new URLSearchParams({ limit: String(filters.limit) });
+  if (filters.status !== null) parameters.set("status", filters.status);
+  if (filters.cursor !== null) parameters.set("cursor", filters.cursor);
+  const response = await request(`/api/v1/approvals?${parameters}`, { signal }, fetcher);
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeApprovalPage);
+}
+
+export async function getApproval(
+  approvalId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/approvals/${encodeURIComponent(approvalId)}`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeApprovalDetail);
+}
+
+export async function decideApproval(
+  approvalId: string,
+  decision: ApprovalDecision,
+  expectedRevision: number,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/approvals/${encodeURIComponent(approvalId)}/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision, expectedRevision }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeApprovalDetail);
 }
 
 async function request(path: string, init: RequestInit, fetcher: Fetcher, includeCsrf = true) {

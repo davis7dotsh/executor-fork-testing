@@ -500,8 +500,10 @@ async fn preview_import_and_invoke_enforce_planes_modes_and_body_limits() {
         &[(header::AUTHORIZATION.as_str(), &authorization)],
     )
     .await;
-    assert_eq!(ask.status(), StatusCode::CONFLICT);
-    assert_eq!(body(ask).await["error"]["code"], "approval_required");
+    assert_eq!(ask.status(), StatusCode::ACCEPTED);
+    let ask = body(ask).await;
+    assert_eq!(ask["status"], "approval_required");
+    assert_eq!(ask["approval"]["status"], "pending");
 
     upstream_task.abort();
 }
@@ -630,6 +632,17 @@ async fn large_body_routes_authenticate_before_parsing_json() {
         app.router(),
         Method::PUT,
         "/api/v1/sources/not-a-source/credentials",
+        malformed.clone(),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(response).await["error"]["code"], "invalid_origin");
+
+    let response = send_raw(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources/not-a-source/refresh",
         malformed.clone(),
         &[],
     )
@@ -785,4 +798,179 @@ async fn openapi_credentials_reject_other_protocols_and_unknown_schema_versions(
         body(response).await["error"]["code"],
         "unsupported_credential_schema"
     );
+}
+
+#[tokio::test]
+async fn source_requests_reject_typos_before_mutating_catalog_or_credentials() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+        .await
+        .expect("Executor should open");
+    let admin = setup(&app).await;
+    let specification = json!({
+        "openapi": "3.1.0",
+        "info": { "title": "Strict requests" },
+        "servers": [{ "url": "https://example.com" }],
+        "paths": {}
+    })
+    .to_string();
+
+    let preview_typo = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources/openapi/preview",
+        json!({
+            "spec": { "type": "inline", "content": specification },
+            "allowPrivateNetwrok": false
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(preview_typo.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(preview_typo).await["error"]["code"], "invalid_json");
+
+    let spec_typo = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources/openapi/preview",
+        json!({
+            "spec": {
+                "type": "inline",
+                "content": specification,
+                "contnet": specification
+            }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(spec_typo.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(spec_typo).await["error"]["code"], "invalid_json");
+
+    let create_typo = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources",
+        json!({
+            "kind": "openapi",
+            "displayNmae": "Strict requests",
+            "spec": { "type": "inline", "content": specification }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(create_typo.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(create_typo).await["error"]["code"], "invalid_json");
+    assert!(
+        app.catalog()
+            .list_sources()
+            .await
+            .expect("sources should list")
+            .is_empty()
+    );
+
+    let malformed_credential = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources",
+        json!({
+            "kind": "openapi",
+            "displayName": "Strict requests",
+            "spec": { "type": "inline", "content": specification },
+            "credential": {}
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(malformed_credential.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body(malformed_credential).await["error"]["code"],
+        "invalid_json"
+    );
+    assert!(
+        app.catalog()
+            .list_sources()
+            .await
+            .expect("sources should list")
+            .is_empty()
+    );
+
+    let created = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources",
+        json!({
+            "kind": "openapi",
+            "displayName": "Strict requests",
+            "preferredSlug": "strict",
+            "spec": { "type": "inline", "content": specification }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let source_id = body(created).await["id"]
+        .as_str()
+        .expect("created source should have an ID")
+        .to_owned();
+
+    let put_typo = send(
+        app.router(),
+        Method::PUT,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!({
+            "expectedRevison": 0,
+            "credential": {
+                "schemes": {
+                    "ApiKey": { "type": "api_key", "value": "must-not-store" }
+                }
+            }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(put_typo.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(put_typo).await["error"]["code"], "invalid_json");
+
+    let put_missing_revision = send(
+        app.router(),
+        Method::PUT,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!({
+            "credential": {
+                "schemes": {
+                    "ApiKey": { "type": "api_key", "value": "must-not-store" }
+                }
+            }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(put_missing_revision.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body(put_missing_revision).await["error"]["code"],
+        "invalid_json"
+    );
+
+    let delete_typo = send(
+        app.router(),
+        Method::DELETE,
+        &format!("/api/v1/sources/{source_id}/credentials?expectedRevison=0"),
+        json!(null),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(delete_typo.status(), StatusCode::BAD_REQUEST);
+
+    let metadata = send(
+        app.router(),
+        Method::GET,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!(null),
+        &[(header::COOKIE.as_str(), admin.cookie.as_str())],
+    )
+    .await;
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata = body(metadata).await;
+    assert_eq!(metadata["revision"], 0);
+    assert_eq!(metadata["configuredSchemes"], json!([]));
 }

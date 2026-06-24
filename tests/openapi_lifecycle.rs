@@ -1,4 +1,10 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
@@ -26,18 +32,25 @@ struct Admin {
 struct Upstream {
     address: std::net::SocketAddr,
     specification: Arc<RwLock<Value>>,
+    spec_requests: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct UpstreamState {
+    specification: Arc<RwLock<Value>>,
+    spec_requests: Arc<AtomicUsize>,
 }
 
 impl Upstream {
     async fn start() -> Self {
-        async fn serve_specification(
-            State(specification): State<Arc<RwLock<Value>>>,
-        ) -> Json<Value> {
-            Json(specification.read().await.clone())
+        async fn serve_specification(State(state): State<UpstreamState>) -> Json<Value> {
+            state.spec_requests.fetch_add(1, Ordering::SeqCst);
+            Json(state.specification.read().await.clone())
         }
 
         let specification = Arc::new(RwLock::new(json!({})));
+        let spec_requests = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener should bind");
@@ -48,7 +61,10 @@ impl Upstream {
                 "/api/hello",
                 get(|| async { Json(json!({ "message": "still callable" })) }),
             )
-            .with_state(Arc::clone(&specification));
+            .with_state(UpstreamState {
+                specification: Arc::clone(&specification),
+                spec_requests: Arc::clone(&spec_requests),
+            });
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
@@ -57,6 +73,7 @@ impl Upstream {
         Self {
             address,
             specification,
+            spec_requests,
             task,
         }
     }
@@ -75,6 +92,10 @@ impl Upstream {
             Some(query) => format!("http://{}/openapi.json?{query}", self.address),
             None => format!("http://{}/openapi.json", self.address),
         }
+    }
+
+    fn spec_request_count(&self) -> usize {
+        self.spec_requests.load(Ordering::SeqCst)
     }
 }
 
@@ -254,6 +275,71 @@ fn hello_paths() -> Value {
 }
 
 #[tokio::test]
+async fn refresh_rejects_unknown_fields_before_fetching_or_mutating() {
+    let upstream = Upstream::start().await;
+    upstream.set_paths(hello_paths(), "initial").await;
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+        .await
+        .expect("Executor should open");
+    let admin = setup(&app).await;
+    let created = import_source(
+        &app,
+        &admin,
+        &upstream.spec_url(None),
+        "strict-refresh",
+        json!({ "schemes": {} }),
+    )
+    .await;
+    let source_id = created["id"]
+        .as_str()
+        .expect("source should have an ID")
+        .to_owned();
+    let before_source = app
+        .catalog()
+        .source(&source_id)
+        .await
+        .expect("source should read");
+    let before_global_revision = app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let before_spec_requests = upstream.spec_request_count();
+
+    let response = send(
+        app.router(),
+        Method::POST,
+        &format!("/api/v1/sources/{source_id}/refresh"),
+        json!({ "expectedRevison": before_source.revision }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"]["code"], "invalid_json");
+    assert_eq!(upstream.spec_request_count(), before_spec_requests);
+
+    let after_source = app
+        .catalog()
+        .source(&source_id)
+        .await
+        .expect("source should still read");
+    assert_eq!(after_source.revision, before_source.revision);
+    assert_eq!(
+        after_source.catalog_revision,
+        before_source.catalog_revision
+    );
+    assert_eq!(after_source.tool_count, before_source.tool_count);
+    assert_eq!(
+        app.catalog()
+            .global_revision()
+            .await
+            .expect("global revision should still read"),
+        before_global_revision
+    );
+}
+
+#[tokio::test]
 async fn removed_then_restored_openapi_tool_keeps_identity_override_and_callable_binding() {
     let upstream = Upstream::start().await;
     upstream.set_paths(hello_paths(), "initial").await;
@@ -267,7 +353,7 @@ async fn removed_then_restored_openapi_tool_keeps_identity_override_and_callable
         &admin,
         &upstream.spec_url(None),
         "lifecycle",
-        json!({}),
+        json!({ "schemes": {} }),
     )
     .await;
     let source_id = created["id"]
@@ -371,7 +457,7 @@ async fn refresh_binding_failure_rolls_back_artifact_tools_bindings_and_revision
         &admin,
         &upstream.spec_url(None),
         "rollback",
-        json!({}),
+        json!({ "schemes": {} }),
     )
     .await;
     let source_id = created["id"]

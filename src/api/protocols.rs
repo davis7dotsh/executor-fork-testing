@@ -1,30 +1,38 @@
-use std::{collections::BTreeMap, time::Instant};
-
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode, header},
-    routing::post,
+    body::Body,
+    extract::{DefaultBodyLimit, Extension, Path, Query, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use super::{
-    AdminMutation, ApiError, AppState, GatewayAuthentication, RequestId, openapi, parse_json,
+    AdminAuthentication, AdminMutation, ApiError, AppState, GatewayAuthentication, RequestId,
+    parse_json,
 };
 use crate::{
-    catalog::{
-        CatalogError, InvocationLease, InvocationLookup, InvocationRevisionToken, NewRequestLog,
-        RequestOutcome, RequestSurface, SourceKind, ToolBinding,
+    actor::ToolActor,
+    approval::ApprovalError,
+    catalog::{AuditContext, CatalogError, RequestSurface, SourceKind},
+    execution::{ExecuteCodeRequest, ExecutionServiceError},
+    invocation::{
+        GatewayInvokeError, GatewayInvokeResponse, ToolCall, ToolCallError, ToolCallSubmission,
+        gateway_idempotency_key_is_valid,
     },
-    outbound::{HardenedHttpClient, OutboundError},
-    unix_timestamp,
+    outbound::OutboundError,
+    protocols::{CredentialMetadata, ProtocolError, ProtocolErrorCategory},
+    runtime::RuntimeFailure,
 };
 
 const MAX_SOURCE_BODY_BYTES: usize = 16 * 1024 * 1024 + 64 * 1024;
-const MAX_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_INVOKE_BODY_BYTES: usize = MAX_ARGUMENT_BYTES + 64 * 1024;
+const MAX_INVOKE_BODY_BYTES: usize = crate::invocation::MAX_ARGUMENT_BYTES + 64 * 1024;
+const MAX_EXECUTE_BODY_BYTES: usize = crate::runtime::MAX_SOURCE_BYTES + 64 * 1024;
+const DEFAULT_EXECUTION_TIMEOUT_MILLIS: u64 = 30_000;
+const MAX_EXECUTION_TIMEOUT_MILLIS: u64 = 300_000;
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -32,9 +40,172 @@ pub(super) fn router() -> Router<AppState> {
         .layer(DefaultBodyLimit::max(MAX_SOURCE_BODY_BYTES))
         .merge(
             Router::new()
+                .route("/api/v1/sources/{id}/refresh", post(refresh_source))
+                .route(
+                    "/api/v1/sources/{id}/credentials",
+                    get(get_credentials)
+                        .put(put_credentials)
+                        .delete(delete_credentials),
+                ),
+        )
+        .merge(
+            Router::new()
                 .route("/api/v1/gateway/tools/invoke", post(invoke))
                 .layer(DefaultBodyLimit::max(MAX_INVOKE_BODY_BYTES)),
         )
+        .merge(
+            Router::new()
+                .route("/api/v1/gateway/execute", post(execute))
+                .layer(DefaultBodyLimit::max(MAX_EXECUTE_BODY_BYTES)),
+        )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecuteRequest {
+    code: String,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteResponse {
+    execution_id: String,
+    result: Value,
+    emits: Vec<Value>,
+    console: Vec<crate::runtime::ConsoleEntry>,
+    calls: Vec<crate::runtime::ToolCallRecord>,
+}
+
+async fn execute(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    GatewayAuthentication(identity): GatewayAuthentication,
+    headers: HeaderMap,
+    payload: Result<Json<ExecuteRequest>, JsonRejection>,
+) -> Result<Json<ExecuteResponse>, ApiError> {
+    if headers.contains_key(IDEMPOTENCY_KEY_HEADER) {
+        return Err(ApiError::new(
+            &request_id,
+            StatusCode::BAD_REQUEST,
+            "idempotency_not_supported",
+            "Idempotency-Key is not supported for whole TypeScript executions yet.",
+        ));
+    }
+    let Json(payload) = match parse_json(&request_id, payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            state.tool_calls.record_rejected_request(
+                &request_id.0,
+                &identity.token_id,
+                RequestSurface::Gateway,
+                "executor.execute",
+                error.code,
+            );
+            return Err(error);
+        }
+    };
+    let timeout_ms = payload
+        .timeout_ms
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_MILLIS);
+    let output = state
+        .execution
+        .execute(ExecuteCodeRequest {
+            request_id: request_id.0.clone(),
+            actor: ToolActor::api_token(identity.token_id, Some(identity.token_name)),
+            surface: RequestSurface::Gateway,
+            code: payload.code,
+            timeout: std::time::Duration::from_millis(timeout_ms),
+        })
+        .await
+        .map_err(|error| execution_error(&request_id, error))?;
+    Ok(Json(ExecuteResponse {
+        execution_id: output.execution_id,
+        result: output.result,
+        emits: output.emits,
+        console: output.console,
+        calls: output.calls,
+    }))
+}
+
+fn execution_error(request_id: &RequestId, error: ExecutionServiceError) -> ApiError {
+    match error {
+        ExecutionServiceError::SourceTooLarge => ApiError::new(
+            request_id,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "source_too_large",
+            "TypeScript source exceeds 1 MiB.",
+        ),
+        ExecutionServiceError::InvalidTimeout => ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_timeout",
+            format!(
+                "Execution timeout must be between 1 and {MAX_EXECUTION_TIMEOUT_MILLIS} milliseconds."
+            ),
+        ),
+        ExecutionServiceError::ShuttingDown => ApiError::new(
+            request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_shutting_down",
+            "The TypeScript runtime is shutting down.",
+        ),
+        ExecutionServiceError::OwnerRevoked => {
+            ApiError::unauthorized(request_id, "The API token is no longer active.")
+        }
+        ExecutionServiceError::ActorFailed => {
+            tracing::error!(request_id = request_id.0, "runtime execution task failed");
+            ApiError::internal(request_id)
+        }
+        ExecutionServiceError::Runtime(failure) => runtime_error(request_id, failure),
+    }
+}
+
+fn runtime_error(request_id: &RequestId, failure: RuntimeFailure) -> ApiError {
+    let status = match failure.code.as_str() {
+        "source_too_large" | "result_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "runtime_busy" => StatusCode::TOO_MANY_REQUESTS,
+        "execution_timeout" => StatusCode::REQUEST_TIMEOUT,
+        "execution_cancelled" => StatusCode::CONFLICT,
+        "invalid_timeout"
+        | "typescript_invalid"
+        | "typescript_unsupported"
+        | "transformed_source_too_large"
+        | "execution_failed"
+        | "result_not_json"
+        | "argument_too_large"
+        | "tool_call_limit_exceeded"
+        | "tool_path_invalid" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let code: &'static str = match failure.code.as_str() {
+        "source_too_large" => "source_too_large",
+        "result_too_large" => "result_too_large",
+        "runtime_busy" => "runtime_busy",
+        "execution_timeout" => "execution_timeout",
+        "execution_cancelled" => "execution_cancelled",
+        "invalid_timeout" => "invalid_timeout",
+        "typescript_invalid" => "typescript_invalid",
+        "typescript_unsupported" => "typescript_unsupported",
+        "transformed_source_too_large" => "transformed_source_too_large",
+        "execution_failed" => "execution_failed",
+        "result_not_json" => "result_not_json",
+        "argument_too_large" => "argument_too_large",
+        "tool_call_limit_exceeded" => "tool_call_limit_exceeded",
+        "tool_path_invalid" => "tool_path_invalid",
+        _ => "runtime_failed",
+    };
+    let message = if failure.internal {
+        "The TypeScript execution could not be completed safely.".to_owned()
+    } else {
+        failure.message
+    };
+    let error = ApiError::new(request_id, status, code, message);
+    if code == "runtime_busy" {
+        error.with_retry_after(1)
+    } else {
+        error
+    }
 }
 
 #[derive(Deserialize)]
@@ -52,30 +223,107 @@ async fn create_source(
     payload: Result<Json<CreateSourceRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<crate::catalog::SourceRecord>), ApiError> {
     let Json(payload) = parse_json(&request_id, payload)?;
-    match payload.kind {
-        SourceKind::Openapi => {
-            let request =
-                serde_json::from_value(Value::Object(payload.protocol)).map_err(|_| {
-                    ApiError::new(
-                        &request_id,
-                        StatusCode::BAD_REQUEST,
-                        "invalid_json",
-                        "The request body must be valid JSON with the expected fields.",
-                    )
-                })?;
-            let source = openapi::create_source(&state, &request_id, admin_id, request).await?;
-            Ok((StatusCode::CREATED, Json(source)))
-        }
-        SourceKind::Graphql | SourceKind::McpHttp | SourceKind::McpStdio => Err(ApiError::new(
-            &request_id,
-            StatusCode::BAD_REQUEST,
-            "unsupported_source_kind",
-            "This source protocol is not supported yet.",
-        )),
-    }
+    let source = state
+        .sources
+        .create(
+            payload.kind,
+            Value::Object(payload.protocol),
+            AuditContext::admin(&request_id.0, admin_id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
+    Ok((StatusCode::CREATED, Json(source)))
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PutCredentialsRequest {
+    expected_revision: i64,
+    credential: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteCredentialsQuery {
+    expected_revision: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshSourceRequest {}
+
+async fn refresh_source(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    AdminMutation(admin_id): AdminMutation,
+    Path(source_id): Path<String>,
+    payload: Result<Json<RefreshSourceRequest>, JsonRejection>,
+) -> Result<Json<crate::catalog::CatalogSyncResult>, ApiError> {
+    let Json(_payload) = parse_json(&request_id, payload)?;
+    let refreshed = state
+        .sources
+        .refresh(&source_id, AuditContext::admin(&request_id.0, admin_id))
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
+    Ok(Json(refreshed))
+}
+
+async fn get_credentials(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    _admin: AdminAuthentication,
+    Path(source_id): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    let metadata = state
+        .sources
+        .credential_metadata(&source_id)
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
+    Ok(Json(metadata))
+}
+
+async fn put_credentials(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    AdminMutation(admin_id): AdminMutation,
+    Path(source_id): Path<String>,
+    payload: Result<Json<PutCredentialsRequest>, JsonRejection>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    let Json(payload) = parse_json(&request_id, payload)?;
+    let metadata = state
+        .sources
+        .replace_credentials(
+            &source_id,
+            payload.expected_revision,
+            payload.credential,
+            AuditContext::admin(&request_id.0, admin_id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
+    Ok(Json(metadata))
+}
+
+async fn delete_credentials(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<AppState>,
+    AdminMutation(admin_id): AdminMutation,
+    Path(source_id): Path<String>,
+    Query(query): Query<DeleteCredentialsQuery>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    let metadata = state
+        .sources
+        .clear_credentials(
+            &source_id,
+            query.expected_revision,
+            AuditContext::admin(&request_id.0, admin_id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
+    Ok(Json(metadata))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvokeRequest {
     path: String,
     #[serde(default = "empty_object")]
@@ -86,344 +334,272 @@ fn empty_object() -> Value {
     Value::Object(Map::new())
 }
 
+fn parse_idempotency_key(
+    request_id: &RequestId,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_idempotency_key(request_id));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| invalid_idempotency_key(request_id))?;
+    if !gateway_idempotency_key_is_valid(value) {
+        return Err(invalid_idempotency_key(request_id));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn invalid_idempotency_key(request_id: &RequestId) -> ApiError {
+    ApiError::new(
+        request_id,
+        StatusCode::BAD_REQUEST,
+        "invalid_idempotency_key",
+        "Idempotency-Key must contain between 1 and 255 visible ASCII bytes.",
+    )
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InvokeResponse {
-    ok: bool,
-    data: Option<Value>,
-    error: Option<InvokeError>,
-    http: InvokeHttp,
+struct ApprovalRequiredResponse {
+    status: &'static str,
+    approval: PendingApprovalResponse,
 }
 
 #[derive(Serialize)]
-struct InvokeError {
-    code: &'static str,
-    message: &'static str,
-}
-
-#[derive(Serialize)]
-struct InvokeHttp {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    truncated: bool,
-}
-
-pub(super) struct InvocationAdapterError {
-    pub code: &'static str,
-    pub message: &'static str,
+#[serde(rename_all = "camelCase")]
+struct PendingApprovalResponse {
+    id: String,
+    status: crate::approval::ApprovalStatus,
+    revision: i64,
+    path: String,
+    created_at: i64,
+    expires_at: i64,
+    status_url: String,
 }
 
 async fn invoke(
     Extension(request_id): Extension<RequestId>,
     State(state): State<AppState>,
     GatewayAuthentication(identity): GatewayAuthentication,
+    headers: HeaderMap,
     payload: Result<Json<InvokeRequest>, JsonRejection>,
-) -> Result<Json<InvokeResponse>, ApiError> {
-    let started = Instant::now();
+) -> Result<Response, ApiError> {
+    let idempotency_key = parse_idempotency_key(&request_id, &headers)?;
     let Json(payload) = match parse_json(&request_id, payload) {
         Ok(payload) => payload,
         Err(error) => {
-            record_invocation_attempt(
-                &state,
-                &request_id,
+            state.tool_calls.record_rejected_request(
+                &request_id.0,
                 &identity.token_id,
-                None,
-                None,
+                RequestSurface::Gateway,
                 "tools.invoke",
-                started,
-                RequestOutcome::Failed,
-                Some(error.code),
+                error.code,
             );
             return Err(error);
         }
     };
-    if serde_json::to_vec(&payload.arguments)
-        .is_ok_and(|encoded| encoded.len() > MAX_ARGUMENT_BYTES)
-    {
-        record_invocation_attempt(
-            &state,
-            &request_id,
-            &identity.token_id,
-            None,
-            None,
-            &payload.path,
-            started,
-            RequestOutcome::Failed,
-            Some("arguments_too_large"),
-        );
-        return Err(ApiError::new(
-            &request_id,
+    let call = ToolCall {
+        request_id: request_id.0.clone(),
+        actor: ToolActor::api_token(identity.token_id, Some(identity.token_name)),
+        surface: RequestSurface::Gateway,
+        execution_id: request_id.0.clone(),
+        call_id: "gateway".to_owned(),
+        worker_generation: 0,
+        path: payload.path,
+        arguments: payload.arguments,
+    };
+    if let Some(idempotency_key) = idempotency_key {
+        let response = state
+            .tool_calls
+            .submit_gateway_idempotent(call, &idempotency_key)
+            .await
+            .map_err(|error| gateway_invoke_error(&request_id, error))?;
+        return exact_gateway_response(&request_id, response);
+    }
+    let submission = state
+        .tool_calls
+        .submit(call)
+        .await
+        .map_err(|error| tool_call_error(&request_id, error))?;
+    match submission {
+        ToolCallSubmission::Completed(result) => Ok(Json(result).into_response()),
+        ToolCallSubmission::ApprovalRequired(approval) => Ok((
+            StatusCode::ACCEPTED,
+            Json(ApprovalRequiredResponse {
+                status: "approval_required",
+                approval: PendingApprovalResponse {
+                    status_url: format!("/api/v1/gateway/approvals/{}", approval.id),
+                    id: approval.id.clone(),
+                    status: approval.status,
+                    revision: approval.revision,
+                    path: approval.callable_path_snapshot.clone(),
+                    created_at: approval.created_at,
+                    expires_at: approval.expires_at,
+                },
+            }),
+        )
+            .into_response()),
+    }
+}
+
+fn exact_gateway_response(
+    request_id: &RequestId,
+    output: GatewayInvokeResponse,
+) -> Result<Response, ApiError> {
+    let mut response = Response::builder().status(output.response.status);
+    for (name, value) in output.response.headers {
+        let name = HeaderName::try_from(name).map_err(|_| ApiError::internal(request_id))?;
+        let value = HeaderValue::try_from(value).map_err(|_| ApiError::internal(request_id))?;
+        response = response.header(name, value);
+    }
+    if output.replayed {
+        response = response.header("idempotency-replayed", "true");
+    }
+    response
+        .body(Body::from(output.response.body))
+        .map_err(|_| ApiError::internal(request_id))
+}
+
+fn gateway_invoke_error(request_id: &RequestId, error: GatewayInvokeError) -> ApiError {
+    match error {
+        GatewayInvokeError::ToolCall(error) => tool_call_error(request_id, error),
+        GatewayInvokeError::InvalidKey => invalid_idempotency_key(request_id),
+        GatewayInvokeError::Capacity => ApiError::new(
+            request_id,
+            StatusCode::TOO_MANY_REQUESTS,
+            "idempotency_capacity",
+            "Gateway idempotency capacity has been reached. Retry later.",
+        )
+        .with_retry_after(1),
+        GatewayInvokeError::KeyMismatch => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "idempotency_key_mismatch",
+            "This Idempotency-Key was already used for a different invocation.",
+        ),
+        GatewayInvokeError::InProgress => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "idempotency_in_progress",
+            "The invocation for this Idempotency-Key is still in progress.",
+        )
+        .with_retry_after(1),
+        GatewayInvokeError::OutcomeUnknown => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "idempotency_outcome_unknown",
+            "The invocation may have reached the upstream service, so it will not be retried.",
+        ),
+        GatewayInvokeError::Idempotency(error) => ApiError::internal_logged(request_id, error),
+    }
+}
+
+pub(super) fn tool_call_error(request_id: &RequestId, error: ToolCallError) -> ApiError {
+    match error {
+        ToolCallError::Approval(error) => approval_error(request_id, error),
+        ToolCallError::Catalog(error) => catalog_error(request_id, error),
+        ToolCallError::Adapter { code, message } => {
+            ApiError::new(request_id, StatusCode::BAD_REQUEST, code, message)
+        }
+        ToolCallError::ArgumentsTooLarge => ApiError::new(
+            request_id,
             StatusCode::PAYLOAD_TOO_LARGE,
             "arguments_too_large",
             "Tool arguments exceed the allowed size.",
-        ));
-    }
-
-    let lease = match state.catalog.prepare_invocation(&payload.path).await {
-        Ok(lease) => lease,
-        Err(error) => {
-            record_invocation_attempt(
-                &state,
-                &request_id,
-                &identity.token_id,
-                None,
-                None,
-                &payload.path,
-                started,
-                if matches!(error, CatalogError::ToolDisabled { .. }) {
-                    RequestOutcome::Denied
-                } else {
-                    RequestOutcome::Failed
-                },
-                Some(catalog_log_code(&error)),
-            );
-            return Err(catalog_error(&request_id, error));
-        }
-    };
-    let plan = match dispatch(&lease, &payload.arguments) {
-        Ok(plan) => plan,
-        Err(error) => {
-            record_invocation(
-                &state,
-                &request_id,
-                &identity.token_id,
-                &lease.lookup,
-                started,
-                RequestOutcome::Failed,
-                Some(error.code),
-            );
-            return Err(ApiError::new(
-                &request_id,
-                StatusCode::BAD_REQUEST,
-                error.code,
-                error.message,
-            ));
-        }
-    };
-    if !lease.arguments_are_valid(&payload.arguments) {
-        record_invocation(
-            &state,
-            &request_id,
-            &identity.token_id,
-            &lease.lookup,
-            started,
-            RequestOutcome::Failed,
-            Some("invalid_tool_arguments"),
-        );
-        return Err(ApiError::new(
-            &request_id,
+        ),
+        ToolCallError::InvalidArguments => ApiError::new(
+            request_id,
             StatusCode::BAD_REQUEST,
             "invalid_tool_arguments",
             "The tool arguments do not match the imported input schema.",
-        ));
-    }
-    if lease.lookup.requires_approval {
-        let pending = PendingApproval {
-            revisions: lease.revisions.clone(),
-        };
-        record_invocation(
-            &state,
-            &request_id,
-            &identity.token_id,
-            &lease.lookup,
-            started,
-            RequestOutcome::PendingApproval,
-            Some("approval_required"),
-        );
-        return Err(pending.into_api_error(&request_id));
-    }
-
-    let response = match HardenedHttpClient::new(plan.policy)
-        .execute(plan.request)
-        .await
-    {
-        Ok(response) => {
-            let succeeded = response.status.is_success();
-            let data = response_data(&response.headers, &response.body);
-            record_invocation(
-                &state,
-                &request_id,
-                &identity.token_id,
-                &lease.lookup,
-                started,
-                if succeeded {
-                    RequestOutcome::Succeeded
-                } else {
-                    RequestOutcome::Failed
-                },
-                (!succeeded).then_some("upstream_http_error"),
-            );
-            InvokeResponse {
-                ok: succeeded,
-                data: succeeded.then_some(data),
-                error: (!succeeded).then_some(InvokeError {
-                    code: "upstream_http_error",
-                    message: "The upstream API returned an error response.",
-                }),
-                http: InvokeHttp {
-                    status: response.status.as_u16(),
-                    headers: safe_response_headers(&response.headers),
-                    truncated: false,
-                },
-            }
-        }
-        Err(error) => {
-            record_invocation(
-                &state,
-                &request_id,
-                &identity.token_id,
-                &lease.lookup,
-                started,
-                RequestOutcome::Failed,
-                Some(error.code()),
-            );
-            return Err(outbound_error(&request_id, error));
-        }
-    };
-    drop(lease);
-    Ok(Json(response))
-}
-
-fn dispatch(
-    lease: &InvocationLease,
-    arguments: &Value,
-) -> Result<openapi::OpenApiInvocationPlan, InvocationAdapterError> {
-    match &lease.binding {
-        ToolBinding::OpenapiV1(binding) => openapi::invocation_plan(
-            binding,
-            &lease.source_configuration,
-            lease.credential.as_ref(),
-            arguments,
+        ),
+        ToolCallError::Protocol(error) => protocol_error(request_id, error),
+        ToolCallError::Stale => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "invocation_stale",
+            "The tool changed before invocation. Retry with the current catalog.",
+        ),
+        ToolCallError::Outbound(error) => outbound_error(request_id, error),
+        ToolCallError::ResultTooLarge => ApiError::new(
+            request_id,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            "The upstream tool result exceeds the allowed size.",
         ),
     }
 }
 
-struct PendingApproval {
-    revisions: InvocationRevisionToken,
-}
-
-impl PendingApproval {
-    fn into_api_error(self, request_id: &RequestId) -> ApiError {
-        tracing::debug!(
-            request_id = %request_id.0,
-            source_id = %self.revisions.source_id,
-            tool_id = %self.revisions.tool_id,
-            source_revision = self.revisions.source_revision,
-            catalog_revision = self.revisions.catalog_revision,
-            tool_revision = self.revisions.tool_revision,
-            binding_revision = self.revisions.binding_revision,
-            credential_revision = self.revisions.credential_revision,
-            "invocation requires approval against a catalog revision token"
-        );
-        ApiError::new(
+pub(super) fn approval_error(request_id: &RequestId, error: ApprovalError) -> ApiError {
+    match error {
+        ApprovalError::NotFound => ApiError::new(
+            request_id,
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "The requested approval does not exist.",
+        ),
+        ApprovalError::Expired => ApiError::new(
+            request_id,
+            StatusCode::GONE,
+            "approval_expired",
+            "The approval has expired.",
+        ),
+        ApprovalError::RevisionConflict { .. } | ApprovalError::DecisionConflict => ApiError::new(
             request_id,
             StatusCode::CONFLICT,
-            "approval_required",
-            "This tool requires interactive approval before it can run.",
+            "revision_conflict",
+            "The approval changed. Refresh it and retry.",
+        ),
+        ApprovalError::InvalidTransition { .. } => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "approval_not_cancelable",
+            "The approval can no longer be canceled or changed.",
+        ),
+        ApprovalError::OwnerTokenInactive => ApiError::unauthorized(
+            request_id,
+            "The API token that created this approval is no longer active.",
+        ),
+        ApprovalError::Capacity { .. } => ApiError::new(
+            request_id,
+            StatusCode::TOO_MANY_REQUESTS,
+            "approval_capacity",
+            "Too many approvals are active. Resolve an existing approval and retry.",
         )
-    }
-}
-
-fn response_data(headers: &HeaderMap, body: &[u8]) -> Value {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if (content_type.contains("/json") || content_type.contains("+json"))
-        && let Ok(value) = serde_json::from_slice(body)
-    {
-        value
-    } else if let Ok(value) = std::str::from_utf8(body) {
-        Value::String(value.to_owned())
-    } else {
-        json!({ "encoding": "base64", "data": STANDARD.encode(body) })
-    }
-}
-
-fn safe_response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
-    [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::RETRY_AFTER,
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        headers
-            .get(&name)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| (name.as_str().to_owned(), value.to_owned()))
-    })
-    .collect()
-}
-
-fn record_invocation(
-    state: &AppState,
-    request_id: &RequestId,
-    token_id: &str,
-    lookup: &InvocationLookup,
-    started: Instant,
-    outcome: RequestOutcome,
-    error_code: Option<&str>,
-) {
-    record_invocation_attempt(
-        state,
-        request_id,
-        token_id,
-        Some(lookup.source_id.clone()),
-        Some(lookup.tool_id.clone()),
-        &lookup.callable_path,
-        started,
-        outcome,
-        error_code,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_invocation_attempt(
-    state: &AppState,
-    request_id: &RequestId,
-    token_id: &str,
-    source_id: Option<String>,
-    tool_id: Option<String>,
-    path: &str,
-    started: Instant,
-    outcome: RequestOutcome,
-    error_code: Option<&str>,
-) {
-    let mut path_snapshot = if path.starts_with("tools.") {
-        path.to_owned()
-    } else {
-        format!("tools.{path}")
-    };
-    if path_snapshot.len() > 512 || path_snapshot.contains('\0') {
-        path_snapshot = "tools.invoke".to_owned();
-    }
-    state.request_logs.try_record(NewRequestLog {
-        request_id: request_id.0.clone(),
-        actor_api_token_id: Some(token_id.to_owned()),
-        surface: RequestSurface::Gateway,
-        source_id,
-        tool_id,
-        path_snapshot: Some(path_snapshot),
-        outcome,
-        error_code: error_code.map(str::to_owned),
-        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        approval_id: None,
-        created_at: unix_timestamp(),
-    });
-}
-
-fn catalog_log_code(error: &CatalogError) -> &'static str {
-    match error {
-        CatalogError::Validation { code, .. } => code,
-        CatalogError::NotFound { entity: "source" } => "source_not_found",
-        CatalogError::NotFound { .. } | CatalogError::ToolNotFound { .. } => "tool_not_found",
-        CatalogError::ToolDisabled { .. } => "tool_disabled",
-        CatalogError::RevisionConflict { .. } => "revision_conflict",
-        CatalogError::Database(_)
-        | CatalogError::Crypto(_)
-        | CatalogError::Json(_)
-        | CatalogError::CorruptData(_) => "internal_error",
+        .with_retry_after(1),
+        ApprovalError::CorrelationConflict => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "duplicate_tool_call",
+            "The execution call conflicts with an existing approval.",
+        ),
+        ApprovalError::CorrelationRetired => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "approval_stale",
+            "The correlated approval is no longer retained.",
+        ),
+        ApprovalError::WorkerGenerationConflict => ApiError::new(
+            request_id,
+            StatusCode::CONFLICT,
+            "approval_stale",
+            "The approval belongs to an older execution generation.",
+        ),
+        ApprovalError::PayloadTooLarge { .. } => ApiError::new(
+            request_id,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "approval_payload_too_large",
+            "The approval payload exceeds the allowed size.",
+        ),
+        ApprovalError::Validation { code, message } => {
+            ApiError::new(request_id, StatusCode::BAD_REQUEST, code, message)
+        }
+        error => ApiError::internal_logged(request_id, error),
     }
 }
 
@@ -460,7 +636,35 @@ fn catalog_error(request_id: &RequestId, error: CatalogError) -> ApiError {
     }
 }
 
-fn outbound_error(request_id: &RequestId, error: OutboundError) -> ApiError {
+pub(super) fn protocol_error(request_id: &RequestId, error: ProtocolError) -> ApiError {
+    if error.category == ProtocolErrorCategory::Internal {
+        return ApiError::internal_logged(request_id, error);
+    }
+    let status = match error.category {
+        ProtocolErrorCategory::InvalidInput => match error.code {
+            "private_network_denied" | "forbidden_network_target" => StatusCode::FORBIDDEN,
+            "outbound_headers_too_large"
+            | "outbound_request_too_large"
+            | "upstream_headers_too_large"
+            | "upstream_response_too_large"
+            | "openapi_document_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            _ => StatusCode::BAD_REQUEST,
+        },
+        ProtocolErrorCategory::NotFound => StatusCode::NOT_FOUND,
+        ProtocolErrorCategory::Conflict | ProtocolErrorCategory::CorruptData => {
+            StatusCode::CONFLICT
+        }
+        ProtocolErrorCategory::Unsupported => StatusCode::BAD_REQUEST,
+        ProtocolErrorCategory::Upstream if error.code == "upstream_timeout" => {
+            StatusCode::GATEWAY_TIMEOUT
+        }
+        ProtocolErrorCategory::Upstream => StatusCode::BAD_GATEWAY,
+        ProtocolErrorCategory::Internal => unreachable!("internal protocol errors return above"),
+    };
+    ApiError::new(request_id, status, error.code, error.message)
+}
+
+pub(super) fn outbound_error(request_id: &RequestId, error: OutboundError) -> ApiError {
     let status = match error {
         OutboundError::PrivateAddress | OutboundError::ForbiddenAddress => StatusCode::FORBIDDEN,
         OutboundError::ResponseBodyTooLarge

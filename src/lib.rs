@@ -12,12 +12,20 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 use url::Url;
 
+pub mod actor;
 mod api;
+pub mod approval;
 pub mod catalog;
 pub mod crypto;
 mod database;
+pub mod execution;
+pub use approval::invocation;
 pub mod openapi;
 pub mod outbound;
+pub(crate) mod protocols;
+mod request_logs;
+pub mod runtime;
+mod tasks;
 pub mod web_assets;
 
 pub use database::DatabaseError;
@@ -32,6 +40,7 @@ pub struct AppConfig {
     pub(crate) origin: Url,
     pub(crate) session_ttl_seconds: i64,
     pub(crate) trusted_proxies: Arc<[IpNet]>,
+    pub(crate) runtime_executable: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -42,6 +51,7 @@ impl AppConfig {
             origin: Url::parse(DEFAULT_ORIGIN).expect("the default public origin is valid"),
             session_ttl_seconds: 8 * 60 * 60,
             trusted_proxies: Arc::from([]),
+            runtime_executable: None,
         }
     }
 
@@ -58,6 +68,11 @@ impl AppConfig {
 
     pub fn with_trusted_proxies(mut self, trusted_proxies: Vec<IpNet>) -> Self {
         self.trusted_proxies = Arc::from(trusted_proxies);
+        self
+    }
+
+    pub fn with_runtime_executable(mut self, executable: PathBuf) -> Self {
+        self.runtime_executable = Some(executable);
         self
     }
 
@@ -117,6 +132,9 @@ pub struct ExecutorApp {
     setup_token: Option<String>,
     pool: SqlitePool,
     catalog: catalog::CatalogStore,
+    tool_calls: invocation::ToolCallService,
+    execution: execution::ExecutionService,
+    api_tasks: tasks::TaskTracker,
 }
 
 impl ExecutorApp {
@@ -124,10 +142,31 @@ impl ExecutorApp {
         let opened = database::Database::open(&config).await?;
         let pool = opened.database.pool.clone();
         let catalog = catalog::CatalogStore::new(pool.clone(), opened.database.keyring.clone());
+        let sources = protocols::SourceService::new(catalog.clone());
+        let protocol_registry = sources.registry().clone();
+        let request_logs =
+            request_logs::RequestLogSink::new(opened.database.clone(), catalog.clone());
+        let tool_calls = invocation::ToolCallService::new(
+            catalog.clone(),
+            protocol_registry,
+            pool.clone(),
+            opened.database.keyring.clone(),
+            request_logs.clone(),
+        );
+        tool_calls.recover_startup().await?;
+        let api_tasks = tasks::TaskTracker::default();
+        let runtime =
+            runtime::RuntimeManager::new(config.runtime_executable.clone().unwrap_or_else(|| {
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("executor"))
+            }));
+        let execution = execution::ExecutionService::new(runtime, tool_calls.clone());
         let dummy_password_hash = crypto::hash_password("executor-dummy-login-password")?;
         let router = api::router(
             opened.database,
             catalog.clone(),
+            api::ApiServices::new(sources, tool_calls.clone(), execution.clone()),
+            request_logs,
+            api_tasks.clone(),
             &config,
             dummy_password_hash,
         );
@@ -136,6 +175,9 @@ impl ExecutorApp {
             setup_token: opened.setup_token,
             pool,
             catalog,
+            tool_calls,
+            execution,
+            api_tasks,
         })
     }
 
@@ -153,6 +195,29 @@ impl ExecutorApp {
 
     pub fn catalog(&self) -> &catalog::CatalogStore {
         &self.catalog
+    }
+
+    pub fn tool_calls(&self) -> &invocation::ToolCallService {
+        &self.tool_calls
+    }
+
+    pub fn executions(&self) -> &execution::ExecutionService {
+        &self.execution
+    }
+
+    pub async fn shutdown(self) {
+        self.execution.shutdown().await;
+        self.api_tasks.shutdown().await;
+        self.tool_calls.shutdown().await;
+        self.pool.close().await;
+    }
+}
+
+impl Drop for ExecutorApp {
+    fn drop(&mut self) {
+        self.execution.cancel_all();
+        self.api_tasks.abort_all();
+        self.tool_calls.abort_background_tasks();
     }
 }
 

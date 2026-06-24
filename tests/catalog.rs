@@ -241,15 +241,19 @@ async fn catalog_migration_is_strict_and_enforces_foreign_keys_and_constraints()
     .expect_err("closed source kind must reject unknown values");
     assert!(invalid_kind.as_database_error().is_some());
 
-    let reserved_slug = sqlx::query(
-        "INSERT INTO sources \
-         (id, kind, slug, display_name, configuration_json, created_at, updated_at) \
-         VALUES ('reserved', 'openapi', 'tools', 'Reserved', '{}', 1, 1)",
-    )
-    .execute(executor.app.pool())
-    .await
-    .expect_err("reserved source roots must be rejected by SQLite");
-    assert!(reserved_slug.as_database_error().is_some());
+    for reserved in ["tools", "search", "describe", "executor"] {
+        let reserved_slug = sqlx::query(
+            "INSERT INTO sources \
+             (id, kind, slug, display_name, configuration_json, created_at, updated_at) \
+             VALUES (?, 'openapi', ?, 'Reserved', '{}', 1, 1)",
+        )
+        .bind(format!("reserved-{reserved}"))
+        .bind(reserved)
+        .execute(executor.app.pool())
+        .await
+        .expect_err("reserved source roots must be rejected by SQLite");
+        assert!(reserved_slug.as_database_error().is_some());
+    }
 
     let source = executor.source("strict").await;
     let strict_error = sqlx::query("UPDATE sources SET display_name = ? WHERE id = ?")
@@ -275,10 +279,12 @@ async fn source_and_tool_names_are_collision_safe_and_order_independent() {
     let second = executor.source("Git-Hub").await;
     assert_eq!(first.slug, "git_hub");
     assert_eq!(second.slug, "git_hub_2");
-    for reserved in ["tools", "search", "describe", "executor"] {
+    for reserved in ["tools", "search", "describe", "sources", "executor"] {
         let source = executor.source(reserved).await;
         assert_eq!(source.slug, format!("{reserved}_2"));
     }
+    let graphql = executor.source("graphql").await;
+    assert_eq!(graphql.slug, "graphql");
 
     let updated = executor
         .app

@@ -100,8 +100,8 @@ display name and callable name. The full callable path is
 `tools.` because that is the proxy root. Local names are normalized and
 collision suffixes are allocated in stable-key order. Existing and tombstoned
 names stay reserved, which keeps paths stable when upstream discovery reorders,
-removes, or restores a tool. The source roots `tools`, `search`, `describe`, and
-`executor` are reserved for the sandbox and built-in catalog helpers.
+removes, or restores a tool. The source roots `tools`, `search`, `describe`,
+`sources`, and `executor` are reserved for the sandbox and built-in catalog helpers.
 
 A source may expose at most 100,000 active tools and retain at most 25,000
 tombstoned tool identities, for a hard 125,000-row history ceiling. Refreshes
@@ -150,13 +150,14 @@ invocation routes own authentication, limits, logging, and typed dispatch;
 OpenAPI owns only its preview, compiler, credential adapter, and invocation
 adapter.
 
-Invocation admission acquires a catalog read lease and reads tool presence,
-effective mode, source configuration, credential revision, and typed binding in
-one coherent SQLite snapshot. Policy-affecting writers take the matching write
-gate, so the admitted policy cannot change before or during outbound execution.
-Ask releases the lease without network work and retains a revision token. A
-future approval continuation must reacquire a fresh lease and revalidate every
-source, tool, binding, catalog, and credential revision before execution.
+Invocation admission first reads tool presence, effective mode, the input
+schema, typed-binding identity, and credential revision in one coherent SQLite
+snapshot without decrypting credentials. Arguments are validated before policy
+handling. Enabled calls reacquire a full catalog read lease, decrypt credentials
+only in the parent process, and retain the lease through outbound completion.
+Ask calls persist an encrypted approval and release the preflight lease without
+building an outbound request. Approval execution reacquires a fresh lease and
+revalidates every source, tool, binding, catalog, and credential revision.
 
 Administrator catalog reads require a session cookie. Catalog mutations also
 require the matching Origin, CSRF cookie, and CSRF header. Gateway discovery,
@@ -225,9 +226,84 @@ subset:
   styles fail during import instead of producing tools that cannot execute.
 
 Enabled tools execute immediately, disabled or removed tools cannot reach the
-transport, and Ask tools return the stable `approval_required` seam without
-executing. Request logs remain metadata-only and never contain arguments,
-credentials, upstream bodies, or results.
+transport, and Ask tools return HTTP 202 with an opaque approval ID, expiry,
+and owner-only status URL. Request logs remain metadata-only and never contain
+arguments, credentials, upstream bodies, or results.
+
+## Persistent approvals and tool invocation
+
+`ToolCallService` is the protocol-neutral parent-side invocation boundary used
+by the HTTP gateway and designed for the TypeScript runtime, CLI, and MCP host.
+A tool call carries its request, actor token, surface, execution, call, path,
+and argument snapshots. The sandbox can request a path and arguments, but it
+cannot select credentials, bindings, policy, actor identity, or approval state.
+
+Ask arguments, input schemas, internal invocation snapshots, and terminal
+results are encrypted with approval-ID-bound associated data. SQLite stores
+only metadata snapshots and revision columns in plaintext. Arguments and
+results never enter audit metadata or request logs. Administrator detail
+responses decrypt only a conservative schema-shaped redaction. Only the active
+API token that created an approval can poll or cancel it and retrieve its
+terminal result.
+
+The fixed approval TTL is ten minutes. The persisted state machine is:
+
+```text
+pending -> approved -> executing -> succeeded | failed | interrupted
+        -> denied | expired | canceled
+approved -> stale | canceled
+```
+
+Administrator decisions use cookie authentication plus Origin and CSRF checks.
+The decision is a SQLite compare-and-swap and its metadata-only audit event is
+committed in the same transaction. Repeating the same decision is idempotent;
+a conflicting decision or revision loses with a stable conflict. The gateway
+owner may cancel only pending or approved work. Executing work is never labeled
+canceled because bytes may already have reached the upstream service.
+Runtime cancellation and approval claims share an execution gate. If
+cancellation marks the continuation lost first, no later approval can claim
+network work. If the claim commits first, the server owns that already-executing
+side effect through truthful terminal completion.
+
+Every terminal transition also inserts a bounded, metadata-only request-log
+event into a transactional outbox. A single background drainer sends those
+events through the shared bounded log sink and acknowledges an outbox row only
+after SQLite confirms the request-log write. Stable event IDs make a crash
+between persistence and acknowledgement idempotent. Delivery retries never
+delay an approval decision or approved tool execution.
+
+Approval acceptance starts a detached server-owned task. That task reacquires
+the exact invocation revision, atomically verifies the original API token is
+still active, commits `executing`, then performs network work while holding the
+fresh catalog lease. No database transaction spans network activity. A source,
+tool, mode, binding, credential, or relevant catalog change makes the approval
+stale without dispatch. API token revocation and cancellation of its pending or
+approved work happen in one immediate transaction.
+
+On startup, only generation-zero direct pending approvals remain decidable and
+generation-zero approved calls are safely queued. Sandbox pending or approved
+approvals tied to a lost worker generation become canceled or stale. Any row
+left executing is marked interrupted and is never retried, because its external
+side effect may have completed before the process stopped.
+A persisted nondecreasing clock high-water mark prevents a backward wall-clock
+adjustment from reviving expired work. Active counts, aggregate ciphertext,
+individual payloads, and terminal history all have hard bounds. Terminal
+retention uses insertion order rather than wall-clock order.
+
+Caller correlation is scoped by typed actor, execution ID, and call ID. A
+nonterminal approval retains that correlation without expiry. On a terminal
+transition, its correlation receives a fixed 24-hour expiry. Identical retries
+during that window recover the original approval or its retained tombstone;
+identity mismatches fail with a conflict. After the full 24 hours, and only
+after any linked gateway idempotency response also expires, the same IDs may
+represent a new call. Cleanup runs before the bounded correlation-cap check and
+never removes active or unexpired entries.
+
+Approval APIs are:
+
+- `GET /api/v1/approvals` and `GET /api/v1/approvals/{id}`
+- `POST /api/v1/approvals/{id}/decision`
+- `GET` and `DELETE /api/v1/gateway/approvals/{id}`
 
 OAuth2 and OpenID Connect operations expose their declared flow metadata for a
 later OAuth setup UI. This slice accepts a manually supplied access token in

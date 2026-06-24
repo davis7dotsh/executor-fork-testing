@@ -3,7 +3,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
+};
+use tokio::task::JoinHandle;
 
 use crate::{
     catalog::{CatalogError, CatalogStore, NewRequestLog},
@@ -14,15 +18,18 @@ const DEFAULT_CAPACITY: usize = 1_024;
 const MAX_BATCH_SIZE: usize = 64;
 
 #[derive(Clone)]
-pub(super) struct GatewayRequestLogSink {
+pub(crate) struct RequestLogSink {
     sender: mpsc::Sender<QueuedRequestLog>,
     database: Database,
     telemetry: Arc<RequestLogTelemetry>,
+    consumer: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    shutdown: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 struct QueuedRequestLog {
     log: NewRequestLog,
     _database_guard: Database,
+    completion: Option<oneshot::Sender<bool>>,
 }
 
 #[derive(Default)]
@@ -40,8 +47,8 @@ enum DropReason {
     Closed,
 }
 
-impl GatewayRequestLogSink {
-    pub(super) fn new(database: Database, catalog: CatalogStore) -> Self {
+impl RequestLogSink {
+    pub(crate) fn new(database: Database, catalog: CatalogStore) -> Self {
         Self::with_capacity(database, catalog, DEFAULT_CAPACITY)
     }
 
@@ -52,19 +59,28 @@ impl GatewayRequestLogSink {
     ) -> Self {
         assert!(capacity > 0, "request-log sink capacity must be positive");
         let (sender, receiver) = mpsc::channel(capacity);
+        let (shutdown, shutdown_requested) = oneshot::channel();
         let telemetry = Arc::new(RequestLogTelemetry::default());
-        tokio::spawn(consume(receiver, catalog, telemetry.clone()));
+        let consumer = tokio::spawn(consume(
+            receiver,
+            catalog,
+            telemetry.clone(),
+            shutdown_requested,
+        ));
         Self {
             sender,
             database,
             telemetry,
+            consumer: Arc::new(std::sync::Mutex::new(Some(consumer))),
+            shutdown: Arc::new(std::sync::Mutex::new(Some(shutdown))),
         }
     }
 
-    pub(super) fn try_record(&self, log: NewRequestLog) -> bool {
+    pub(crate) fn try_record(&self, log: NewRequestLog) -> bool {
         let queued = QueuedRequestLog {
             log,
             _database_guard: self.database.clone(),
+            completion: None,
         };
         match self.sender.try_send(queued) {
             Ok(()) => true,
@@ -78,6 +94,49 @@ impl GatewayRequestLogSink {
                     .record_drop(DropReason::Closed, &queued.log.request_id);
                 false
             }
+        }
+    }
+
+    pub(crate) async fn record_durable(&self, log: NewRequestLog) -> bool {
+        let (completion, completed) = oneshot::channel();
+        let queued = QueuedRequestLog {
+            log,
+            _database_guard: self.database.clone(),
+            completion: Some(completion),
+        };
+        if self.sender.send(queued).await.is_err() {
+            return false;
+        }
+        completed.await.unwrap_or(false)
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(consumer) = self
+            .consumer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            consumer.abort();
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        if let Some(shutdown) = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = shutdown.send(());
+        }
+        let consumer = self
+            .consumer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(consumer) = consumer {
+            let _ = consumer.await;
         }
     }
 
@@ -148,9 +207,26 @@ async fn consume(
     mut receiver: mpsc::Receiver<QueuedRequestLog>,
     catalog: CatalogStore,
     telemetry: Arc<RequestLogTelemetry>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
-    while let Some(queued) = receiver.recv().await {
+    let mut draining = false;
+    loop {
+        let queued = if draining {
+            receiver.recv().await
+        } else {
+            tokio::select! {
+                queued = receiver.recv() => queued,
+                _ = &mut shutdown => {
+                    receiver.close();
+                    draining = true;
+                    receiver.recv().await
+                }
+            }
+        };
+        let Some(queued) = queued else {
+            break;
+        };
         batch.push(queued);
         while batch.len() < MAX_BATCH_SIZE {
             match receiver.try_recv() {
@@ -163,11 +239,25 @@ async fn consume(
             let QueuedRequestLog {
                 log,
                 _database_guard,
+                completion,
             } = queued;
             let request_id = log.request_id.clone();
-            match catalog.record_request(log).await {
-                Ok(()) => telemetry.record_write(),
-                Err(error) => telemetry.record_write_failure(&request_id, &error),
+            let succeeded = match catalog.record_request(log).await {
+                Ok(()) => {
+                    telemetry.record_write();
+                    true
+                }
+                Err(error) => {
+                    if catalog.request_log(&request_id).await.is_ok() {
+                        true
+                    } else {
+                        telemetry.record_write_failure(&request_id, &error);
+                        false
+                    }
+                }
+            };
+            if let Some(completion) = completion {
+                let _ = completion.send(succeeded);
             }
         }
     }
@@ -198,7 +288,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::{sync::mpsc, time::timeout};
 
-    use super::{GatewayRequestLogSink, RequestLogTelemetry};
+    use super::{RequestLogSink, RequestLogTelemetry};
     use crate::{
         AppConfig,
         catalog::{CatalogStore, NewRequestLog, RequestOutcome, RequestSurface},
@@ -236,10 +326,12 @@ mod tests {
         let (_directory, database, _catalog) = open_database().await;
         let (sender, _receiver) = mpsc::channel(1);
         let telemetry = Arc::new(RequestLogTelemetry::default());
-        let sink = GatewayRequestLogSink {
+        let sink = RequestLogSink {
             sender,
             database,
             telemetry,
+            consumer: Arc::new(std::sync::Mutex::new(None)),
+            shutdown: Arc::new(std::sync::Mutex::new(None)),
         };
 
         assert!(sink.try_record(request_log("queued")));
@@ -252,10 +344,10 @@ mod tests {
     #[tokio::test]
     async fn consumer_recovers_after_a_failed_record_and_preserves_metadata() {
         let (_directory, database, catalog) = open_database().await;
-        let sink = GatewayRequestLogSink::with_capacity(database, catalog.clone(), 2);
+        let sink = RequestLogSink::with_capacity(database, catalog.clone(), 2);
 
-        assert!(sink.try_record(request_log("")));
-        assert!(sink.try_record(request_log("recorded")));
+        assert!(!sink.record_durable(request_log("")).await);
+        assert!(sink.record_durable(request_log("recorded")).await);
 
         let stored = timeout(Duration::from_secs(2), async {
             loop {
