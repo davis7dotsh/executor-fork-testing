@@ -196,6 +196,13 @@ async fn application_state_exists(pool: &SqlitePool) -> Result<bool, DatabaseErr
          OR EXISTS(SELECT 1 FROM admins) \
          OR EXISTS(SELECT 1 FROM admin_sessions) \
          OR EXISTS(SELECT 1 FROM api_tokens) \
+         OR EXISTS(SELECT 1 FROM sources) \
+         OR EXISTS(SELECT 1 FROM source_credentials) \
+         OR EXISTS(SELECT 1 FROM source_artifacts) \
+         OR EXISTS(SELECT 1 FROM tools) \
+         OR EXISTS(SELECT 1 FROM request_logs) \
+         OR EXISTS(SELECT 1 FROM audit_events) \
+         OR EXISTS(SELECT 1 FROM catalog_state WHERE id = 1 AND revision <> 0) \
          OR EXISTS(SELECT 1 FROM instance_metadata WHERE key <> ?)",
     )
     .bind(SENTINEL_KEY)

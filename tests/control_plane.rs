@@ -6,7 +6,10 @@ use axum::{
     extract::ConnectInfo,
     http::{Method, Request, Response, StatusCode, header},
 };
-use executor::{AppConfig, DatabaseError, ExecutorApp};
+use executor::{
+    AppConfig, DatabaseError, ExecutorApp,
+    catalog::{RequestOutcome, RequestSurface},
+};
 use http_body_util::BodyExt;
 use ipnet::IpNet;
 use serde_json::{Value, json};
@@ -925,12 +928,20 @@ async fn api_tokens_are_revealed_once_revocable_and_gateway_only() {
     assert_eq!(gateway.status(), StatusCode::OK);
     let gateway_body = response_json(gateway).await;
     assert_eq!(gateway_body["tokenId"], token_id);
-    let last_used =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT last_used_at FROM api_tokens WHERE id = ?")
-            .bind(&token_id)
-            .fetch_one(executor.app.pool())
-            .await
-            .expect("last-used timestamp should be readable");
+    let mut last_used = None;
+    for _ in 0..100 {
+        last_used = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT last_used_at FROM api_tokens WHERE id = ?",
+        )
+        .bind(&token_id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("last-used timestamp should be readable");
+        if last_used.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(last_used.is_some());
 
     let bearer_on_control_plane = send_empty(
@@ -971,6 +982,211 @@ async fn api_tokens_are_revealed_once_revocable_and_gateway_only() {
 }
 
 #[tokio::test]
+async fn gateway_request_logging_does_not_wait_for_the_sqlite_writer() {
+    let executor = TestExecutor::new().await;
+    executor.setup_admin().await;
+    let admin = executor.login().await;
+    let created = create_token_request(&executor, &admin, Some(ORIGIN), Some(&admin.csrf)).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_body = response_json(created).await;
+    let token = created_body["token"]
+        .as_str()
+        .expect("create should reveal the token")
+        .to_owned();
+    let token_id = created_body["id"]
+        .as_str()
+        .expect("create should return the token ID")
+        .to_owned();
+
+    let mut writer = executor
+        .app
+        .pool()
+        .acquire()
+        .await
+        .expect("test writer connection should be acquired");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .expect("test writer should hold the SQLite write lock");
+
+    let authorization = format!("Bearer {token}");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        send_json(
+            executor.router(),
+            Method::POST,
+            "/api/v1/gateway/tools/search",
+            json!({ "query": "nothing" }),
+            &[(header::AUTHORIZATION.as_str(), &authorization)],
+        ),
+    )
+    .await
+    .expect("gateway reads must return without waiting for request-log persistence");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .expect("gateway response should have a request ID")
+        .to_str()
+        .expect("request ID should be text")
+        .to_owned();
+
+    sqlx::query("COMMIT")
+        .execute(&mut *writer)
+        .await
+        .expect("test writer should release the SQLite write lock");
+    drop(writer);
+
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(stored) = executor.app.catalog().request_log(&request_id).await {
+                break stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued request log should persist after writer contention clears");
+    assert_eq!(
+        stored.actor_api_token_id.as_deref(),
+        Some(token_id.as_str())
+    );
+    assert_eq!(stored.surface, RequestSurface::Gateway);
+    assert_eq!(stored.path_snapshot.as_deref(), Some("tools.search"));
+    assert_eq!(stored.outcome, RequestOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn token_last_used_retries_after_write_slot_contention() {
+    let executor = TestExecutor::new().await;
+    executor.setup_admin().await;
+    let admin = executor.login().await;
+
+    let first_created =
+        create_token_request(&executor, &admin, Some(ORIGIN), Some(&admin.csrf)).await;
+    assert_eq!(first_created.status(), StatusCode::CREATED);
+    let first_body = response_json(first_created).await;
+    let first_token = first_body["token"]
+        .as_str()
+        .expect("first token should be revealed")
+        .to_owned();
+    let first_token_id = first_body["id"]
+        .as_str()
+        .expect("first token ID should be returned")
+        .to_owned();
+
+    let second_created =
+        create_token_request(&executor, &admin, Some(ORIGIN), Some(&admin.csrf)).await;
+    assert_eq!(second_created.status(), StatusCode::CREATED);
+    let second_body = response_json(second_created).await;
+    let second_token = second_body["token"]
+        .as_str()
+        .expect("second token should be revealed")
+        .to_owned();
+    let second_token_id = second_body["id"]
+        .as_str()
+        .expect("second token ID should be returned")
+        .to_owned();
+
+    let mut writer = executor
+        .app
+        .pool()
+        .acquire()
+        .await
+        .expect("test writer connection should be acquired");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .expect("test writer should hold the SQLite write lock");
+
+    let first_gateway = send_empty(
+        executor.router(),
+        Method::GET,
+        "/api/v1/gateway/whoami",
+        &[(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {first_token}"),
+        )],
+    )
+    .await;
+    assert_eq!(first_gateway.status(), StatusCode::OK);
+
+    let mut telemetry_writer_started = false;
+    for _ in 0..100 {
+        let checked_out_connections =
+            executor.app.pool().size() as usize - executor.app.pool().num_idle();
+        if checked_out_connections >= 2 {
+            telemetry_writer_started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(telemetry_writer_started);
+
+    let contended_gateway = send_empty(
+        executor.router(),
+        Method::GET,
+        "/api/v1/gateway/whoami",
+        &[(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {second_token}"),
+        )],
+    )
+    .await;
+    assert_eq!(contended_gateway.status(), StatusCode::OK);
+
+    sqlx::query("COMMIT")
+        .execute(&mut *writer)
+        .await
+        .expect("test writer should release the SQLite write lock");
+    drop(writer);
+
+    let mut first_last_used = None;
+    for _ in 0..100 {
+        first_last_used = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT last_used_at FROM api_tokens WHERE id = ?",
+        )
+        .bind(&first_token_id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("first token last-used timestamp should be readable");
+        if first_last_used.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(first_last_used.is_some());
+
+    let retry_gateway = send_empty(
+        executor.router(),
+        Method::GET,
+        "/api/v1/gateway/whoami",
+        &[(
+            header::AUTHORIZATION.as_str(),
+            &format!("Bearer {second_token}"),
+        )],
+    )
+    .await;
+    assert_eq!(retry_gateway.status(), StatusCode::OK);
+
+    let mut second_last_used = None;
+    for _ in 0..100 {
+        second_last_used = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT last_used_at FROM api_tokens WHERE id = ?",
+        )
+        .bind(&second_token_id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("second token last-used timestamp should be readable");
+        if second_last_used.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(second_last_used.is_some());
+}
+
+#[tokio::test]
 async fn token_names_are_counted_by_characters_and_stored_trimmed() {
     let executor = TestExecutor::new().await;
     executor.setup_admin().await;
@@ -1001,6 +1217,14 @@ async fn health_bootstrap_and_errors_have_stable_shapes() {
     assert!(health.headers().contains_key("x-request-id"));
     assert_eq!(response_json(health).await, json!({ "status": "ok" }));
 
+    let health_method_mismatch = send_empty(executor.router(), Method::POST, "/healthz", &[]).await;
+    assert_error(
+        health_method_mismatch,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+
     let before = send_empty(executor.router(), Method::GET, "/api/v1/bootstrap", &[]).await;
     assert_eq!(
         response_json(before).await,
@@ -1023,6 +1247,41 @@ async fn health_bootstrap_and_errors_have_stable_shapes() {
 
     let missing = send_empty(executor.router(), Method::GET, "/missing", &[]).await;
     assert_error(missing, StatusCode::NOT_FOUND, "not_found").await;
+}
+
+#[tokio::test]
+async fn catalog_route_rejections_have_stable_error_envelopes() {
+    let executor = TestExecutor::new().await;
+
+    let method_mismatch = send_empty(executor.router(), Method::POST, "/api/v1/tools", &[]).await;
+    assert_error(
+        method_mismatch,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+
+    executor.setup_admin().await;
+    let admin = executor.login().await;
+    let headers = [(header::COOKIE.as_str(), admin.cookie.as_str())];
+
+    let invalid_query = send_empty(
+        executor.router(),
+        Method::GET,
+        "/api/v1/tools?limit=not-a-number",
+        &headers,
+    )
+    .await;
+    assert_error(invalid_query, StatusCode::BAD_REQUEST, "invalid_query").await;
+
+    let invalid_path = send_empty(
+        executor.router(),
+        Method::GET,
+        "/api/v1/tools/%FF",
+        &headers,
+    )
+    .await;
+    assert_error(invalid_path, StatusCode::BAD_REQUEST, "invalid_path").await;
 }
 
 async fn create_token_request(

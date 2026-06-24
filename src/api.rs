@@ -21,16 +21,23 @@ use uuid::Uuid;
 
 use crate::{
     AppConfig,
+    catalog::CatalogStore,
     crypto::{generate_secret, hash_password, verify_password},
     database::{Database, SETUP_TOKEN_TTL_SECONDS},
     unix_timestamp,
 };
+
+mod catalog;
+mod request_logs;
+
+use request_logs::GatewayRequestLogSink;
 
 const SESSION_COOKIE: &str = "executor_session";
 const CSRF_COOKIE: &str = "executor_csrf";
 const CSRF_HEADER: &str = "x-executor-csrf";
 const MAX_API_BODY_BYTES: usize = 16 * 1024;
 const PASSWORD_HASH_CONCURRENCY: usize = 2;
+const GATEWAY_SEARCH_CONCURRENCY: usize = 1;
 const MAX_USERNAME_CHARACTERS: usize = 64;
 const MAX_USERNAME_BYTES: usize = 256;
 const MIN_PASSWORD_CHARACTERS: usize = 12;
@@ -44,16 +51,23 @@ const MAX_LOGIN_RATE_LIMIT_CLIENTS: usize = 4096;
 const MAX_FORWARDED_FOR_HOPS: usize = 64;
 const MAX_FORWARDED_FOR_BYTES: usize = 4 * 1024;
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
+const TOKEN_LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 60;
+const TOKEN_LAST_USED_WRITE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_TOKEN_LAST_USED_ATTEMPTS: usize = 4096;
 
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    catalog: CatalogStore,
+    request_logs: GatewayRequestLogSink,
     origin: Arc<str>,
     session_ttl_seconds: i64,
     secure_cookies: bool,
     password_hash_slots: Arc<Semaphore>,
+    gateway_search_slots: Arc<Semaphore>,
     dummy_password_hash: Arc<str>,
     login_rate_limiter: Arc<LoginRateLimiter>,
+    token_last_used_tracker: Arc<TokenLastUsedTracker>,
     trusted_proxies: Arc<[IpNet]>,
 }
 
@@ -69,6 +83,11 @@ enum LoginClientKey {
 
 struct LoginRateLimiter {
     attempts: Mutex<HashMap<LoginClientKey, VecDeque<Instant>>>,
+}
+
+struct TokenLastUsedTracker {
+    attempts: Mutex<HashMap<String, Instant>>,
+    write_slot: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -236,6 +255,79 @@ impl LoginRateLimiter {
     }
 }
 
+impl TokenLastUsedTracker {
+    fn new() -> Self {
+        Self {
+            attempts: Mutex::new(HashMap::new()),
+            write_slot: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn schedule(
+        self: &Arc<Self>,
+        database: Database,
+        token_id: String,
+        used_at: i64,
+        request_id: String,
+    ) {
+        let attempted_at = Instant::now();
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        attempts.retain(|_, previous_attempt| {
+            attempted_at.saturating_duration_since(*previous_attempt)
+                < TOKEN_LAST_USED_WRITE_INTERVAL
+        });
+        if attempts.contains_key(&token_id) {
+            return;
+        }
+        let Ok(permit) = self.write_slot.clone().try_acquire_owned() else {
+            return;
+        };
+        if attempts.len() >= MAX_TOKEN_LAST_USED_ATTEMPTS
+            && let Some(oldest) = attempts
+                .iter()
+                .min_by_key(|(_, attempted_at)| *attempted_at)
+                .map(|(token_id, _)| token_id.clone())
+        {
+            attempts.remove(&oldest);
+        }
+        attempts.insert(token_id.clone(), attempted_at);
+        drop(attempts);
+
+        let tracker = Arc::clone(self);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let database_guard = database;
+            let result = sqlx::query(
+                "UPDATE api_tokens SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL \
+                 AND (last_used_at IS NULL OR last_used_at <= ?)",
+            )
+            .bind(used_at)
+            .bind(&token_id)
+            .bind(used_at - TOKEN_LAST_USED_WRITE_INTERVAL_SECONDS)
+            .execute(&database_guard.pool)
+            .await;
+            if let Err(error) = result {
+                tracker.clear_failed_attempt(&token_id, attempted_at);
+                tracing::warn!(request_id, error = %error, "API token last-used update failed");
+            }
+            drop(database_guard);
+        });
+    }
+
+    fn clear_failed_attempt(&self, token_id: &str, attempted_at: Instant) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attempts.get(token_id) == Some(&attempted_at) {
+            attempts.remove(token_id);
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -306,7 +398,13 @@ struct GatewayIdentityResponse {
     token_name: String,
 }
 
+struct GatewayIdentity {
+    token_id: String,
+    token_name: String,
+}
+
 struct AdminSession {
+    id: i64,
     username: String,
     session_digest: Vec<u8>,
     csrf_digest: Vec<u8>,
@@ -314,17 +412,23 @@ struct AdminSession {
 
 pub(crate) fn router(
     database: Database,
+    catalog: CatalogStore,
     config: &AppConfig,
     dummy_password_hash: String,
 ) -> Router {
+    let request_logs = GatewayRequestLogSink::new(database.clone(), catalog.clone());
     let state = AppState {
         database,
+        catalog,
+        request_logs,
         origin: Arc::from(config.public_origin()),
         session_ttl_seconds: config.session_ttl_seconds,
         secure_cookies: config.origin.scheme() == "https",
         password_hash_slots: Arc::new(Semaphore::new(PASSWORD_HASH_CONCURRENCY)),
+        gateway_search_slots: Arc::new(Semaphore::new(GATEWAY_SEARCH_CONCURRENCY)),
         dummy_password_hash: Arc::from(dummy_password_hash),
         login_rate_limiter: Arc::new(LoginRateLimiter::new()),
+        token_last_used_tracker: Arc::new(TokenLastUsedTracker::new()),
         trusted_proxies: config.trusted_proxies.clone(),
     };
     let middleware_state = state.clone();
@@ -337,7 +441,9 @@ pub(crate) fn router(
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/tokens/{id}", delete(revoke_token))
         .route("/api/v1/gateway/whoami", get(gateway_whoami))
+        .merge(catalog::router())
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -833,26 +939,47 @@ async fn gateway_whoami(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<GatewayIdentityResponse>, ApiError> {
-    let token = bearer_token(&headers).ok_or_else(|| {
-        ApiError::unauthorized(&request_id, "A valid Executor API token is required.")
+    let identity = require_gateway_token(&request_id, &state, &headers).await?;
+    Ok(Json(GatewayIdentityResponse {
+        token_id: identity.token_id,
+        token_name: identity.token_name,
+    }))
+}
+
+async fn require_gateway_token(
+    request_id: &RequestId,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<GatewayIdentity, ApiError> {
+    let token = bearer_token(headers).ok_or_else(|| {
+        ApiError::unauthorized(request_id, "A valid Executor API token is required.")
     })?;
     let digest = state.database.keyring.digest("api-token", token.as_bytes());
-    let identity = sqlx::query_as::<_, (String, String)>(
-        "UPDATE api_tokens SET last_used_at = ? \
-         WHERE token_digest = ? AND revoked_at IS NULL RETURNING id, name",
+    let identity = sqlx::query_as::<_, (String, String, Option<i64>)>(
+        "SELECT id, name, last_used_at FROM api_tokens \
+         WHERE token_digest = ? AND revoked_at IS NULL",
     )
-    .bind(unix_timestamp())
     .bind(digest.to_vec())
     .fetch_optional(&state.database.pool)
     .await
-    .map_err(|error| ApiError::internal_logged(&request_id, error))?
-    .ok_or_else(|| {
-        ApiError::unauthorized(&request_id, "A valid Executor API token is required.")
-    })?;
-    Ok(Json(GatewayIdentityResponse {
+    .map_err(|error| ApiError::internal_logged(request_id, error))?
+    .ok_or_else(|| ApiError::unauthorized(request_id, "A valid Executor API token is required."))?;
+    let now = unix_timestamp();
+    if identity
+        .2
+        .is_none_or(|last_used_at| last_used_at <= now - TOKEN_LAST_USED_WRITE_INTERVAL_SECONDS)
+    {
+        state.token_last_used_tracker.schedule(
+            state.database.clone(),
+            identity.0.clone(),
+            now,
+            request_id.0.clone(),
+        );
+    }
+    Ok(GatewayIdentity {
         token_id: identity.0,
         token_name: identity.1,
-    }))
+    })
 }
 
 async fn not_found(Extension(request_id): Extension<RequestId>) -> ApiError {
@@ -861,6 +988,15 @@ async fn not_found(Extension(request_id): Extension<RequestId>) -> ApiError {
         StatusCode::NOT_FOUND,
         "not_found",
         "The requested resource does not exist.",
+    )
+}
+
+async fn method_not_allowed(Extension(request_id): Extension<RequestId>) -> ApiError {
+    ApiError::new(
+        &request_id,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "The request method is not allowed for this resource.",
     )
 }
 
@@ -981,8 +1117,8 @@ async fn optional_admin_session(
         .database
         .keyring
         .digest("admin-session", token.as_bytes());
-    sqlx::query_as::<_, (String, Vec<u8>, Vec<u8>)>(
-        "SELECT admins.username, admin_sessions.session_digest, admin_sessions.csrf_digest \
+    sqlx::query_as::<_, (i64, String, Vec<u8>, Vec<u8>)>(
+        "SELECT admins.id, admins.username, admin_sessions.session_digest, admin_sessions.csrf_digest \
          FROM admin_sessions JOIN admins ON admins.id = admin_sessions.admin_id \
          WHERE admin_sessions.session_digest = ? AND admin_sessions.expires_at > ?",
     )
@@ -991,7 +1127,8 @@ async fn optional_admin_session(
     .fetch_optional(&state.database.pool)
     .await
     .map(|row| {
-        row.map(|(username, session_digest, csrf_digest)| AdminSession {
+        row.map(|(id, username, session_digest, csrf_digest)| AdminSession {
+            id,
             username,
             session_digest,
             csrf_digest,
@@ -1087,4 +1224,178 @@ fn csrf_cookie(state: &AppState, token: &str) -> String {
 
 fn clear_cookie(name: &str) -> String {
     format!("{name}=; Path=/; SameSite=Lax; Max-Age=0")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use tempfile::TempDir;
+    use tokio::time::timeout;
+
+    use super::TokenLastUsedTracker;
+    use crate::{
+        AppConfig,
+        database::{Database, DatabaseError, OpenedDatabase},
+    };
+
+    async fn open_database() -> (TempDir, AppConfig, Database) {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let config = AppConfig::new(directory.path().into());
+        let OpenedDatabase { database, .. } =
+            Database::open(&config).await.expect("test database opens");
+        (directory, config, database)
+    }
+
+    async fn insert_token(database: &Database, token_id: &str) {
+        sqlx::query(
+            "INSERT INTO api_tokens \
+             (id, name, token_digest, token_prefix, token_suffix, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(token_id)
+        .bind(token_id)
+        .bind(format!("digest-{token_id}").into_bytes())
+        .bind("exr_test")
+        .bind("test")
+        .bind(1_i64)
+        .execute(&database.pool)
+        .await
+        .expect("test API token is inserted");
+    }
+
+    async fn wait_for_token_write(tracker: &Arc<TokenLastUsedTracker>) {
+        let permit = timeout(
+            Duration::from_secs(2),
+            tracker.write_slot.clone().acquire_owned(),
+        )
+        .await
+        .expect("token last-used write completes")
+        .expect("token last-used write semaphore remains open");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn failed_token_last_used_write_clears_only_its_matching_attempt_and_retries() {
+        let (_directory, _config, database) = open_database().await;
+        insert_token(&database, "retry-token").await;
+        sqlx::query(
+            "CREATE TRIGGER reject_token_last_used \
+             BEFORE UPDATE OF last_used_at ON api_tokens \
+             BEGIN SELECT RAISE(FAIL, 'forced token last-used failure'); END",
+        )
+        .execute(&database.pool)
+        .await
+        .expect("failure trigger is installed");
+
+        let tracker = Arc::new(TokenLastUsedTracker::new());
+        let unrelated_attempt = Instant::now();
+        tracker
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("unrelated-token".to_owned(), unrelated_attempt);
+
+        let replaced_attempt = Instant::now();
+        let replacement_attempt = replaced_attempt + Duration::from_secs(1);
+        tracker
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("replacement-token".to_owned(), replacement_attempt);
+        tracker.clear_failed_attempt("replacement-token", replaced_attempt);
+
+        tracker.schedule(
+            database.clone(),
+            "retry-token".to_owned(),
+            1_750_000_000,
+            "failed-request".to_owned(),
+        );
+        wait_for_token_write(&tracker).await;
+
+        {
+            let attempts = tracker
+                .attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!attempts.contains_key("retry-token"));
+            assert_eq!(attempts.get("unrelated-token"), Some(&unrelated_attempt));
+            assert_eq!(
+                attempts.get("replacement-token"),
+                Some(&replacement_attempt)
+            );
+        }
+
+        sqlx::query("DROP TRIGGER reject_token_last_used")
+            .execute(&database.pool)
+            .await
+            .expect("failure trigger is removed");
+        tracker.schedule(
+            database.clone(),
+            "retry-token".to_owned(),
+            1_750_000_001,
+            "retry-request".to_owned(),
+        );
+        wait_for_token_write(&tracker).await;
+
+        let last_used = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT last_used_at FROM api_tokens WHERE id = 'retry-token'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .expect("last-used timestamp is readable");
+        assert_eq!(last_used, Some(1_750_000_001));
+    }
+
+    #[tokio::test]
+    async fn token_last_used_background_write_retains_the_instance_lock() {
+        let (_directory, config, database) = open_database().await;
+        insert_token(&database, "guarded-token").await;
+        let mut writer = database
+            .pool
+            .acquire()
+            .await
+            .expect("test writer connection is acquired");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("test writer holds the SQLite write lock");
+
+        let tracker = Arc::new(TokenLastUsedTracker::new());
+        tracker.schedule(
+            database.clone(),
+            "guarded-token".to_owned(),
+            1_750_000_000,
+            "guarded-request".to_owned(),
+        );
+        drop(database);
+
+        let second_open = Database::open(&config).await;
+        assert!(matches!(second_open, Err(DatabaseError::AlreadyRunning(_))));
+
+        sqlx::query("COMMIT")
+            .execute(&mut *writer)
+            .await
+            .expect("test writer releases the SQLite write lock");
+        drop(writer);
+        wait_for_token_write(&tracker).await;
+
+        let reopened = timeout(Duration::from_secs(2), async {
+            loop {
+                match Database::open(&config).await {
+                    Ok(opened) => break opened.database,
+                    Err(DatabaseError::AlreadyRunning(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("database should reopen after the write: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("background write releases its instance-lock guard");
+        reopened.pool.close().await;
+    }
 }

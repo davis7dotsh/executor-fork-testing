@@ -13,6 +13,7 @@ use thiserror::Error;
 use url::Url;
 
 mod api;
+pub mod catalog;
 pub mod crypto;
 mod database;
 pub mod web_assets;
@@ -113,18 +114,26 @@ pub struct ExecutorApp {
     router: Router,
     setup_token: Option<String>,
     pool: SqlitePool,
+    catalog: catalog::CatalogStore,
 }
 
 impl ExecutorApp {
     pub async fn open(config: AppConfig) -> Result<Self, DatabaseError> {
         let opened = database::Database::open(&config).await?;
         let pool = opened.database.pool.clone();
+        let catalog = catalog::CatalogStore::new(pool.clone(), opened.database.keyring.clone());
         let dummy_password_hash = crypto::hash_password("executor-dummy-login-password")?;
-        let router = api::router(opened.database, &config, dummy_password_hash);
+        let router = api::router(
+            opened.database,
+            catalog.clone(),
+            &config,
+            dummy_password_hash,
+        );
         Ok(Self {
             router,
             setup_token: opened.setup_token,
             pool,
+            catalog,
         })
     }
 
@@ -138,6 +147,10 @@ impl ExecutorApp {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub fn catalog(&self) -> &catalog::CatalogStore {
+        &self.catalog
     }
 }
 
