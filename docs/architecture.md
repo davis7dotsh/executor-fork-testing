@@ -132,12 +132,31 @@ caller with an old path from bypassing the catalog. Ask tools remain
 discoverable and carry approval-required metadata.
 
 Protocol discovery and schema normalization happen before a catalog write.
-The staged snapshot records the source and credential revisions it used. The
-commit rechecks both revisions, serializes catalog writers, replaces source
+Initial creation uses a create-only staged snapshot with no meaningless CAS
+fields. Refresh snapshots record the source and credential revisions they used.
+The commit rechecks both revisions, serializes catalog writers, replaces source
 artifacts, upserts tools by `(source_id, stable_key)`, tombstones missing tools,
-and advances the source and global catalog revisions in one transaction. A
-failed stage or stale revision leaves the last known good catalog untouched.
-Network work never occurs inside this transaction.
+and advances the source and global catalog revisions in one transaction. Create
+and refresh share the same transaction-scoped artifact, tool, binding, and
+search-index application helpers. A failed stage or stale revision leaves the
+last known good catalog untouched. Network work never occurs inside this
+transaction.
+
+Tool bindings use a closed Rust enum and a generic persisted wire vocabulary:
+protocol, positive binding version, and private JSON definition. SQLite reserves
+the supported source protocol names, while Rust rejects protocol/version pairs
+that have no implemented typed variant. Generic source creation and gateway
+invocation routes own authentication, limits, logging, and typed dispatch;
+OpenAPI owns only its preview, compiler, credential adapter, and invocation
+adapter.
+
+Invocation admission acquires a catalog read lease and reads tool presence,
+effective mode, source configuration, credential revision, and typed binding in
+one coherent SQLite snapshot. Policy-affecting writers take the matching write
+gate, so the admitted policy cannot change before or during outbound execution.
+Ask releases the lease without network work and retains a revision token. A
+future approval continuation must reacquire a fresh lease and revalidate every
+source, tool, binding, catalog, and credential revision before execution.
 
 Administrator catalog reads require a session cookie. Catalog mutations also
 require the matching Origin, CSRF cookie, and CSRF header. Gateway discovery,
@@ -153,6 +172,10 @@ are:
 - `POST /api/v1/gateway/tools/search`
 - `POST /api/v1/gateway/tools/describe`
 - `POST /api/v1/gateway/tools/lookup`
+- `POST /api/v1/sources/openapi/preview`
+- `POST /api/v1/sources` and `POST /api/v1/sources/{id}/refresh`
+- `GET`, `PUT`, and `DELETE /api/v1/sources/{id}/credentials`
+- `POST /api/v1/gateway/tools/invoke`
 
 Request logs store metadata only: request ID, nullable actor token ID, surface,
 nullable source and tool IDs, an immutable callable-path snapshot, outcome,
@@ -160,6 +183,58 @@ stable error code, duration, nullable approval ID, and timestamp. They never
 store request headers, credentials, arguments, or results. Source and tool
 deletion clears their foreign keys while retaining the history and path
 snapshot.
+
+## OpenAPI import and invocation
+
+OpenAPI 3.0 and 3.1 documents can be previewed from pasted JSON or YAML and
+from an HTTP URL. Swagger 2 documents and external references fail closed.
+Local references have cycle and depth limits. Tool identities are derived from
+the HTTP method and exact path, so operation ID and display-name changes do not
+change tool IDs, callable names, or administrator mode overrides on refresh.
+
+The persisted tool binding contains only typed protocol metadata. Static API keys,
+bearer tokens, basic credentials, manually supplied OAuth access tokens, and
+query-bearing source URLs live only in the source-bound encrypted credential
+envelope. The source configuration and admin response expose a query-stripped
+display URL. Refresh
+performs network and compilation work before the catalog transaction, then
+commits artifacts, tools, tombstones, bindings, and health together under
+source and credential revision checks. A failed refresh leaves the last good
+callable catalog in place.
+
+Outbound requests resolve and validate every DNS answer, pin the validated
+addresses into a proxy-free client, and reject mixed safe and unsafe answers.
+Private and loopback targets require a per-source administrator opt-in.
+Link-local, metadata, reserved, documentation, and multicast targets remain
+blocked even with that opt-in. Spec redirects are manual, bounded, revalidated
+at every hop, and cannot downgrade HTTPS. Tool invocation never follows
+redirects. Request and response headers, bodies, time, DNS answers, redirects,
+and document sizes have hard limits.
+
+The first invocation surface deliberately supports this exact serialization
+subset:
+
+- Path and header parameters use `simple` style.
+- Query parameters use `form`, `spaceDelimited`, `pipeDelimited`, or
+  `deepObject`; `allowReserved` is not accepted.
+- Cookie parameters use `form`, including scalar, array, and object explode
+  behavior.
+- Request bodies support JSON and `+json`, string-valued `text/plain`, and
+  closed scalar-object `application/x-www-form-urlencoded` schemas.
+- Parameter `content`, multipart bodies, arbitrary media types, and other
+  styles fail during import instead of producing tools that cannot execute.
+
+Enabled tools execute immediately, disabled or removed tools cannot reach the
+transport, and Ask tools return the stable `approval_required` seam without
+executing. Request logs remain metadata-only and never contain arguments,
+credentials, upstream bodies, or results.
+
+OAuth2 and OpenID Connect operations expose their declared flow metadata for a
+later OAuth setup UI. This slice accepts a manually supplied access token in
+the encrypted credential envelope, labeled `manual_oauth_access_token` in
+metadata. It does not yet claim a managed OAuth flow. State and PKCE handling,
+browser callbacks, authorization-code exchange, refresh-token rotation, and
+provider error recovery remain part of the dedicated OAuth slice.
 
 Audit history is bounded to the most recently inserted 10,000 events for a
 single-user instance. Each event's serialized metadata is capped at 64 KiB.

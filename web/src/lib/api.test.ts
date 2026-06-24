@@ -1,5 +1,85 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ApiError, createToken, getBootstrap, listTokens, loginAdmin } from "./api";
+import { Schema } from "effect";
+import {
+  ApiError,
+  bulkSetToolModes,
+  createOpenApiSource,
+  createToken,
+  deleteOpenApiCredentials,
+  getOpenApiCredentials,
+  getBootstrap,
+  listRequestLogs,
+  listSources,
+  listTokens,
+  listTools,
+  loginAdmin,
+  previewOpenApiSource,
+  putOpenApiCredentials,
+  refreshOpenApiSource,
+  setSourceMode,
+} from "./api";
+
+function sourceFixture() {
+  return {
+    id: "source-1",
+    kind: "openapi",
+    slug: "github",
+    displayName: "GitHub",
+    description: "Repository API",
+    configuration: { publicBaseUrl: "https://api.example.test" },
+    modeOverride: null,
+    healthStatus: "healthy",
+    healthErrorCode: null,
+    revision: 3,
+    catalogRevision: 8,
+    createdAt: 100,
+    updatedAt: 200,
+    lastRefreshedAt: 190,
+    toolCount: 2,
+    tombstonedToolCount: 1,
+  };
+}
+
+function toolFixture() {
+  return {
+    id: "tool-1",
+    sourceId: "source-1",
+    sourceSlug: "github",
+    stableKey: "GET /repos",
+    localName: "list_repos",
+    callablePath: "tools.github.list_repos",
+    sandboxPath: "github.list_repos",
+    displayName: "List repositories",
+    description: "Lists repositories",
+    intrinsicMode: "enabled",
+    modeOverride: null,
+    effectiveMode: { mode: "enabled", provenance: "intrinsic" },
+    present: true,
+    revision: 4,
+    createdAt: 100,
+    updatedAt: 200,
+    lastSeenAt: 190,
+    tombstonedAt: null,
+  };
+}
+
+function logFixture() {
+  return {
+    requestId: "request-1",
+    actorApiTokenId: "token-id",
+    surface: "gateway",
+    sourceId: "source-1",
+    toolId: "tool-1",
+    pathSnapshot: "tools.github.list_repos",
+    outcome: "succeeded",
+    errorCode: null,
+    durationMs: 27,
+    approvalId: null,
+    createdAt: 200,
+  };
+}
+
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 describe("dashboard API client", () => {
   it("normalizes bootstrap data from the control API", async () => {
@@ -149,5 +229,268 @@ describe("dashboard API client", () => {
         status: 502,
       }),
     });
+  });
+
+  it("strictly decodes source and tool catalog snapshots", async () => {
+    const sources = await listSources(async () =>
+      Response.json({ sources: [sourceFixture()], catalogRevision: 12 }),
+    );
+    const tools = await listTools(
+      {
+        query: "repos & teams",
+        sourceId: "source/one",
+        mode: "ask",
+        includeTombstoned: true,
+        limit: 50,
+        offset: 100,
+      },
+      async (input) => {
+        expect(String(input)).toBe(
+          "/api/v1/tools?query=repos+%26+teams&sourceId=source%2Fone&mode=ask&includeTombstoned=true&limit=50&offset=100",
+        );
+        return Response.json({
+          items: [toolFixture()],
+          total: 1,
+          hasMore: false,
+          nextOffset: null,
+          catalogRevision: 12,
+        });
+      },
+    );
+
+    expect(sources.ok && sources.value.sources[0]?.kind).toBe("openapi");
+    expect(tools.ok && tools.value.items[0]?.effectiveMode.provenance).toBe("intrinsic");
+  });
+
+  it("rejects catalog enum drift instead of trusting response JSON", async () => {
+    const source = sourceFixture();
+    const result = await listSources(async () =>
+      Response.json(
+        { sources: [{ ...source, healthStatus: "mostly_fine" }], catalogRevision: 12 },
+        { headers: { "x-request-id": "request-invalid-catalog" } },
+      ),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: new ApiError({
+        code: "invalid_response",
+        displayMessage: "Executor returned a response the dashboard could not understand.",
+        requestId: "request-invalid-catalog",
+        status: 502,
+      }),
+    });
+  });
+
+  it("sends source and current-page bulk revisions exactly once", async () => {
+    const bodies: unknown[] = [];
+    await setSourceMode("source/1", "ask", 7, async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/source%2F1/mode");
+      bodies.push(decodeJson(String(init?.body)));
+      return Response.json({ ...sourceFixture(), modeOverride: "ask", revision: 8 });
+    });
+    await bulkSetToolModes(["tool-1", "tool-2"], "disabled", 19, async (_input, init) => {
+      bodies.push(decodeJson(String(init?.body)));
+      return Response.json({
+        updatedCount: 2,
+        catalogRevision: 20,
+        sourceRevisions: { "source-1": 9 },
+      });
+    });
+
+    expect(bodies).toEqual([
+      { mode: "ask", expectedRevision: 7 },
+      {
+        selection: {
+          type: "tool_ids",
+          toolIds: ["tool-1", "tool-2"],
+          expectedCatalogRevision: 19,
+        },
+        mode: "disabled",
+      },
+    ]);
+  });
+
+  it("preserves revision conflicts for review instead of retrying", async () => {
+    const result = await setSourceMode("source-1", "enabled", 2, async () =>
+      Response.json(
+        {
+          error: {
+            code: "revision_conflict",
+            message: "The source changed.",
+            requestId: "request-conflict",
+          },
+        },
+        { status: 409 },
+      ),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: new ApiError({
+        code: "revision_conflict",
+        displayMessage: "The source changed.",
+        requestId: "request-conflict",
+        status: 409,
+      }),
+    });
+  });
+
+  it("keeps request-log state metadata-only even if a server adds secret fields", async () => {
+    const secret = "secret-sentinel-never-render";
+    const result = await listRequestLogs(null, async (input) => {
+      expect(String(input)).toBe("/api/v1/request-logs?limit=50");
+      return Response.json({
+        items: [
+          {
+            ...logFixture(),
+            requestBody: secret,
+            responseBody: secret,
+            headers: { authorization: secret },
+            credential: secret,
+            token: secret,
+          },
+        ],
+        nextCursor: "older",
+      });
+    });
+
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(result.ok && Object.keys(result.value.items[0] ?? {})).toEqual([
+      "requestId",
+      "actorApiTokenId",
+      "surface",
+      "sourceId",
+      "toolId",
+      "pathSnapshot",
+      "outcome",
+      "errorCode",
+      "durationMs",
+      "approvalId",
+      "createdAt",
+    ]);
+  });
+
+  it("previews an OpenAPI URL with strict tool metadata", async () => {
+    let body: unknown;
+    const result = await previewOpenApiSource(
+      { type: "url", url: "https://api.example.test/openapi.json" },
+      false,
+      async (input, init) => {
+        expect(String(input)).toBe("/api/v1/sources/openapi/preview");
+        body = decodeJson(String(init?.body));
+        return Response.json({
+          title: "Example API",
+          description: null,
+          toolCount: 1,
+          tools: [
+            {
+              preferredName: "list_widgets",
+              displayName: "List widgets",
+              description: "Lists widgets",
+              intrinsicMode: "enabled",
+              security: [["bearerAuth"]],
+            },
+          ],
+          securitySchemes: [
+            {
+              name: "bearerAuth",
+              credentialType: "bearer",
+              placement: "header",
+              supported: true,
+              oauthFlows: null,
+            },
+          ],
+        });
+      },
+    );
+
+    expect(body).toEqual({
+      spec: { type: "url", url: "https://api.example.test/openapi.json" },
+      allowPrivateNetwork: false,
+    });
+    expect(result.ok && result.value.tools[0]?.intrinsicMode).toBe("enabled");
+    expect(result.ok && result.value.securitySchemes[0]?.name).toBe("bearerAuth");
+  });
+
+  it("imports credentials without accepting secret echoes in the source response", async () => {
+    const secret = "source-secret-sentinel";
+    let body: unknown;
+    const result = await createOpenApiSource(
+      {
+        kind: "openapi",
+        displayName: "Example API",
+        spec: { type: "inline", content: "openapi: 3.1.0" },
+        credential: {
+          schemes: { bearerAuth: { type: "bearer", token: secret } },
+        },
+      },
+      async (_input, init) => {
+        body = decodeJson(String(init?.body));
+        return Response.json({ ...sourceFixture(), credentials: secret }, { status: 201 });
+      },
+    );
+
+    expect(JSON.stringify(body)).toContain(secret);
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("decodes OpenAPI refresh counts", async () => {
+    const result = await refreshOpenApiSource("source/1", async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/source%2F1/refresh");
+      expect(init?.body).toBe("{}");
+      return Response.json({
+        sourceId: "source/1",
+        sourceRevision: 4,
+        catalogRevision: 9,
+        globalRevision: 13,
+        activeToolCount: 6,
+        tombstonedToolCount: 2,
+      });
+    });
+
+    expect(result.ok && result.value.activeToolCount).toBe(6);
+  });
+
+  it("reads and replaces only credential metadata and sends CAS revisions", async () => {
+    const metadata = {
+      revision: 4,
+      configuredSchemes: [{ name: "bearerAuth", credentialType: "bearer" }],
+    };
+    const read = await getOpenApiCredentials("source-1", async () => Response.json(metadata));
+    let putBody: unknown;
+    const replaced = await putOpenApiCredentials(
+      "source-1",
+      4,
+      { oauth: { type: "oauth_access_token", access_token: "secret-token" } },
+      async (_input, init) => {
+        putBody = decodeJson(String(init?.body));
+        return Response.json({
+          revision: 5,
+          configuredSchemes: [{ name: "oauth", credentialType: "manual_oauth_access_token" }],
+        });
+      },
+    );
+
+    expect(read).toEqual({ ok: true, value: metadata });
+    expect(putBody).toEqual({
+      expectedRevision: 4,
+      credential: {
+        schemes: { oauth: { type: "oauth_access_token", access_token: "secret-token" } },
+      },
+    });
+    expect(replaced.ok && replaced.value.revision).toBe(5);
+  });
+
+  it("clears credentials with an encoded CAS query", async () => {
+    const result = await deleteOpenApiCredentials("source/1", 5, async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/source%2F1/credentials?expectedRevision=5");
+      expect(init?.method).toBe("DELETE");
+      return Response.json({ revision: 6, configuredSchemes: [] });
+    });
+
+    expect(result.ok && result.value.configuredSchemes).toEqual([]);
   });
 });

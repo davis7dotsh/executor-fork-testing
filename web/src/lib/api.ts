@@ -30,6 +30,168 @@ const TokenListSchema = Schema.Struct({
   tokens: Schema.Array(TokenMetadataSchema),
 });
 
+const ToolModeSchema = Schema.Literals(["enabled", "ask", "disabled"]);
+const ModeProvenanceSchema = Schema.Literals(["tool_override", "source_override", "intrinsic"]);
+const JsonObjectSchema = Schema.Record(Schema.String, Schema.Unknown);
+
+const SourceSchema = Schema.Struct({
+  id: Schema.String,
+  kind: Schema.Literals(["openapi", "graphql", "mcp_http", "mcp_stdio"]),
+  slug: Schema.String,
+  displayName: Schema.String,
+  description: Schema.NullOr(Schema.String),
+  configuration: JsonObjectSchema,
+  modeOverride: Schema.NullOr(ToolModeSchema),
+  healthStatus: Schema.Literals(["unknown", "healthy", "error"]),
+  healthErrorCode: Schema.NullOr(Schema.String),
+  revision: Schema.Number,
+  catalogRevision: Schema.Number,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  lastRefreshedAt: Schema.NullOr(Schema.Number),
+  toolCount: Schema.Number,
+  tombstonedToolCount: Schema.Number,
+});
+
+const SourceListSchema = Schema.Struct({
+  sources: Schema.Array(SourceSchema),
+  catalogRevision: Schema.Number,
+});
+
+const OAuthFlowSchema = Schema.Struct({
+  authorizationUrl: Schema.NullOr(Schema.String),
+  tokenUrl: Schema.NullOr(Schema.String),
+  refreshUrl: Schema.NullOr(Schema.String),
+  scopes: Schema.Record(Schema.String, Schema.String),
+});
+
+const OAuthFlowsSchema = Schema.Struct({
+  implicit: Schema.NullOr(OAuthFlowSchema),
+  password: Schema.NullOr(OAuthFlowSchema),
+  clientCredentials: Schema.NullOr(OAuthFlowSchema),
+  authorizationCode: Schema.NullOr(OAuthFlowSchema),
+});
+
+const OpenApiCredentialTypeSchema = Schema.Literals([
+  "api_key",
+  "bearer",
+  "basic",
+  "manual_oauth_access_token",
+  "http",
+  "mutual_tls",
+]);
+
+const OpenApiPreviewSchema = Schema.Struct({
+  title: Schema.String,
+  description: Schema.NullOr(Schema.String),
+  toolCount: Schema.Number,
+  tools: Schema.Array(
+    Schema.Struct({
+      preferredName: Schema.String,
+      displayName: Schema.String,
+      description: Schema.NullOr(Schema.String),
+      intrinsicMode: ToolModeSchema,
+      security: Schema.Array(Schema.Array(Schema.String)),
+    }),
+  ),
+  securitySchemes: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      credentialType: OpenApiCredentialTypeSchema,
+      placement: Schema.NullOr(Schema.Literals(["header", "query", "cookie", "path"])),
+      supported: Schema.Boolean,
+      oauthFlows: Schema.NullOr(OAuthFlowsSchema),
+    }),
+  ),
+});
+
+const CredentialMetadataSchema = Schema.Struct({
+  revision: Schema.Number,
+  configuredSchemes: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      credentialType: Schema.Literals(["api_key", "bearer", "basic", "manual_oauth_access_token"]),
+    }),
+  ),
+});
+
+const CatalogSyncResultSchema = Schema.Struct({
+  sourceId: Schema.String,
+  sourceRevision: Schema.Number,
+  catalogRevision: Schema.Number,
+  globalRevision: Schema.Number,
+  activeToolCount: Schema.Number,
+  tombstonedToolCount: Schema.Number,
+});
+
+const EffectiveModeSchema = Schema.Struct({
+  mode: ToolModeSchema,
+  provenance: ModeProvenanceSchema,
+});
+
+const ToolSummarySchema = Schema.Struct({
+  id: Schema.String,
+  sourceId: Schema.String,
+  sourceSlug: Schema.String,
+  stableKey: Schema.String,
+  localName: Schema.String,
+  callablePath: Schema.String,
+  sandboxPath: Schema.String,
+  displayName: Schema.String,
+  description: Schema.NullOr(Schema.String),
+  intrinsicMode: ToolModeSchema,
+  modeOverride: Schema.NullOr(ToolModeSchema),
+  effectiveMode: EffectiveModeSchema,
+  present: Schema.Boolean,
+  revision: Schema.Number,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  lastSeenAt: Schema.Number,
+  tombstonedAt: Schema.NullOr(Schema.Number),
+});
+
+const ToolRecordSchema = Schema.Struct({
+  ...ToolSummarySchema.fields,
+  inputSchema: Schema.Unknown,
+  outputSchema: Schema.NullOr(Schema.Unknown),
+  inputTypescript: Schema.NullOr(Schema.String),
+  outputTypescript: Schema.NullOr(Schema.String),
+  typescriptDefinitions: Schema.Record(Schema.String, Schema.String),
+});
+
+const ToolPageSchema = Schema.Struct({
+  items: Schema.Array(ToolSummarySchema),
+  total: Schema.Number,
+  hasMore: Schema.Boolean,
+  nextOffset: Schema.NullOr(Schema.Number),
+  catalogRevision: Schema.Number,
+});
+
+const BulkToolModeResultSchema = Schema.Struct({
+  updatedCount: Schema.Number,
+  catalogRevision: Schema.Number,
+  sourceRevisions: Schema.Record(Schema.String, Schema.Number),
+});
+
+const RequestLogSchema = Schema.Struct({
+  requestId: Schema.String,
+  actorApiTokenId: Schema.NullOr(Schema.String),
+  surface: Schema.Literals(["admin", "gateway", "cli", "mcp"]),
+  sourceId: Schema.NullOr(Schema.String),
+  toolId: Schema.NullOr(Schema.String),
+  pathSnapshot: Schema.NullOr(Schema.String),
+  outcome: Schema.Literals(["succeeded", "failed", "pending_approval", "denied"]),
+  errorCode: Schema.NullOr(Schema.String),
+  durationMs: Schema.Number,
+  approvalId: Schema.NullOr(Schema.String),
+  createdAt: Schema.Number,
+});
+
+const RequestLogPageSchema = Schema.Struct({
+  items: Schema.Array(RequestLogSchema),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+
 const ErrorEnvelopeSchema = Schema.Struct({
   error: Schema.Struct({
     code: Schema.String,
@@ -42,6 +204,18 @@ export type Bootstrap = typeof BootstrapSchema.Type;
 export type Session = typeof SessionSchema.Type;
 export type TokenMetadata = typeof TokenMetadataSchema.Type;
 export type CreatedToken = typeof CreatedTokenSchema.Type;
+export type ToolMode = typeof ToolModeSchema.Type;
+export type Source = typeof SourceSchema.Type;
+export type SourceList = typeof SourceListSchema.Type;
+export type OpenApiPreview = typeof OpenApiPreviewSchema.Type;
+export type CatalogSyncResult = typeof CatalogSyncResultSchema.Type;
+export type OpenApiCredentialMetadata = typeof CredentialMetadataSchema.Type;
+export type ToolSummary = typeof ToolSummarySchema.Type;
+export type ToolRecord = typeof ToolRecordSchema.Type;
+export type ToolPage = typeof ToolPageSchema.Type;
+export type BulkToolModeResult = typeof BulkToolModeResultSchema.Type;
+export type RequestLog = typeof RequestLogSchema.Type;
+export type RequestLogPage = typeof RequestLogPageSchema.Type;
 
 export class ApiError extends Schema.TaggedErrorClass<ApiError>()("ApiError", {
   code: Schema.String,
@@ -61,6 +235,26 @@ const decodeBootstrap = Schema.decodeUnknownOption(Schema.fromJsonString(Bootstr
 const decodeSession = Schema.decodeUnknownOption(Schema.fromJsonString(SessionSchema));
 const decodeCreatedToken = Schema.decodeUnknownOption(Schema.fromJsonString(CreatedTokenSchema));
 const decodeTokenList = Schema.decodeUnknownOption(Schema.fromJsonString(TokenListSchema));
+const decodeSource = Schema.decodeUnknownOption(Schema.fromJsonString(SourceSchema));
+const decodeSourceList = Schema.decodeUnknownOption(Schema.fromJsonString(SourceListSchema));
+const decodeOpenApiPreview = Schema.decodeUnknownOption(
+  Schema.fromJsonString(OpenApiPreviewSchema),
+);
+const decodeCatalogSyncResult = Schema.decodeUnknownOption(
+  Schema.fromJsonString(CatalogSyncResultSchema),
+);
+const decodeCredentialMetadata = Schema.decodeUnknownOption(
+  Schema.fromJsonString(CredentialMetadataSchema),
+);
+const decodeToolRecord = Schema.decodeUnknownOption(Schema.fromJsonString(ToolRecordSchema));
+const decodeToolPage = Schema.decodeUnknownOption(Schema.fromJsonString(ToolPageSchema));
+const decodeBulkToolModeResult = Schema.decodeUnknownOption(
+  Schema.fromJsonString(BulkToolModeResultSchema),
+);
+const decodeRequestLog = Schema.decodeUnknownOption(Schema.fromJsonString(RequestLogSchema));
+const decodeRequestLogPage = Schema.decodeUnknownOption(
+  Schema.fromJsonString(RequestLogPageSchema),
+);
 const decodeErrorEnvelope = Schema.decodeUnknownOption(Schema.fromJsonString(ErrorEnvelopeSchema));
 
 export async function getBootstrap(fetcher: Fetcher = fetch, signal?: AbortSignal) {
@@ -136,6 +330,265 @@ export async function revokeToken(tokenId: string, fetcher: Fetcher = fetch, sig
   );
   if (!response.ok) return response;
   return { ok: true, value: undefined } as const;
+}
+
+export async function listSources(fetcher: Fetcher = fetch, signal?: AbortSignal) {
+  const response = await request("/api/v1/sources", { signal }, fetcher);
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSourceList);
+}
+
+export async function setSourceMode(
+  sourceId: string,
+  mode: ToolMode | null,
+  expectedRevision: number,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/mode`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ mode, expectedRevision }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSource);
+}
+
+export async function deleteSource(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}`,
+    { method: "DELETE", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return { ok: true, value: undefined } as const;
+}
+
+export type OpenApiSpecInput =
+  | { readonly type: "inline"; readonly content: string }
+  | { readonly type: "url"; readonly url: string };
+
+export type OpenApiStaticCredential =
+  | { readonly type: "api_key"; readonly value: string }
+  | { readonly type: "bearer"; readonly token: string }
+  | { readonly type: "basic"; readonly username: string; readonly password: string }
+  | { readonly type: "oauth_access_token"; readonly access_token: string };
+
+export type OpenApiSourceInput = {
+  readonly kind: "openapi";
+  readonly displayName: string;
+  readonly preferredSlug?: string;
+  readonly description?: string;
+  readonly spec: OpenApiSpecInput;
+  readonly allowPrivateNetwork?: boolean;
+  readonly credential?: {
+    readonly schemes: Readonly<Record<string, OpenApiStaticCredential>>;
+  };
+};
+
+export async function previewOpenApiSource(
+  spec: OpenApiSpecInput,
+  allowPrivateNetwork: boolean,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/sources/openapi/preview",
+    { method: "POST", body: JSON.stringify({ spec, allowPrivateNetwork }), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeOpenApiPreview);
+}
+
+export async function createOpenApiSource(
+  input: OpenApiSourceInput,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/sources",
+    { method: "POST", body: JSON.stringify(input), signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeSource);
+}
+
+export async function refreshOpenApiSource(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/refresh`,
+    { method: "POST", body: "{}", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCatalogSyncResult);
+}
+
+export async function getOpenApiCredentials(
+  sourceId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export async function putOpenApiCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  schemes: Readonly<Record<string, OpenApiStaticCredential>>,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ expectedRevision, credential: { schemes } }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export async function deleteOpenApiCredentials(
+  sourceId: string,
+  expectedRevision: number,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/sources/${encodeURIComponent(sourceId)}/credentials?expectedRevision=${encodeURIComponent(String(expectedRevision))}`,
+    { method: "DELETE", signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeCredentialMetadata);
+}
+
+export type ToolListFilters = {
+  query?: string;
+  sourceId?: string;
+  mode?: ToolMode;
+  includeTombstoned?: boolean;
+  limit?: number;
+  offset?: number;
+};
+
+export async function listTools(
+  filters: ToolListFilters,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const parameters = new URLSearchParams();
+  if (filters.query) parameters.set("query", filters.query);
+  if (filters.sourceId) parameters.set("sourceId", filters.sourceId);
+  if (filters.mode) parameters.set("mode", filters.mode);
+  if (filters.includeTombstoned) parameters.set("includeTombstoned", "true");
+  if (filters.limit !== undefined) parameters.set("limit", String(filters.limit));
+  if (filters.offset !== undefined) parameters.set("offset", String(filters.offset));
+  const response = await request(`/api/v1/tools?${parameters}`, { signal }, fetcher);
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeToolPage);
+}
+
+export async function getTool(toolId: string, fetcher: Fetcher = fetch, signal?: AbortSignal) {
+  const response = await request(
+    `/api/v1/tools/${encodeURIComponent(toolId)}`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeToolRecord);
+}
+
+export async function setToolMode(
+  toolId: string,
+  mode: ToolMode | null,
+  expectedRevision: number,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/tools/${encodeURIComponent(toolId)}/mode`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ mode, expectedRevision }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeToolRecord);
+}
+
+export async function bulkSetToolModes(
+  toolIds: readonly string[],
+  mode: ToolMode | null,
+  expectedCatalogRevision: number,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    "/api/v1/tools/modes",
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        selection: { type: "tool_ids", toolIds, expectedCatalogRevision },
+        mode,
+      }),
+      signal,
+    },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeBulkToolModeResult);
+}
+
+export async function listRequestLogs(
+  cursor: string | null,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const parameters = new URLSearchParams({ limit: "50" });
+  if (cursor) parameters.set("cursor", cursor);
+  const response = await request(`/api/v1/request-logs?${parameters}`, { signal }, fetcher);
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeRequestLogPage);
+}
+
+export async function getRequestLog(
+  requestId: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  const response = await request(
+    `/api/v1/request-logs/${encodeURIComponent(requestId)}`,
+    { signal },
+    fetcher,
+  );
+  if (!response.ok) return response;
+  return decodeResponse(response.value, decodeRequestLog);
 }
 
 async function request(path: string, init: RequestInit, fetcher: Fetcher, includeCsrf = true) {

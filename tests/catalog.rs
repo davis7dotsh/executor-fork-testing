@@ -10,8 +10,9 @@ use executor::{
     catalog::{
         ArtifactKind, AuditContext, CatalogError, CatalogSnapshot, CreateSource, CredentialPayload,
         ListToolsFilter, ModeProvenance, NewRequestLog, RequestOutcome, RequestSurface, SourceKind,
-        StagedArtifact, StagedTool, ToolMode, UpdateSource,
+        StagedArtifact, StagedTool, StagedToolBinding, ToolBinding, ToolMode, UpdateSource,
     },
+    openapi::{OpenApiBinding, OpenApiSecurityAlternative},
 };
 use http_body_util::BodyExt;
 use serde_json::{Map, Value, json};
@@ -48,11 +49,20 @@ impl TestExecutor {
     }
 
     async fn source(&self, preferred_slug: &str) -> executor::catalog::SourceRecord {
+        self.source_with_kind(preferred_slug, SourceKind::Graphql)
+            .await
+    }
+
+    async fn source_with_kind(
+        &self,
+        preferred_slug: &str,
+        kind: SourceKind,
+    ) -> executor::catalog::SourceRecord {
         self.app
             .catalog()
             .create_source(
                 CreateSource {
-                    kind: SourceKind::Openapi,
+                    kind,
                     preferred_slug: preferred_slug.to_owned(),
                     display_name: preferred_slug.to_owned(),
                     description: None,
@@ -166,6 +176,23 @@ fn staged(stable_key: &str, preferred_name: &str, mode: ToolMode) -> StagedTool 
         output_typescript: Some("{ ok: boolean }".to_owned()),
         typescript_definitions: BTreeMap::new(),
         intrinsic_mode: mode,
+    }
+}
+
+fn openapi_binding(stable_key: &str, method: &str) -> StagedToolBinding {
+    StagedToolBinding {
+        stable_key: stable_key.to_owned(),
+        binding: ToolBinding::OpenapiV1(OpenApiBinding {
+            version: 1,
+            method: method.to_owned(),
+            path_template: format!("/{stable_key}"),
+            server_url: "https://catalog.example.test".to_owned(),
+            parameters: Vec::new(),
+            request_body: None,
+            security: vec![OpenApiSecurityAlternative {
+                requirements: Vec::new(),
+            }],
+        }),
     }
 }
 
@@ -439,6 +466,203 @@ async fn refresh_is_atomic_and_preserves_overrides_through_tombstones() {
     assert_eq!(restored.id, beta.id);
     assert_eq!(restored.local_name, beta.local_name);
     assert_eq!(restored.mode_override, Some(ToolMode::Disabled));
+}
+
+#[tokio::test]
+async fn generic_sync_rejects_unbound_openapi_tools_without_changing_catalog_state() {
+    let executor = TestExecutor::new().await;
+    let source = executor
+        .source_with_kind("bound-openapi", SourceKind::Openapi)
+        .await;
+    executor
+        .app
+        .catalog()
+        .sync_catalog_with_bindings(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: source.revision,
+                expected_credential_revision: None,
+                artifacts: Vec::new(),
+                tools: vec![staged("alpha", "Alpha", ToolMode::Enabled)],
+            },
+            vec![openapi_binding("alpha", "GET")],
+            AuditContext::system(None),
+        )
+        .await
+        .expect("bound OpenAPI catalog should sync");
+
+    let source_before = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let global_revision_before = executor
+        .app
+        .catalog()
+        .global_revision()
+        .await
+        .expect("global revision should read");
+    let tool_before = executor
+        .app
+        .catalog()
+        .list_tools(ListToolsFilter {
+            source_id: Some(source.id.clone()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("tool should list")
+        .items
+        .remove(0);
+    let binding_before = executor
+        .app
+        .catalog()
+        .tool_binding(&tool_before.id)
+        .await
+        .expect("binding should exist");
+
+    let error = executor
+        .app
+        .catalog()
+        .sync_catalog(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: source_before.revision,
+                expected_credential_revision: None,
+                artifacts: vec![StagedArtifact {
+                    kind: ArtifactKind::OpenapiDocument,
+                    stable_key: "replacement".to_owned(),
+                    content: json!({ "openapi": "3.1.0" }),
+                }],
+                tools: vec![
+                    staged("alpha", "Changed Alpha", ToolMode::Ask),
+                    staged("beta", "Beta", ToolMode::Enabled),
+                ],
+            },
+            AuditContext::system(None),
+        )
+        .await
+        .expect_err("generic sync must not leave active OpenAPI tools unbound");
+    assert!(matches!(
+        error,
+        CatalogError::Validation {
+            code: "incomplete_tool_bindings",
+            ..
+        }
+    ));
+
+    let source_after = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(source_after.revision, source_before.revision);
+    assert_eq!(
+        source_after.catalog_revision,
+        source_before.catalog_revision
+    );
+    assert_eq!(
+        executor
+            .app
+            .catalog()
+            .global_revision()
+            .await
+            .expect("global revision should read"),
+        global_revision_before
+    );
+    let tools_after = executor
+        .app
+        .catalog()
+        .list_tools(ListToolsFilter {
+            source_id: Some(source.id.clone()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("original tool should list")
+        .items;
+    assert_eq!(tools_after.len(), 1);
+    assert_eq!(tools_after[0].id, tool_before.id);
+    assert_eq!(tools_after[0].revision, tool_before.revision);
+    assert_eq!(tools_after[0].display_name, tool_before.display_name);
+    let binding_after = executor
+        .app
+        .catalog()
+        .tool_binding(&tool_before.id)
+        .await
+        .expect("original binding should remain");
+    assert_eq!(binding_after.binding, binding_before.binding);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_artifacts WHERE source_id = ?",)
+            .bind(&source.id)
+            .fetch_one(executor.app.pool())
+            .await
+            .expect("artifact count should read"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn non_openapi_sources_reject_openapi_bindings() {
+    let executor = TestExecutor::new().await;
+    let source = executor.source("graphql-bindings").await;
+    executor
+        .sync(
+            &source.id,
+            vec![staged("query", "Query", ToolMode::Enabled)],
+        )
+        .await;
+    let current = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should exist");
+    let sync_error = executor
+        .app
+        .catalog()
+        .sync_catalog_with_bindings(
+            &source.id,
+            CatalogSnapshot {
+                expected_source_revision: current.revision,
+                expected_credential_revision: None,
+                artifacts: Vec::new(),
+                tools: vec![staged("query", "Query", ToolMode::Enabled)],
+            },
+            vec![openapi_binding("query", "POST")],
+            AuditContext::system(None),
+        )
+        .await
+        .expect_err("GraphQL refresh must reject OpenAPI bindings");
+    assert!(matches!(
+        sync_error,
+        CatalogError::Validation {
+            code: "invalid_source_kind",
+            ..
+        }
+    ));
+
+    let source_after = executor
+        .app
+        .catalog()
+        .source(&source.id)
+        .await
+        .expect("source should remain");
+    assert_eq!(source_after.revision, current.revision);
+    assert_eq!(source_after.catalog_revision, current.catalog_revision);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM tool_bindings JOIN tools ON tools.id = tool_bindings.tool_id \
+             WHERE tools.source_id = ?",
+        )
+        .bind(&source.id)
+        .fetch_one(executor.app.pool())
+        .await
+        .expect("binding count should read"),
+        0
+    );
 }
 
 #[tokio::test]

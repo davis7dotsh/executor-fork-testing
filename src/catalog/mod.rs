@@ -1,3 +1,4 @@
+mod schema;
 mod search;
 mod store;
 
@@ -8,6 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::crypto::CryptoError;
+use crate::openapi::OpenApiBinding;
 
 pub use store::CatalogStore;
 
@@ -239,6 +241,12 @@ pub struct StagedTool {
 }
 
 #[derive(Clone, Debug)]
+pub struct InitialCatalogSnapshot {
+    pub artifacts: Vec<StagedArtifact>,
+    pub tools: Vec<StagedTool>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CatalogSnapshot {
     pub expected_source_revision: i64,
     pub expected_credential_revision: Option<i64>,
@@ -251,6 +259,67 @@ pub struct StagedArtifact {
     pub kind: ArtifactKind,
     pub stable_key: String,
     pub content: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct StagedToolBinding {
+    pub stable_key: String,
+    pub binding: ToolBinding,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "definition", rename_all = "snake_case")]
+pub enum ToolBinding {
+    OpenapiV1(OpenApiBinding),
+}
+
+impl ToolBinding {
+    pub const fn protocol(&self) -> &'static str {
+        match self {
+            Self::OpenapiV1(_) => "openapi",
+        }
+    }
+
+    pub const fn version(&self) -> i64 {
+        match self {
+            Self::OpenapiV1(_) => 1,
+        }
+    }
+
+    pub fn openapi(&self) -> Option<&OpenApiBinding> {
+        match self {
+            Self::OpenapiV1(binding) => Some(binding),
+        }
+    }
+
+    pub(crate) fn decode(
+        protocol: &str,
+        version: i64,
+        definition_json: &str,
+    ) -> Result<Self, CatalogError> {
+        match (protocol, version) {
+            ("openapi", 1) => {
+                let binding: OpenApiBinding = serde_json::from_str(definition_json)?;
+                if binding.version != 1 {
+                    return Err(CatalogError::CorruptData(
+                        "unsupported OpenAPI binding version",
+                    ));
+                }
+                Ok(Self::OpenapiV1(binding))
+            }
+            _ => Err(CatalogError::CorruptData(
+                "unknown tool binding protocol or version",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredToolBinding {
+    pub tool_id: String,
+    pub source_id: String,
+    pub revision: i64,
+    pub binding: ToolBinding,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -392,6 +461,62 @@ pub struct InvocationLookup {
     pub sandbox_path: String,
     pub effective_mode: ToolMode,
     pub requires_approval: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationRevisionToken {
+    pub source_id: String,
+    pub tool_id: String,
+    pub source_revision: i64,
+    pub catalog_revision: i64,
+    pub tool_revision: i64,
+    pub binding_revision: i64,
+    pub credential_revision: Option<i64>,
+}
+
+pub struct InvocationLease {
+    pub(crate) lookup: InvocationLookup,
+    pub(crate) revisions: InvocationRevisionToken,
+    pub(crate) binding: ToolBinding,
+    pub(crate) input_schema: Value,
+    pub(crate) input_validator: jsonschema::Validator,
+    pub(crate) source_configuration: serde_json::Map<String, Value>,
+    pub(crate) credential: Option<StoredCredential>,
+    pub(crate) _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl InvocationLease {
+    pub fn lookup(&self) -> &InvocationLookup {
+        &self.lookup
+    }
+
+    pub fn revisions(&self) -> &InvocationRevisionToken {
+        &self.revisions
+    }
+
+    pub fn binding(&self) -> &ToolBinding {
+        &self.binding
+    }
+
+    pub fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    pub fn arguments_are_valid(&self, arguments: &Value) -> bool {
+        self.input_validator.is_valid(arguments)
+    }
+
+    pub fn source_configuration(&self) -> &serde_json::Map<String, Value> {
+        &self.source_configuration
+    }
+
+    pub fn credential(&self) -> Option<&StoredCredential> {
+        self.credential.as_ref()
+    }
+}
+
+impl Drop for InvocationLease {
+    fn drop(&mut self) {}
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

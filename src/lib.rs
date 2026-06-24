@@ -16,6 +16,8 @@ mod api;
 pub mod catalog;
 pub mod crypto;
 mod database;
+pub mod openapi;
+pub mod outbound;
 pub mod web_assets;
 
 pub use database::DatabaseError;

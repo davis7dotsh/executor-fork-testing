@@ -7,8 +7,11 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, State,
+        rejection::JsonRejection,
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -28,6 +31,8 @@ use crate::{
 };
 
 mod catalog;
+mod openapi;
+mod protocols;
 mod request_logs;
 
 use request_logs::GatewayRequestLogSink;
@@ -403,11 +408,49 @@ struct GatewayIdentity {
     token_name: String,
 }
 
+struct AdminMutation(i64);
+
+struct GatewayAuthentication(GatewayIdentity);
+
 struct AdminSession {
     id: i64,
     username: String,
     session_digest: Vec<u8>,
     csrf_digest: Vec<u8>,
+}
+
+impl FromRequestParts<AppState> for AdminMutation {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .expect("request ID middleware runs before authentication")
+            .clone();
+        let admin = require_admin_mutation(&request_id, state, &parts.headers).await?;
+        Ok(Self(admin.id))
+    }
+}
+
+impl FromRequestParts<AppState> for GatewayAuthentication {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .expect("request ID middleware runs before authentication")
+            .clone();
+        let identity = require_gateway_token(&request_id, state, &parts.headers).await?;
+        Ok(Self(identity))
+    }
 }
 
 pub(crate) fn router(
@@ -442,6 +485,8 @@ pub(crate) fn router(
         .route("/api/v1/tokens/{id}", delete(revoke_token))
         .route("/api/v1/gateway/whoami", get(gateway_whoami))
         .merge(catalog::router())
+        .merge(protocols::router())
+        .merge(openapi::router())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)

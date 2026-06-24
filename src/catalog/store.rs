@@ -7,16 +7,17 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 use sqlx::{FromRow, SqlitePool, Transaction};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use super::{
     ArtifactKind, AuditContext, BulkToolModeResult, CatalogError, CatalogSnapshot,
     CatalogSyncResult, CreateSource, CredentialPayload, DEFAULT_PAGE_LIMIT, DescribedTool,
-    DiscoveryPage, InvocationLookup, ListToolsFilter, MAX_PAGE_LIMIT, NewRequestLog,
-    RequestLogPage, RequestLogRecord, RequestOutcome, RequestSurface, SourceHealth, SourceKind,
-    SourceRecord, StoredCredential, ToolMode, ToolPage, ToolRecord, ToolSummary, UpdateSource,
-    effective_mode, search,
+    DiscoveryPage, InitialCatalogSnapshot, InvocationLease, InvocationLookup,
+    InvocationRevisionToken, ListToolsFilter, MAX_PAGE_LIMIT, NewRequestLog, RequestLogPage,
+    RequestLogRecord, RequestOutcome, RequestSurface, SourceHealth, SourceKind, SourceRecord,
+    StagedToolBinding, StoredCredential, StoredToolBinding, ToolBinding, ToolMode, ToolPage,
+    ToolRecord, ToolSummary, UpdateSource, effective_mode, search,
 };
 use crate::{crypto::Keyring, unix_timestamp};
 
@@ -56,7 +57,7 @@ const MAX_CATALOG_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 pub struct CatalogStore {
     pool: SqlitePool,
     keyring: Keyring,
-    write_lock: Arc<Mutex<()>>,
+    mutation_lock: Arc<RwLock<()>>,
     request_log_writes: Arc<Semaphore>,
 }
 
@@ -140,6 +141,31 @@ struct RequestLogRow {
     created_at: i64,
 }
 
+#[derive(FromRow)]
+struct InvocationRow {
+    tool_id: String,
+    source_id: String,
+    source_kind: String,
+    source_slug: String,
+    local_name: String,
+    present: i64,
+    intrinsic_mode: String,
+    tool_mode_override: Option<String>,
+    source_mode_override: Option<String>,
+    tool_revision: i64,
+    source_revision: i64,
+    catalog_revision: i64,
+    configuration_json: String,
+    input_schema_json: String,
+    binding_protocol: Option<String>,
+    binding_version: Option<i64>,
+    definition_json: Option<String>,
+    binding_revision: Option<i64>,
+    credential_schema_version: Option<i64>,
+    credential_ciphertext: Option<Vec<u8>>,
+    credential_revision: Option<i64>,
+}
+
 struct PreparedTool {
     stable_key: String,
     preferred_name: String,
@@ -164,7 +190,26 @@ struct PreparedArtifact {
 struct PreparedSnapshot {
     tools: Vec<PreparedTool>,
     artifacts: Vec<PreparedArtifact>,
+    payload_bytes: usize,
 }
+
+enum CatalogApplyKind<'a> {
+    Initial {
+        source_kind: SourceKind,
+        slug: &'a str,
+        credential_schema_version: u32,
+    },
+    Refresh,
+}
+
+struct PreparedToolBinding {
+    stable_key: String,
+    protocol: &'static str,
+    version: i64,
+    definition_json: String,
+}
+
+type PreparedToolBindings = Vec<PreparedToolBinding>;
 
 #[derive(Clone, Copy)]
 struct PayloadLimits {
@@ -226,7 +271,7 @@ impl CatalogStore {
         Self {
             pool,
             keyring,
-            write_lock: Arc::new(Mutex::new(())),
+            mutation_lock: Arc::new(RwLock::new(())),
             request_log_writes: Arc::new(Semaphore::new(1)),
         }
     }
@@ -241,6 +286,147 @@ impl CatalogStore {
                 .fetch_one(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn create_source_with_catalog(
+        &self,
+        input: CreateSource,
+        credential: &CredentialPayload,
+        snapshot: InitialCatalogSnapshot,
+        bindings: Vec<StagedToolBinding>,
+        audit: AuditContext<'_>,
+    ) -> Result<(SourceRecord, CatalogSyncResult), CatalogError> {
+        if input.kind != SourceKind::Openapi {
+            return Err(validation(
+                "invalid_source_kind",
+                "Atomic imported-source creation currently supports OpenAPI sources only.",
+            ));
+        }
+        let display_name = validate_text(
+            "invalid_source_name",
+            "Source names must contain between 1 and 200 characters.",
+            &input.display_name,
+            200,
+        )?;
+        let description = validate_optional_text(
+            "invalid_source_description",
+            "Source descriptions may contain at most 2000 characters.",
+            input.description.as_deref(),
+            2000,
+        )?;
+        if credential.schema_version == 0 {
+            return Err(validation(
+                "invalid_credential_schema",
+                "Credential schema versions must be positive.",
+            ));
+        }
+        let (prepared, prepared_bindings) =
+            prepare_initial_snapshot_and_bindings(snapshot, bindings)?;
+        if prepared_bindings
+            .iter()
+            .map(|binding| &binding.stable_key)
+            .collect::<HashSet<_>>()
+            != prepared
+                .tools
+                .iter()
+                .map(|tool| &tool.stable_key)
+                .collect::<HashSet<_>>()
+        {
+            return Err(validation(
+                "incomplete_tool_bindings",
+                "Every staged imported tool must have exactly one binding.",
+            ));
+        }
+
+        let source_id = Uuid::new_v4().to_string();
+        let configuration_json = serde_json::to_string(&input.configuration)?;
+        let credential_plaintext = serde_json::to_vec(&credential.payload)?;
+        let credential_ciphertext =
+            self.keyring
+                .encrypt(CREDENTIAL_PURPOSE, &source_id, &credential_plaintext)?;
+        let base_slug = normalize_source_slug(&input.preferred_slug);
+        let now = unix_timestamp();
+        let _write = self.mutation_lock.write().await;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let mut used_slugs = sqlx::query_scalar::<_, String>("SELECT slug FROM sources")
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        used_slugs.extend(RESERVED_SOURCE_SLUGS.into_iter().map(str::to_owned));
+        let slug = NameAllocator::new(used_slugs).allocate(&base_slug, 63, '_');
+        let search_short_grams = search::short_gram_document(&[&slug]);
+        sqlx::query(
+            "INSERT INTO sources \
+             (id, kind, slug, search_short_grams, display_name, description, configuration_json, \
+              health_status, revision, catalog_revision, created_at, updated_at, last_refreshed_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'healthy', 1, 1, ?, ?, ?)",
+        )
+        .bind(&source_id)
+        .bind(input.kind.as_str())
+        .bind(&slug)
+        .bind(search_short_grams)
+        .bind(display_name)
+        .bind(description)
+        .bind(configuration_json)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO source_credentials \
+             (source_id, schema_version, payload_ciphertext, revision, created_at, updated_at) \
+             VALUES (?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&source_id)
+        .bind(i64::from(credential.schema_version))
+        .bind(credential_ciphertext)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+
+        apply_artifacts(&mut transaction, &source_id, &prepared.artifacts, now).await?;
+        let missing = apply_tools(&mut transaction, &source_id, &prepared.tools, now).await?;
+        debug_assert!(missing.is_empty());
+        apply_tool_bindings(&mut transaction, &source_id, &prepared_bindings, now).await?;
+        rebuild_search_indexes(&mut transaction, &source_id).await?;
+
+        let source_path = format!("tools.{slug}");
+        let (source_revision, catalog_revision, global_revision) = finalize_catalog_apply(
+            &mut transaction,
+            audit,
+            &source_id,
+            &source_path,
+            CatalogApplyKind::Initial {
+                source_kind: input.kind,
+                slug: &slug,
+                credential_schema_version: credential.schema_version,
+            },
+            prepared.tools.len(),
+            prepared.artifacts.len(),
+            0,
+            now,
+        )
+        .await?;
+
+        let source = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(&source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        transaction.commit().await?;
+        let sync = CatalogSyncResult {
+            source_id,
+            source_revision,
+            catalog_revision,
+            global_revision,
+            active_tool_count: prepared.tools.len(),
+            tombstoned_tool_count: 0,
+        };
+        Ok((source, sync))
     }
 
     pub async fn create_source(
@@ -264,7 +450,7 @@ impl CatalogStore {
         let source_id = Uuid::new_v4().to_string();
         let configuration_json = serde_json::to_string(&input.configuration)?;
         let now = unix_timestamp();
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut used_slugs = sqlx::query_scalar::<_, String>("SELECT slug FROM sources")
             .fetch_all(&mut *transaction)
@@ -353,7 +539,7 @@ impl CatalogStore {
             2000,
         )?;
         let configuration_json = serde_json::to_string(&input.configuration)?;
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
@@ -401,7 +587,7 @@ impl CatalogStore {
         source_id: &str,
         audit: AuditContext<'_>,
     ) -> Result<(), CatalogError> {
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let source = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
             .bind(source_id)
@@ -448,7 +634,7 @@ impl CatalogStore {
         expected_revision: i64,
         audit: AuditContext<'_>,
     ) -> Result<SourceRecord, CatalogError> {
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
@@ -507,7 +693,7 @@ impl CatalogStore {
             .keyring
             .encrypt(CREDENTIAL_PURPOSE, source_id, &plaintext)?;
         let now = unix_timestamp();
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_source_exists(&mut transaction, source_id).await?;
         let actual_revision = sqlx::query_scalar::<_, i64>(
@@ -607,20 +793,179 @@ impl CatalogStore {
             .transpose()
     }
 
+    pub async fn delete_credential(
+        &self,
+        source_id: &str,
+        expected_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<(), CatalogError> {
+        let now = unix_timestamp();
+        let _write = self.mutation_lock.write().await;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_source_exists(&mut transaction, source_id).await?;
+        let changed =
+            sqlx::query("DELETE FROM source_credentials WHERE source_id = ? AND revision = ?")
+                .bind(source_id)
+                .bind(expected_revision)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+        if changed == 0 {
+            let actual = sqlx::query_scalar::<_, i64>(
+                "SELECT revision FROM source_credentials WHERE source_id = ?",
+            )
+            .bind(source_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .unwrap_or(-1);
+            return Err(CatalogError::RevisionConflict {
+                scope: "credential",
+                expected: expected_revision,
+                actual,
+            });
+        }
+        increment_source_and_global(&mut transaction, source_id, now).await?;
+        let source_path = source_path_snapshot(&mut transaction, source_id).await?;
+        insert_audit(
+            &mut transaction,
+            audit,
+            "source.credential_deleted",
+            Some(source_id),
+            None,
+            Some(&source_path),
+            json!({}),
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_tool_bindings(
+        &self,
+        source_id: &str,
+        bindings: Vec<StagedToolBinding>,
+    ) -> Result<(), CatalogError> {
+        let prepared = prepare_tool_bindings(bindings)?;
+
+        let _write = self.mutation_lock.write().await;
+        let now = unix_timestamp();
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source_kind = source_kind(&mut transaction, source_id).await?;
+        if source_kind != SourceKind::Openapi {
+            return Err(validation(
+                "invalid_source_kind",
+                "OpenAPI tool bindings may only be stored for OpenAPI sources.",
+            ));
+        }
+        let active_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM tools WHERE source_id = ? AND present = 1",
+        )
+        .bind(source_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if usize::try_from(active_count).ok() != Some(prepared.len()) {
+            return Err(validation(
+                "incomplete_tool_bindings",
+                "Every active imported tool must have exactly one binding.",
+            ));
+        }
+        for binding in prepared {
+            let changed = sqlx::query(
+                "INSERT INTO tool_bindings (tool_id, protocol, binding_version, definition_json, revision, created_at, updated_at) \
+                 SELECT id, ?, ?, ?, 0, ?, ? FROM tools \
+                 WHERE source_id = ? AND stable_key = ? AND present = 1 \
+                 ON CONFLICT(tool_id) DO UPDATE SET protocol = excluded.protocol, \
+                 binding_version = excluded.binding_version, \
+                 definition_json = excluded.definition_json, revision = tool_bindings.revision + 1, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(binding.protocol)
+            .bind(binding.version)
+            .bind(binding.definition_json)
+            .bind(now)
+            .bind(now)
+            .bind(source_id)
+            .bind(binding.stable_key)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(validation(
+                    "invalid_tool_binding",
+                    "A tool binding does not match an active imported tool.",
+                ));
+            }
+        }
+        sqlx::query(
+            "DELETE FROM tool_bindings WHERE tool_id IN (\
+             SELECT id FROM tools WHERE source_id = ? AND present = 0)",
+        )
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn tool_binding(&self, tool_id: &str) -> Result<StoredToolBinding, CatalogError> {
+        let row = sqlx::query_as::<_, (String, String, String, String, i64, String, i64)>(
+            "SELECT tool_bindings.tool_id, tools.source_id, sources.kind, \
+             tool_bindings.protocol, tool_bindings.binding_version, tool_bindings.definition_json, \
+             tool_bindings.revision FROM tool_bindings \
+             JOIN tools ON tools.id = tool_bindings.tool_id \
+             JOIN sources ON sources.id = tools.source_id \
+             WHERE tool_bindings.tool_id = ? AND tools.present = 1",
+        )
+        .bind(tool_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(CatalogError::NotFound {
+            entity: "tool binding",
+        })?;
+        let binding = ToolBinding::decode(&row.3, row.4, &row.5)?;
+        if !matches!(
+            (&binding, SourceKind::from_str(&row.2)?),
+            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
+        ) {
+            return Err(CatalogError::CorruptData(
+                "tool binding does not match source kind",
+            ));
+        }
+        Ok(StoredToolBinding {
+            tool_id: row.0,
+            source_id: row.1,
+            revision: row.6,
+            binding,
+        })
+    }
+
     pub async fn sync_catalog(
         &self,
         source_id: &str,
         snapshot: CatalogSnapshot,
         audit: AuditContext<'_>,
     ) -> Result<CatalogSyncResult, CatalogError> {
+        self.sync_catalog_with_bindings(source_id, snapshot, Vec::new(), audit)
+            .await
+    }
+
+    pub async fn sync_catalog_with_bindings(
+        &self,
+        source_id: &str,
+        snapshot: CatalogSnapshot,
+        bindings: Vec<StagedToolBinding>,
+        audit: AuditContext<'_>,
+    ) -> Result<CatalogSyncResult, CatalogError> {
         let expected_source_revision = snapshot.expected_source_revision;
         let expected_credential_revision = snapshot.expected_credential_revision;
-        let prepared = prepare_snapshot(snapshot)?;
+        let (prepared, prepared_bindings) = prepare_snapshot_and_bindings(snapshot, bindings)?;
         let now = unix_timestamp();
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let actual_source_revision =
-            sqlx::query_scalar::<_, i64>("SELECT revision FROM sources WHERE id = ?")
+        let (actual_source_revision, source_kind) =
+            sqlx::query_as::<_, (i64, String)>("SELECT revision, kind FROM sources WHERE id = ?")
                 .bind(source_id)
                 .fetch_optional(&mut *transaction)
                 .await?
@@ -631,6 +976,32 @@ impl CatalogStore {
                 expected: expected_source_revision,
                 actual: actual_source_revision,
             });
+        }
+        let source_kind = SourceKind::from_str(&source_kind)?;
+        let binding_keys = prepared_bindings
+            .iter()
+            .map(|binding| &binding.stable_key)
+            .collect::<HashSet<_>>();
+        let staged_tool_keys = prepared
+            .tools
+            .iter()
+            .map(|tool| &tool.stable_key)
+            .collect::<HashSet<_>>();
+        match source_kind {
+            SourceKind::Openapi if binding_keys != staged_tool_keys => {
+                return Err(validation(
+                    "incomplete_tool_bindings",
+                    "Every active OpenAPI tool must have exactly one binding.",
+                ));
+            }
+            SourceKind::Openapi => {}
+            _ if !prepared_bindings.is_empty() => {
+                return Err(validation(
+                    "invalid_source_kind",
+                    "OpenAPI tool bindings may only be stored for OpenAPI sources.",
+                ));
+            }
+            _ => {}
         }
         let actual_credential_revision = sqlx::query_scalar::<_, i64>(
             "SELECT revision FROM source_credentials WHERE source_id = ?",
@@ -645,227 +1016,29 @@ impl CatalogStore {
                 actual: actual_credential_revision.unwrap_or(-1),
             });
         }
-        let existing = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT stable_key, local_name, present FROM tools WHERE source_id = ?",
-        )
-        .bind(source_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let existing_by_key = existing
-            .into_iter()
-            .map(|(stable_key, local_name, present)| (stable_key, (local_name, present != 0)))
-            .collect::<HashMap<_, _>>();
-        let staged_keys = prepared
-            .tools
-            .iter()
-            .map(|tool| tool.stable_key.clone())
-            .collect::<HashSet<_>>();
-        validate_tool_history(&existing_by_key, &staged_keys)?;
+        apply_artifacts(&mut transaction, source_id, &prepared.artifacts, now).await?;
+        let missing = apply_tools(&mut transaction, source_id, &prepared.tools, now).await?;
+        apply_tool_bindings(&mut transaction, source_id, &prepared_bindings, now).await?;
+        rebuild_search_indexes(&mut transaction, source_id).await?;
 
-        let artifact_keys = prepared
-            .artifacts
-            .iter()
-            .map(|artifact| {
-                (
-                    artifact.kind.as_str().to_owned(),
-                    artifact.stable_key.clone(),
-                )
-            })
-            .collect::<HashSet<_>>();
-        let existing_artifact_keys = sqlx::query_as::<_, (String, String)>(
-            "SELECT artifact_kind, stable_key FROM source_artifacts WHERE source_id = ?",
-        )
-        .bind(source_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        for artifact in &prepared.artifacts {
-            sqlx::query(
-                "INSERT INTO source_artifacts \
-                 (id, source_id, artifact_kind, stable_key, content_json, revision, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
-                 ON CONFLICT(source_id, artifact_kind, stable_key) DO UPDATE SET \
-                 content_json = excluded.content_json, revision = source_artifacts.revision + 1, \
-                 updated_at = excluded.updated_at",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(source_id)
-            .bind(artifact.kind.as_str())
-            .bind(&artifact.stable_key)
-            .bind(&artifact.content_json)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await?;
-        }
-        for (kind, stable_key) in existing_artifact_keys {
-            if !artifact_keys.contains(&(kind.clone(), stable_key.clone())) {
-                sqlx::query(
-                    "DELETE FROM source_artifacts \
-                     WHERE source_id = ? AND artifact_kind = ? AND stable_key = ?",
-                )
-                .bind(source_id)
-                .bind(kind)
-                .bind(stable_key)
-                .execute(&mut *transaction)
-                .await?;
-            }
-        }
-        let used_names = existing_by_key
-            .values()
-            .map(|(local_name, _)| local_name.clone())
-            .collect::<HashSet<_>>();
-        let mut name_allocator = NameAllocator::new(used_names);
-
-        for tool in &prepared.tools {
-            let local_name = existing_by_key
-                .get(&tool.stable_key)
-                .map(|(local_name, _)| local_name.clone())
-                .unwrap_or_else(|| {
-                    let base = normalize_tool_name(&tool.preferred_name);
-                    name_allocator.allocate(&base, 128, '_')
-                });
-            sqlx::query(
-                "INSERT INTO tools \
-                 (id, source_id, stable_key, local_name, display_name, description, search_description, \
-                  search_short_grams, \
-                  input_schema_json, output_schema_json, input_typescript, output_typescript, \
-                  typescript_definitions_json, intrinsic_mode, present, revision, \
-                  created_at, updated_at, last_seen_at, tombstoned_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, NULL) \
-                 ON CONFLICT(source_id, stable_key) DO UPDATE SET \
-                  display_name = excluded.display_name, description = excluded.description, \
-                  search_description = excluded.search_description, \
-                  search_short_grams = excluded.search_short_grams, \
-                  input_schema_json = excluded.input_schema_json, \
-                  output_schema_json = excluded.output_schema_json, \
-                  input_typescript = excluded.input_typescript, \
-                  output_typescript = excluded.output_typescript, \
-                  typescript_definitions_json = excluded.typescript_definitions_json, \
-                  intrinsic_mode = excluded.intrinsic_mode, present = 1, \
-                  revision = tools.revision + 1, updated_at = excluded.updated_at, \
-                  last_seen_at = excluded.last_seen_at, tombstoned_at = NULL",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(source_id)
-            .bind(&tool.stable_key)
-            .bind(local_name)
-            .bind(&tool.display_name)
-            .bind(&tool.description)
-            .bind(&tool.search_description)
-            .bind(&tool.search_short_grams)
-            .bind(&tool.input_schema_json)
-            .bind(&tool.output_schema_json)
-            .bind(&tool.input_typescript)
-            .bind(&tool.output_typescript)
-            .bind(&tool.typescript_definitions_json)
-            .bind(tool.intrinsic_mode.as_str())
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        let missing = existing_by_key
-            .iter()
-            .filter(|(stable_key, (_, present))| *present && !staged_keys.contains(*stable_key))
-            .map(|(stable_key, _)| stable_key)
-            .collect::<Vec<_>>();
-        for stable_key in &missing {
-            sqlx::query(
-                "UPDATE tools SET present = 0, revision = revision + 1, updated_at = ?, \
-                 tombstoned_at = ? WHERE source_id = ? AND stable_key = ? AND present = 1",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(source_id)
-            .bind(stable_key)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        sqlx::query("DELETE FROM tool_search WHERE source_id = ?")
-            .bind(source_id)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "INSERT INTO tool_search \
-             (source_id, tool_id, source_slug, local_name, description, sandbox_path) \
-             SELECT tools.source_id, tools.id, replace(sources.slug, '_', ' '), \
-                    replace(tools.local_name, '_', ' '), tools.search_description, \
-                    replace(sources.slug, '_', ' ') || ' ' || replace(tools.local_name, '_', ' ') \
-             FROM tools JOIN sources ON sources.id = tools.source_id \
-             WHERE tools.source_id = ? AND tools.present = 1",
-        )
-        .bind(source_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query("DELETE FROM tool_search_trigram WHERE source_id = ?")
-            .bind(source_id)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "INSERT INTO tool_search_trigram \
-             (source_id, tool_id, source_slug, local_name, description, sandbox_path) \
-             SELECT tools.source_id, tools.id, replace(sources.slug, '_', ' '), \
-                    replace(tools.local_name, '_', ' '), tools.search_description, \
-                    replace(sources.slug, '_', ' ') || ' ' || replace(tools.local_name, '_', ' ') \
-             FROM tools JOIN sources ON sources.id = tools.source_id \
-             WHERE tools.source_id = ? AND tools.present = 1",
-        )
-        .bind(source_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query("DELETE FROM tool_search_short WHERE source_id = ?")
-            .bind(source_id)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "INSERT INTO tool_search_short (source_id, tool_id, grams) \
-             SELECT tools.source_id, tools.id, \
-                    sources.search_short_grams || ' ' || tools.search_short_grams \
-             FROM tools JOIN sources ON sources.id = tools.source_id \
-             WHERE tools.source_id = ? AND tools.present = 1",
-        )
-        .bind(source_id)
-        .execute(&mut *transaction)
-        .await?;
-
-        let revisions = sqlx::query_as::<_, (i64, i64)>(
-            "UPDATE sources SET revision = revision + 1, \
-             catalog_revision = catalog_revision + 1, health_status = 'healthy', \
-             health_error_code = NULL, updated_at = ?, last_refreshed_at = ? \
-             WHERE id = ? RETURNING revision, catalog_revision",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(source_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        let global_revision = bump_global_revision(&mut transaction, now).await?;
         let source_path = source_path_snapshot(&mut transaction, source_id).await?;
-        insert_audit(
+        let (source_revision, catalog_revision, global_revision) = finalize_catalog_apply(
             &mut transaction,
             audit,
-            "source.catalog_refreshed",
-            Some(source_id),
-            None,
-            Some(&source_path),
-            json!({
-                "catalogRevision": revisions.1,
-                "activeToolCount": prepared.tools.len(),
-                "artifactCount": prepared.artifacts.len(),
-                "tombstonedToolCount": missing.len(),
-                "globalRevision": global_revision
-            }),
+            source_id,
+            &source_path,
+            CatalogApplyKind::Refresh,
+            prepared.tools.len(),
+            prepared.artifacts.len(),
+            missing.len(),
             now,
         )
         .await?;
         transaction.commit().await?;
         Ok(CatalogSyncResult {
             source_id: source_id.to_owned(),
-            source_revision: revisions.0,
-            catalog_revision: revisions.1,
+            source_revision,
+            catalog_revision,
             global_revision,
             active_tool_count: prepared.tools.len(),
             tombstoned_tool_count: missing.len(),
@@ -945,7 +1118,7 @@ impl CatalogStore {
         expected_revision: i64,
         audit: AuditContext<'_>,
     ) -> Result<ToolRecord, CatalogError> {
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query_as::<_, (String, String, String)>(
@@ -1007,7 +1180,7 @@ impl CatalogStore {
         expected_source_revision: i64,
         audit: AuditContext<'_>,
     ) -> Result<BulkToolModeResult, CatalogError> {
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actual_revision =
@@ -1079,7 +1252,7 @@ impl CatalogStore {
                 "Select between 1 and 200 tools for a bulk mode change.",
             ));
         }
-        let _write = self.write_lock.lock().await;
+        let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actual_catalog_revision =
@@ -1259,6 +1432,143 @@ impl CatalogStore {
             sandbox_path: tool.sandbox_path,
             effective_mode: tool.effective_mode.mode,
             requires_approval: tool.effective_mode.mode == ToolMode::Ask,
+        })
+    }
+
+    pub async fn prepare_invocation(&self, path: &str) -> Result<InvocationLease, CatalogError> {
+        let Some((source_slug, local_name)) = parse_tool_path(path) else {
+            return Err(CatalogError::ToolNotFound {
+                path: normalize_sandbox_path(path),
+            });
+        };
+        let guard = self.mutation_lock.clone().read_owned().await;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, InvocationRow>(INVOCATION_SELECT_BY_PATH)
+            .bind(source_slug)
+            .bind(local_name)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        let row = row.ok_or_else(|| CatalogError::ToolNotFound {
+            path: normalize_sandbox_path(path),
+        })?;
+        self.invocation_lease(row, guard)
+    }
+
+    pub async fn revalidate_invocation(
+        &self,
+        token: &InvocationRevisionToken,
+    ) -> Result<Option<InvocationLease>, CatalogError> {
+        let guard = self.mutation_lock.clone().read_owned().await;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, InvocationRow>(INVOCATION_SELECT_BY_REVISION)
+            .bind(&token.tool_id)
+            .bind(&token.source_id)
+            .bind(token.source_revision)
+            .bind(token.catalog_revision)
+            .bind(token.tool_revision)
+            .bind(token.binding_revision)
+            .bind(token.credential_revision)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        row.map(|row| self.invocation_lease(row, guard)).transpose()
+    }
+
+    fn invocation_lease(
+        &self,
+        row: InvocationRow,
+        guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<InvocationLease, CatalogError> {
+        let sandbox_path = format!("{}.{}", row.source_slug, row.local_name);
+        if row.present == 0 {
+            return Err(CatalogError::ToolNotFound { path: sandbox_path });
+        }
+        let mode = effective_mode(
+            ToolMode::from_str(&row.intrinsic_mode)?,
+            parse_optional_mode(row.source_mode_override)?,
+            parse_optional_mode(row.tool_mode_override)?,
+        )
+        .mode;
+        if mode == ToolMode::Disabled {
+            return Err(CatalogError::ToolDisabled { path: sandbox_path });
+        }
+        let binding_protocol = row
+            .binding_protocol
+            .as_deref()
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding_version = row
+            .binding_version
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let definition_json = row
+            .definition_json
+            .as_deref()
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding_revision = row
+            .binding_revision
+            .ok_or(CatalogError::CorruptData("active tool binding missing"))?;
+        let binding = ToolBinding::decode(binding_protocol, binding_version, definition_json)?;
+        if !matches!(
+            (&binding, SourceKind::from_str(&row.source_kind)?),
+            (ToolBinding::OpenapiV1(_), SourceKind::Openapi)
+        ) {
+            return Err(CatalogError::CorruptData(
+                "tool binding does not match source kind",
+            ));
+        }
+        let credential = match (
+            row.credential_schema_version,
+            row.credential_ciphertext,
+            row.credential_revision,
+        ) {
+            (Some(schema_version), Some(ciphertext), Some(revision)) => {
+                let plaintext =
+                    self.keyring
+                        .decrypt(CREDENTIAL_PURPOSE, &row.source_id, &ciphertext)?;
+                Some(StoredCredential {
+                    revision,
+                    credential: CredentialPayload {
+                        schema_version: u32::try_from(schema_version)
+                            .map_err(|_| CatalogError::CorruptData("credential schema version"))?,
+                        payload: serde_json::from_slice(&plaintext)?,
+                    },
+                })
+            }
+            (None, None, None) => None,
+            _ => return Err(CatalogError::CorruptData("incomplete source credential")),
+        };
+        let callable_path = format!("tools.{sandbox_path}");
+        let lookup = InvocationLookup {
+            tool_id: row.tool_id.clone(),
+            source_id: row.source_id.clone(),
+            callable_path,
+            sandbox_path,
+            effective_mode: mode,
+            requires_approval: mode == ToolMode::Ask,
+        };
+        if row.input_schema_json.len() > MAX_SCHEMA_BYTES {
+            return Err(CatalogError::CorruptData("tool input schema is too large"));
+        }
+        let input_schema: Value = serde_json::from_str(&row.input_schema_json)?;
+        let input_validator = super::schema::compile(&input_schema)
+            .map_err(|()| CatalogError::CorruptData("tool input schema is invalid"))?;
+        Ok(InvocationLease {
+            revisions: InvocationRevisionToken {
+                source_id: row.source_id,
+                tool_id: row.tool_id,
+                source_revision: row.source_revision,
+                catalog_revision: row.catalog_revision,
+                tool_revision: row.tool_revision,
+                binding_revision,
+                credential_revision: row.credential_revision,
+            },
+            lookup,
+            binding,
+            input_schema,
+            input_validator,
+            source_configuration: serde_json::from_str(&row.configuration_json)?,
+            credential,
+            _guard: guard,
         })
     }
 
@@ -1689,19 +1999,157 @@ const TOOL_SUMMARY_SELECT_BY_PATH: &str = "SELECT tools.id, tools.source_id, sou
      FROM tools JOIN sources ON sources.id = tools.source_id \
      WHERE sources.slug = ? AND tools.local_name = ?";
 
+const INVOCATION_SELECT_BY_PATH: &str = "SELECT tools.id AS tool_id, tools.source_id, \
+     sources.kind AS source_kind, sources.slug AS source_slug, tools.local_name, \
+     tools.present, tools.intrinsic_mode, \
+     tools.mode_override AS tool_mode_override, sources.mode_override AS source_mode_override, \
+     tools.revision AS tool_revision, sources.revision AS source_revision, \
+     sources.catalog_revision, sources.configuration_json, tools.input_schema_json, \
+     tool_bindings.protocol AS binding_protocol, tool_bindings.binding_version, \
+     tool_bindings.definition_json, tool_bindings.revision AS binding_revision, \
+     source_credentials.schema_version AS credential_schema_version, \
+     source_credentials.payload_ciphertext AS credential_ciphertext, \
+     source_credentials.revision AS credential_revision \
+     FROM tools JOIN sources ON sources.id = tools.source_id \
+     LEFT JOIN tool_bindings ON tool_bindings.tool_id = tools.id \
+     LEFT JOIN source_credentials ON source_credentials.source_id = sources.id \
+     WHERE sources.slug = ? AND tools.local_name = ?";
+
+const INVOCATION_SELECT_BY_REVISION: &str = "SELECT tools.id AS tool_id, tools.source_id, \
+     sources.kind AS source_kind, sources.slug AS source_slug, tools.local_name, \
+     tools.present, tools.intrinsic_mode, \
+     tools.mode_override AS tool_mode_override, sources.mode_override AS source_mode_override, \
+     tools.revision AS tool_revision, sources.revision AS source_revision, \
+     sources.catalog_revision, sources.configuration_json, tools.input_schema_json, \
+     tool_bindings.protocol AS binding_protocol, tool_bindings.binding_version, \
+     tool_bindings.definition_json, tool_bindings.revision AS binding_revision, \
+     source_credentials.schema_version AS credential_schema_version, \
+     source_credentials.payload_ciphertext AS credential_ciphertext, \
+     source_credentials.revision AS credential_revision \
+     FROM tools JOIN sources ON sources.id = tools.source_id \
+     JOIN tool_bindings ON tool_bindings.tool_id = tools.id \
+     LEFT JOIN source_credentials ON source_credentials.source_id = sources.id \
+     WHERE tools.id = ? AND tools.source_id = ? AND tools.present = 1 \
+       AND sources.revision = ? AND sources.catalog_revision = ? \
+       AND tools.revision = ? AND tool_bindings.revision = ? \
+       AND source_credentials.revision IS ?";
+
 const REQUEST_LOG_SELECT_BY_ID: &str = "SELECT request_id, actor_api_token_id, surface, source_id, tool_id, path_snapshot, \
      outcome, error_code, duration_ms, approval_id, created_at \
      FROM request_logs WHERE request_id = ?";
 
-fn prepare_snapshot(snapshot: CatalogSnapshot) -> Result<PreparedSnapshot, CatalogError> {
-    prepare_snapshot_with_limits(snapshot, PayloadLimits::default())
+fn prepare_snapshot_and_bindings(
+    snapshot: CatalogSnapshot,
+    bindings: Vec<StagedToolBinding>,
+) -> Result<(PreparedSnapshot, PreparedToolBindings), CatalogError> {
+    prepare_snapshot_and_bindings_with_limits(snapshot, bindings, PayloadLimits::default())
+}
+
+fn prepare_initial_snapshot_and_bindings(
+    snapshot: InitialCatalogSnapshot,
+    bindings: Vec<StagedToolBinding>,
+) -> Result<(PreparedSnapshot, PreparedToolBindings), CatalogError> {
+    let prepared = prepare_catalog_content_with_limits(
+        snapshot.artifacts,
+        snapshot.tools,
+        PayloadLimits::default(),
+    )?;
+    let prepared_bindings = prepare_tool_bindings_with_limits(
+        bindings,
+        PayloadLimits::default(),
+        prepared.payload_bytes,
+    )?;
+    Ok((prepared, prepared_bindings))
+}
+
+fn prepare_snapshot_and_bindings_with_limits(
+    snapshot: CatalogSnapshot,
+    bindings: Vec<StagedToolBinding>,
+    limits: PayloadLimits,
+) -> Result<(PreparedSnapshot, PreparedToolBindings), CatalogError> {
+    let prepared = prepare_snapshot_with_limits(snapshot, limits)?;
+    let prepared_bindings =
+        prepare_tool_bindings_with_limits(bindings, limits, prepared.payload_bytes)?;
+    Ok((prepared, prepared_bindings))
+}
+
+#[cfg(test)]
+fn prepare_tool_bindings(
+    bindings: Vec<StagedToolBinding>,
+) -> Result<PreparedToolBindings, CatalogError> {
+    prepare_tool_bindings_with_limits(bindings, PayloadLimits::default(), 0)
+}
+
+fn prepare_tool_bindings_with_limits(
+    bindings: Vec<StagedToolBinding>,
+    limits: PayloadLimits,
+    initial_payload_bytes: usize,
+) -> Result<PreparedToolBindings, CatalogError> {
+    let mut prepared = Vec::with_capacity(bindings.len());
+    let mut seen = HashSet::with_capacity(bindings.len());
+    let mut total_bytes = initial_payload_bytes;
+    for binding in bindings {
+        let stable_key = validate_stable_text(
+            "invalid_stable_key",
+            "Tool stable keys must contain between 1 and 1024 characters.",
+            &binding.stable_key,
+            1024,
+        )?;
+        if !seen.insert(stable_key.clone()) {
+            return Err(validation(
+                "duplicate_tool_binding",
+                "A staged catalog contains the same tool binding more than once.",
+            ));
+        }
+        let definition_json = match &binding.binding {
+            ToolBinding::OpenapiV1(binding) => {
+                if binding.version != 1 {
+                    return Err(validation(
+                        "invalid_tool_binding",
+                        "The OpenAPI tool binding version is not supported.",
+                    ));
+                }
+                serde_json::to_string(binding)?
+            }
+        };
+        if definition_json.len() > limits.schema {
+            return Err(validation(
+                "tool_binding_too_large",
+                "A tool binding exceeds the serialized-size limit.",
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(definition_json.len())
+            .filter(|size| *size <= limits.aggregate)
+            .ok_or_else(|| {
+                validation(
+                    "catalog_payload_too_large",
+                    "The staged tool bindings exceed the aggregate size limit.",
+                )
+            })?;
+        prepared.push(PreparedToolBinding {
+            stable_key,
+            protocol: binding.binding.protocol(),
+            version: binding.binding.version(),
+            definition_json,
+        });
+    }
+    Ok(prepared)
 }
 
 fn prepare_snapshot_with_limits(
     snapshot: CatalogSnapshot,
     limits: PayloadLimits,
 ) -> Result<PreparedSnapshot, CatalogError> {
-    if snapshot.tools.len() > MAX_ACTIVE_TOOLS_PER_SOURCE {
+    prepare_catalog_content_with_limits(snapshot.artifacts, snapshot.tools, limits)
+}
+
+fn prepare_catalog_content_with_limits(
+    staged_artifacts: Vec<super::StagedArtifact>,
+    staged_tools: Vec<super::StagedTool>,
+    limits: PayloadLimits,
+) -> Result<PreparedSnapshot, CatalogError> {
+    if staged_tools.len() > MAX_ACTIVE_TOOLS_PER_SOURCE {
         return Err(validation(
             "catalog_too_large",
             format!(
@@ -1709,11 +2157,11 @@ fn prepare_snapshot_with_limits(
             ),
         ));
     }
-    validate_artifact_count(snapshot.artifacts.len(), limits.artifact_count)?;
+    validate_artifact_count(staged_artifacts.len(), limits.artifact_count)?;
     let mut budget = PayloadBudget::new(limits);
-    let mut artifact_keys = HashSet::with_capacity(snapshot.artifacts.len());
-    let mut artifacts = Vec::with_capacity(snapshot.artifacts.len());
-    for artifact in snapshot.artifacts {
+    let mut artifact_keys = HashSet::with_capacity(staged_artifacts.len());
+    let mut artifacts = Vec::with_capacity(staged_artifacts.len());
+    for artifact in staged_artifacts {
         let stable_key = validate_stable_text(
             "invalid_artifact_key",
             "Artifact stable keys must contain between 1 and 512 characters.",
@@ -1753,9 +2201,9 @@ fn prepare_snapshot_with_limits(
             .then_with(|| left.stable_key.cmp(&right.stable_key))
     });
 
-    let mut stable_keys = HashSet::with_capacity(snapshot.tools.len());
-    let mut tools = Vec::with_capacity(snapshot.tools.len());
-    for tool in snapshot.tools {
+    let mut stable_keys = HashSet::with_capacity(staged_tools.len());
+    let mut tools = Vec::with_capacity(staged_tools.len());
+    for tool in staged_tools {
         let stable_key = validate_stable_text(
             "invalid_stable_key",
             "Tool stable keys must contain between 1 and 1024 characters.",
@@ -1868,6 +2316,12 @@ fn prepare_snapshot_with_limits(
             "schema_too_large",
             "A staged tool schema exceeds the serialized-size limit.",
         )?;
+        super::schema::compile(&tool.input_schema).map_err(|()| {
+            validation(
+                "invalid_tool_input_schema",
+                "A staged tool input schema is invalid or unsafe.",
+            )
+        })?;
         let output_schema_json = tool
             .output_schema
             .as_ref()
@@ -1904,7 +2358,11 @@ fn prepare_snapshot_with_limits(
         });
     }
     tools.sort_by(|left, right| left.stable_key.cmp(&right.stable_key));
-    Ok(PreparedSnapshot { tools, artifacts })
+    Ok(PreparedSnapshot {
+        tools,
+        artifacts,
+        payload_bytes: budget.consumed,
+    })
 }
 
 fn parse_optional_mode(value: Option<String>) -> Result<Option<ToolMode>, CatalogError> {
@@ -2190,6 +2648,324 @@ fn normalize_sandbox_path(path: &str) -> String {
     path.strip_prefix("tools.").unwrap_or(path).to_owned()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finalize_catalog_apply(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    audit: AuditContext<'_>,
+    source_id: &str,
+    source_path: &str,
+    kind: CatalogApplyKind<'_>,
+    active_tool_count: usize,
+    artifact_count: usize,
+    tombstoned_tool_count: usize,
+    now: i64,
+) -> Result<(i64, i64, i64), CatalogError> {
+    let revisions = match kind {
+        CatalogApplyKind::Initial { .. } => {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT revision, catalog_revision FROM sources WHERE id = ?",
+            )
+            .bind(source_id)
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+        CatalogApplyKind::Refresh => {
+            sqlx::query_as::<_, (i64, i64)>(
+                "UPDATE sources SET revision = revision + 1, \
+             catalog_revision = catalog_revision + 1, health_status = 'healthy', \
+             health_error_code = NULL, updated_at = ?, last_refreshed_at = ? \
+             WHERE id = ? RETURNING revision, catalog_revision",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(source_id)
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+    };
+    let global_revision = bump_global_revision(transaction, now).await?;
+    if let CatalogApplyKind::Initial {
+        source_kind,
+        slug,
+        credential_schema_version,
+    } = kind
+    {
+        insert_audit(
+            transaction,
+            audit,
+            "source.created",
+            Some(source_id),
+            None,
+            Some(source_path),
+            json!({ "kind": source_kind, "slug": slug }),
+            now,
+        )
+        .await?;
+        insert_audit(
+            transaction,
+            audit,
+            "source.credential_changed",
+            Some(source_id),
+            None,
+            Some(source_path),
+            json!({ "schemaVersion": credential_schema_version }),
+            now,
+        )
+        .await?;
+    }
+    insert_audit(
+        transaction,
+        audit,
+        "source.catalog_refreshed",
+        Some(source_id),
+        None,
+        Some(source_path),
+        json!({
+            "catalogRevision": revisions.1,
+            "activeToolCount": active_tool_count,
+            "artifactCount": artifact_count,
+            "tombstonedToolCount": tombstoned_tool_count,
+            "globalRevision": global_revision
+        }),
+        now,
+    )
+    .await?;
+    Ok((revisions.0, revisions.1, global_revision))
+}
+
+async fn apply_artifacts(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    artifacts: &[PreparedArtifact],
+    now: i64,
+) -> Result<(), CatalogError> {
+    let staged_keys = artifacts
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.kind.as_str().to_owned(),
+                artifact.stable_key.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let existing_keys = sqlx::query_as::<_, (String, String)>(
+        "SELECT artifact_kind, stable_key FROM source_artifacts WHERE source_id = ?",
+    )
+    .bind(source_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for artifact in artifacts {
+        sqlx::query(
+            "INSERT INTO source_artifacts \
+             (id, source_id, artifact_kind, stable_key, content_json, revision, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
+             ON CONFLICT(source_id, artifact_kind, stable_key) DO UPDATE SET \
+             content_json = excluded.content_json, revision = source_artifacts.revision + 1, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(source_id)
+        .bind(artifact.kind.as_str())
+        .bind(&artifact.stable_key)
+        .bind(&artifact.content_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    for (kind, stable_key) in existing_keys {
+        if !staged_keys.contains(&(kind.clone(), stable_key.clone())) {
+            sqlx::query(
+                "DELETE FROM source_artifacts \
+                 WHERE source_id = ? AND artifact_kind = ? AND stable_key = ?",
+            )
+            .bind(source_id)
+            .bind(kind)
+            .bind(stable_key)
+            .execute(&mut **transaction)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_tools(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    tools: &[PreparedTool],
+    now: i64,
+) -> Result<Vec<String>, CatalogError> {
+    let existing = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT stable_key, local_name, present FROM tools WHERE source_id = ?",
+    )
+    .bind(source_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let existing_by_key = existing
+        .into_iter()
+        .map(|(stable_key, local_name, present)| (stable_key, (local_name, present != 0)))
+        .collect::<HashMap<_, _>>();
+    let staged_keys = tools
+        .iter()
+        .map(|tool| tool.stable_key.clone())
+        .collect::<HashSet<_>>();
+    validate_tool_history(&existing_by_key, &staged_keys)?;
+    let used_names = existing_by_key
+        .values()
+        .map(|(local_name, _)| local_name.clone())
+        .collect::<HashSet<_>>();
+    let mut name_allocator = NameAllocator::new(used_names);
+    for tool in tools {
+        let local_name = existing_by_key
+            .get(&tool.stable_key)
+            .map(|(local_name, _)| local_name.clone())
+            .unwrap_or_else(|| {
+                let base = normalize_tool_name(&tool.preferred_name);
+                name_allocator.allocate(&base, 128, '_')
+            });
+        sqlx::query(
+            "INSERT INTO tools \
+             (id, source_id, stable_key, local_name, display_name, description, search_description, \
+              search_short_grams, input_schema_json, output_schema_json, input_typescript, \
+              output_typescript, typescript_definitions_json, intrinsic_mode, present, revision, \
+              created_at, updated_at, last_seen_at, tombstoned_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, NULL) \
+             ON CONFLICT(source_id, stable_key) DO UPDATE SET \
+              display_name = excluded.display_name, description = excluded.description, \
+              search_description = excluded.search_description, \
+              search_short_grams = excluded.search_short_grams, \
+              input_schema_json = excluded.input_schema_json, \
+              output_schema_json = excluded.output_schema_json, \
+              input_typescript = excluded.input_typescript, \
+              output_typescript = excluded.output_typescript, \
+              typescript_definitions_json = excluded.typescript_definitions_json, \
+              intrinsic_mode = excluded.intrinsic_mode, present = 1, \
+              revision = tools.revision + 1, updated_at = excluded.updated_at, \
+              last_seen_at = excluded.last_seen_at, tombstoned_at = NULL",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(source_id)
+        .bind(&tool.stable_key)
+        .bind(local_name)
+        .bind(&tool.display_name)
+        .bind(&tool.description)
+        .bind(&tool.search_description)
+        .bind(&tool.search_short_grams)
+        .bind(&tool.input_schema_json)
+        .bind(&tool.output_schema_json)
+        .bind(&tool.input_typescript)
+        .bind(&tool.output_typescript)
+        .bind(&tool.typescript_definitions_json)
+        .bind(tool.intrinsic_mode.as_str())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    let missing = existing_by_key
+        .iter()
+        .filter(|(stable_key, (_, present))| *present && !staged_keys.contains(*stable_key))
+        .map(|(stable_key, _)| stable_key.clone())
+        .collect::<Vec<_>>();
+    for stable_key in &missing {
+        sqlx::query(
+            "UPDATE tools SET present = 0, revision = revision + 1, updated_at = ?, \
+             tombstoned_at = ? WHERE source_id = ? AND stable_key = ? AND present = 1",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(source_id)
+        .bind(stable_key)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(missing)
+}
+
+async fn apply_tool_bindings(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    bindings: &[PreparedToolBinding],
+    now: i64,
+) -> Result<(), CatalogError> {
+    for binding in bindings {
+        let changed = sqlx::query(
+            "INSERT INTO tool_bindings \
+             (tool_id, protocol, binding_version, definition_json, revision, created_at, updated_at) \
+             SELECT id, ?, ?, ?, 0, ?, ? FROM tools \
+             WHERE source_id = ? AND stable_key = ? AND present = 1 \
+             ON CONFLICT(tool_id) DO UPDATE SET protocol = excluded.protocol, \
+             binding_version = excluded.binding_version, \
+             definition_json = excluded.definition_json, revision = tool_bindings.revision + 1, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(binding.protocol)
+        .bind(binding.version)
+        .bind(&binding.definition_json)
+        .bind(now)
+        .bind(now)
+        .bind(source_id)
+        .bind(&binding.stable_key)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(validation(
+                "invalid_tool_binding",
+                "A tool binding does not match an active imported tool.",
+            ));
+        }
+    }
+    sqlx::query(
+        "DELETE FROM tool_bindings WHERE tool_id IN (\
+         SELECT id FROM tools WHERE source_id = ? AND present = 0)",
+    )
+    .bind(source_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_search_indexes(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+) -> Result<(), CatalogError> {
+    for table in ["tool_search", "tool_search_trigram", "tool_search_short"] {
+        let statement = format!("DELETE FROM {table} WHERE source_id = ?");
+        sqlx::query(&statement)
+            .bind(source_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
+    for table in ["tool_search", "tool_search_trigram"] {
+        let statement = format!(
+            "INSERT INTO {table} \
+             (source_id, tool_id, source_slug, local_name, description, sandbox_path) \
+             SELECT tools.source_id, tools.id, replace(sources.slug, '_', ' '), \
+                    replace(tools.local_name, '_', ' '), tools.search_description, \
+                    replace(sources.slug, '_', ' ') || ' ' || replace(tools.local_name, '_', ' ') \
+             FROM tools JOIN sources ON sources.id = tools.source_id \
+             WHERE tools.source_id = ? AND tools.present = 1"
+        );
+        sqlx::query(&statement)
+            .bind(source_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO tool_search_short (source_id, tool_id, grams) \
+         SELECT tools.source_id, tools.id, \
+                sources.search_short_grams || ' ' || tools.search_short_grams \
+         FROM tools JOIN sources ON sources.id = tools.source_id \
+         WHERE tools.source_id = ? AND tools.present = 1",
+    )
+    .bind(source_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn ensure_source_exists(
     transaction: &mut Transaction<'_, sqlx::Sqlite>,
     source_id: &str,
@@ -2350,6 +3126,19 @@ async fn insert_audit_with_limit(
     Ok(())
 }
 
+#[cfg(test)]
+async fn source_kind(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+) -> Result<SourceKind, CatalogError> {
+    let kind = sqlx::query_scalar::<_, String>("SELECT kind FROM sources WHERE id = ?")
+        .bind(source_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(CatalogError::NotFound { entity: "source" })?;
+    SourceKind::from_str(&kind)
+}
+
 fn validate_log_text(label: &str, value: &str, maximum_length: usize) -> Result<(), CatalogError> {
     if value.is_empty() || value.len() > maximum_length || value.contains('\0') {
         Err(validation(
@@ -2402,11 +3191,14 @@ mod tests {
 
     use super::{
         CatalogSnapshot, NameAllocator, PayloadLimits, insert_audit_with_limit,
-        prepare_snapshot_with_limits,
+        prepare_snapshot_and_bindings_with_limits, prepare_snapshot_with_limits,
     };
     use crate::catalog::{
-        ArtifactKind, AuditContext, CatalogError, StagedArtifact, StagedTool, ToolMode,
+        ArtifactKind, AuditContext, CatalogError, CreateSource, SourceKind, StagedArtifact,
+        StagedTool, StagedToolBinding, ToolBinding, ToolMode,
     };
+    use crate::openapi::OpenApiBinding;
+    use crate::{AppConfig, ExecutorApp};
 
     fn empty_snapshot() -> CatalogSnapshot {
         CatalogSnapshot {
@@ -2559,6 +3351,83 @@ mod tests {
                 code: "catalog_payload_too_large",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn snapshot_and_bindings_share_one_aggregate_payload_budget() {
+        let snapshot = CatalogSnapshot {
+            expected_source_revision: 0,
+            expected_credential_revision: None,
+            artifacts: Vec::new(),
+            tools: vec![staged_tool()],
+        };
+        let bindings = vec![StagedToolBinding {
+            stable_key: "tool".to_owned(),
+            binding: ToolBinding::OpenapiV1(OpenApiBinding {
+                version: 1,
+                method: "GET".to_owned(),
+                path_template: "/tool".to_owned(),
+                server_url: format!("https://{}.example.test", "x".repeat(100)),
+                parameters: Vec::new(),
+                request_body: None,
+                security: Vec::new(),
+            }),
+        }];
+        let mut limits = small_limits();
+        limits.schema = 256;
+        limits.aggregate = 1_024;
+        let snapshot_bytes = prepare_snapshot_with_limits(snapshot.clone(), limits)
+            .expect("snapshot should fit independently")
+            .payload_bytes;
+        let binding_bytes = match &bindings[0].binding {
+            ToolBinding::OpenapiV1(binding) => serde_json::to_string(binding)
+                .expect("binding should serialize")
+                .len(),
+        };
+        limits.aggregate = snapshot_bytes + binding_bytes - 1;
+        assert!(prepare_snapshot_with_limits(snapshot.clone(), limits).is_ok());
+        assert!(super::prepare_tool_bindings_with_limits(bindings.clone(), limits, 0).is_ok());
+        assert!(matches!(
+            prepare_snapshot_and_bindings_with_limits(snapshot, bindings, limits),
+            Err(CatalogError::Validation {
+                code: "catalog_payload_too_large",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn binding_replacement_rejects_non_openapi_sources() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("Executor should open");
+        let source = app
+            .catalog()
+            .create_source(
+                CreateSource {
+                    kind: SourceKind::Graphql,
+                    preferred_slug: "graphql".to_owned(),
+                    display_name: "GraphQL".to_owned(),
+                    description: None,
+                    configuration: serde_json::Map::new(),
+                },
+                AuditContext::system(None),
+            )
+            .await
+            .expect("source should create");
+        let error = app
+            .catalog()
+            .replace_tool_bindings(&source.id, Vec::new())
+            .await
+            .expect_err("non-OpenAPI source should reject binding replacement");
+        assert!(matches!(
+            error,
+            CatalogError::Validation {
+                code: "invalid_source_kind",
+                ..
+            }
         ));
     }
 

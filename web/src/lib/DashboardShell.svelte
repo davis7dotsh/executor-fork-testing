@@ -13,13 +13,17 @@
   const navigation = [
     { href: "/sources", label: "Sources", marker: "01" },
     { href: "/tools", label: "Tools", marker: "02" },
-    { href: "/approvals", label: "Approvals", marker: "03", count: "--" },
+    { href: "/approvals", label: "Approvals", marker: "03" },
     { href: "/logs", label: "Request logs", marker: "04" },
     { href: "/tokens", label: "API tokens", marker: "05" },
   ];
   let logoutBusy = $state(false);
   let logoutError = $state<ApiError | null>(null);
   let adminLabel = $derived(auth.username ?? "Administrator");
+
+  function isActive(href: string) {
+    return page.url.pathname === href || page.url.pathname.startsWith(`${href}/`);
+  }
 
   async function logout() {
     logoutBusy = true;
@@ -53,26 +57,20 @@
     <nav aria-label="Dashboard">
       {#each navigation as item}
         <a
-          class:active={page.url.pathname === item.href}
+          class:active={isActive(item.href)}
           href={item.href}
-          aria-current={page.url.pathname === item.href ? "page" : undefined}
+          aria-current={isActive(item.href) ? "page" : undefined}
         >
           <span class="nav-marker">{item.marker}</span>
           <span class="nav-label">{item.label}</span>
-          {#if item.count !== undefined}
-            <span class="nav-count" aria-label="Approval count unavailable">
-              <span aria-hidden="true">{item.count}</span>
-            </span>
-          {/if}
         </a>
       {/each}
     </nav>
 
     <div class="instance-card">
-      <span class="status-dot" aria-hidden="true"></span>
       <div>
         <strong>Local instance</strong>
-        <small>Connected over this origin</small>
+        <small>Self-hosted control plane</small>
       </div>
     </div>
   </aside>
