@@ -102,6 +102,10 @@ describe("MCP stdio source form", () => {
     render(McpStdioSourceForm, { oncreated: vi.fn() });
 
     expect(await screen.findByText("No trusted local templates are configured.")).toBeDefined();
+    expect(screen.getByText(/machine-admin JSON registry selected by/)).toBeDefined();
+    expect(screen.getByText("--mcp-stdio-templates")).toBeDefined();
+    expect(screen.getByText("EXECUTOR_MCP_STDIO_TEMPLATES_FILE")).toBeDefined();
+    expect(document.body.textContent).not.toContain("local CLI");
     expect(screen.queryByRole("button", { name: "Connect source" })).toBeNull();
     expect(screen.getByRole("button", { name: "Refresh templates" })).toBeDefined();
   });

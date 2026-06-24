@@ -1,0 +1,14 @@
+{
+  "templates": [
+    {
+      "name": "filesystem",
+      "executable": "/opt/executor/mcp/filesystem-server",
+      "cwd": "/var/lib/executor",
+      "arguments": ["--stdio"],
+      "environment": {
+        "LOG_LEVEL": "warn"
+      },
+      "secretEnvironment": ["API_TOKEN"]
+    }
+  ]
+}

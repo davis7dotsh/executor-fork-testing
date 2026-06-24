@@ -1,10 +1,10 @@
 name: Publish Desktop App
 run-name: "${{ format('publish desktop {0}', github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}"
 
-# Triggered manually or by publish-executor-package.yml after a CLI release
-# lands. Builds Electron distributables for mac/win/linux with the compiled
-# executor CLI bundled in `resources/executor/`, then attaches them to the GitHub
-# release matching the tag so electron-updater can pick them up.
+# Manually triggered for the archived Electron product. Builds macOS and Linux
+# distributables with the compiled executor CLI bundled in
+# `resources/executor/`, then attaches them to the matching GitHub release for
+# legacy clients.
 
 on:
   workflow_dispatch:
@@ -46,11 +46,6 @@ jobs:
             arch: x64
             platform: linux
             bun-target: bun-linux-x64
-            smoke: true
-          - os: windows-latest
-            arch: x64
-            platform: win
-            bun-target: bun-windows-x64
             smoke: true
 
     runs-on: ${{ matrix.os }}
@@ -101,7 +96,7 @@ jobs:
         env:
           BUN_TARGET: ${{ matrix.bun-target }}
         run: bun ./scripts/build-sidecar.ts
-        working-directory: apps/desktop
+        working-directory: legacy/desktop
 
       # Gate the release on the compiled binary actually booting. v1.5.0/.1
       # shipped local-server binaries that died on launch (missing libsql native
@@ -110,7 +105,7 @@ jobs:
       - name: Smoke test bundled executor
         if: matrix.smoke
         run: bun run test:smoke
-        working-directory: apps/desktop
+        working-directory: legacy/desktop
 
       - name: Build Electron main/preload/renderer
         env:
@@ -119,7 +114,7 @@ jobs:
           # is compiled out and dumps stay local.
           DESKTOP_SENTRY_DSN: ${{ vars.DESKTOP_SENTRY_DSN }}
         run: bunx --bun electron-vite build
-        working-directory: apps/desktop
+        working-directory: legacy/desktop
 
       - name: Stage Apple API key (mac signing + notarization)
         if: matrix.platform == 'mac' && env.APPLE_API_KEY != ''
@@ -149,7 +144,7 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: bunx --bun electron-builder --${{ matrix.platform }} --${{ matrix.arch }} --publish never --config electron-builder.config.ts
-        working-directory: apps/desktop
+        working-directory: legacy/desktop
 
       # The two mac legs each emit a latest-mac.yml listing only their own
       # arch. Rename per-arch here; the release job merges them back into the
@@ -159,20 +154,19 @@ jobs:
       - name: Rename mac update manifest per arch
         if: matrix.platform == 'mac'
         shell: bash
-        run: mv apps/desktop/dist/latest-mac.yml "apps/desktop/dist/latest-mac-${{ matrix.arch }}.yml"
+        run: mv legacy/desktop/dist/latest-mac.yml "legacy/desktop/dist/latest-mac-${{ matrix.arch }}.yml"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
-            apps/desktop/dist/*.dmg
-            apps/desktop/dist/*.zip
-            apps/desktop/dist/*.exe
-            apps/desktop/dist/*.AppImage
-            apps/desktop/dist/*.deb
-            apps/desktop/dist/*.rpm
-            apps/desktop/dist/latest*.yml
+            legacy/desktop/dist/*.dmg
+            legacy/desktop/dist/*.zip
+            legacy/desktop/dist/*.AppImage
+            legacy/desktop/dist/*.deb
+            legacy/desktop/dist/*.rpm
+            legacy/desktop/dist/latest*.yml
           if-no-files-found: warn
 
   release:
@@ -221,7 +215,7 @@ jobs:
             echo "Uploading: $file"
             gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
           done < <(find artifacts -type f \
-            \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" \
+            \( -name "*.dmg" -o -name "*.zip" \
             -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
             -o -name "latest*.yml" \))
 

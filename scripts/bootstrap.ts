@@ -31,4 +31,4 @@ if (!existsSync(resolve(repoRoot, "node_modules/.bin/vitest"))) {
   throw new Error("bootstrap: vitest missing after install — bun install likely failed");
 }
 
-console.log("\n[bootstrap] done — `cd e2e && bun run test` runs the full suite.");
+console.log("\n[bootstrap] done. See RUNNING.md for current verification commands.");

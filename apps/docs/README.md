@@ -20,7 +20,7 @@ server hot-reloads.
 
 Mintlify hosts the built site at `executor.mintlify.dev`. The Executor Cloud
 worker reverse-proxies it onto the first-party origin at `executor.sh/docs`
-(see `apps/cloud/src/edge/docs.ts`), so the public docs live at
+(see `legacy/cloud/src/edge/docs.ts`), so the public docs live at
 `executor.sh/docs` instead of a `*.mintlify.dev` subdomain.
 
 Mintlify is configured to host under the `/docs` subpath (Settings → Domain

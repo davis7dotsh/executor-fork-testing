@@ -2,13 +2,13 @@
 
 The `executor` binary is both the self-hosted server and its local client. Client
 commands connect to a running server. They do not open the SQLite database or
-start another server.
+start another server. The server never auto-starts for a client command.
 
 ## Connection
 
 The default server is `http://127.0.0.1:4788`. Override it with
-`--base-url` or `EXECUTOR_BASE_URL`. Create an API token in the dashboard and
-provide it through `EXECUTOR_API_TOKEN`:
+`--base-url` or `EXECUTOR_BASE_URL`. Sign in as the administrator, create an
+API token under **API tokens**, and provide it through `EXECUTOR_API_TOKEN`:
 
 ```sh
 export EXECUTOR_API_TOKEN='copy-the-token-from-the-dashboard'
@@ -21,14 +21,22 @@ Authorization header. Executor never puts them in URLs.
 
 Plain HTTP is accepted only for localhost and literal loopback addresses. Use
 HTTPS for another host. `--allow-insecure-http` is an explicit escape hatch for
-a trusted network where transport security is handled elsewhere.
+an authenticated and encrypted tunnel or equivalent transport that protects
+the complete path. It sends the reusable bearer token over clear HTTP, so a
+private LAN by itself is not sufficient protection.
 
 Use `--json` for machine-readable output. Errors and approval instructions go
 to stderr, leaving stdout available for JSON and MCP protocol messages.
 
+Connection, authentication, validation, and protocol failures exit nonzero. An
+upstream tool failure is a completed call: `--json` prints its result envelope
+and the process exits successfully. Automation must inspect the envelope's
+`ok` and `error` fields instead of treating exit status alone as tool success.
+
 ## Tools
 
-Search the enabled global catalog:
+Search the non-disabled global catalog. Enabled and Ask tools are discoverable;
+Disabled tools are omitted:
 
 ```sh
 executor tools search issue
@@ -44,6 +52,10 @@ object. Prefix a filename with `@` to read the object from disk.
 executor call github.issues_create '{"owner":"acme","repo":"app","title":"Bug"}'
 executor call github issues_create @arguments.json
 ```
+
+Paths contain exactly the source slug and local tool name. A leading `tools.`
+is accepted for a dotted path, but deeper legacy resource or method segments
+are not.
 
 Each call gets one idempotency key that remains stable across safe HTTP retries. An
 Ask-mode tool prints and opens the clean dashboard approval URL, then polls as
@@ -65,7 +77,9 @@ already be running.
 
 ## Dashboard
 
-Open the dashboard without putting credentials in the URL:
+Open the dashboard without putting credentials in the URL. This command does
+not require an API token. The browser still requires the administrator login
+cookie:
 
 ```sh
 executor open

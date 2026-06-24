@@ -7,10 +7,10 @@ const config: KnipConfig = {
     "apps/local": {
       entry: ["src/server.ts", "src/routes/**/*.tsx", "src/server/*.ts"],
     },
-    "apps/cloud": {
+    "legacy/cloud": {
       entry: ["src/server.ts", "src/routes/**/*.tsx", "src/server/*.ts"],
     },
-    "apps/desktop": {
+    "legacy/desktop": {
       entry: ["src/preload.ts"],
     },
     "apps/marketing": {

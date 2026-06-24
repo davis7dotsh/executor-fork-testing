@@ -20,7 +20,7 @@ for (const name of rootTargets) {
 
 const nestedTargets = new Set(["node_modules", "dist", ".turbo", ".output", ".astro"]);
 const nestedGlobs = /\.tsbuildinfo$/;
-const searchRoots = ["apps", "packages"];
+const searchRoots = ["apps", "legacy", "packages"];
 const maxDepth = 5;
 
 function clean(dir: string, depth: number) {

@@ -9,7 +9,7 @@ import react from "@astrojs/react";
 import cloudflare from "@astrojs/cloudflare";
 
 // Single source of truth for public build-time vars: wrangler.toml `[vars]`.
-// Mirrors apps/cloud, which reads its wrangler.jsonc vars the same way. The
+// Mirrors legacy/cloud, which reads its wrangler.jsonc vars the same way. The
 // PUBLIC_ ones are inlined into the client bundle via Vite `define`, so the
 // browser PostHog SDK gets the key at build time; they also remain runtime
 // Worker bindings.

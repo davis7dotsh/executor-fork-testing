@@ -28,7 +28,7 @@ interface AppPluginOptions {
 /**
  * Vite plugin bundle for the executor React app.
  *
- * Layered into apps/local's vite config (web build) and apps/desktop's
+ * Layered into apps/local's vite config (web build) and legacy/desktop's
  * electron.vite renderer config. Consumers must pass `executorConfigPath`
  * so plugin client bundles get included — see option docs above.
  *

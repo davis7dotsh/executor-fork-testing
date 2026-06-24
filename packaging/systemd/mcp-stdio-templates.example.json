@@ -1,0 +1,14 @@
+{
+  "templates": [
+    {
+      "name": "example",
+      "executable": "/usr/local/libexec/executor/example-mcp-server",
+      "cwd": "/var/lib/executor/mcp/example",
+      "arguments": ["--stdio"],
+      "environment": {
+        "LOG_LEVEL": "warn"
+      },
+      "secretEnvironment": ["API_TOKEN"]
+    }
+  ]
+}

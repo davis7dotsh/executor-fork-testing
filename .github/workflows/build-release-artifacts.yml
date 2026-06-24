@@ -1,0 +1,214 @@
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: 1.3.11
+  RUST_VERSION: 1.96.0
+
+jobs:
+  notices:
+    name: Generate third-party notices
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Generate dependency license inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-about --version 0.9.0 --locked
+          cargo about generate about.hbs > THIRD_PARTY_LICENSES.html
+
+      - name: Upload notices
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-license-notices
+          path: |
+            THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+          compression-level: 9
+          overwrite: true
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: notices
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            smoke: true
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            smoke: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            smoke: true
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            smoke: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install web dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download third-party notices
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-license-notices
+          path: ${{ runner.temp }}/release-metadata
+
+      - name: Build embedded web application
+        run: bun run --cwd web build
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "${{ matrix.target }}"
+          rustup override set "$RUST_VERSION"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Smoke test native binary
+        if: matrix.smoke
+        run: "target/${{ matrix.target }}/release/executor --help"
+
+      - name: Package binary and checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact="executor-${{ matrix.target }}"
+          archive="${artifact}.tar.gz"
+          stage="$RUNNER_TEMP/$artifact"
+          output="$RUNNER_TEMP/release-artifacts"
+
+          mkdir -p "$stage" "$output"
+          install -m 0755 "target/${{ matrix.target }}/release/executor" "$stage/executor"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          install -m 0644 \
+            "$RUNNER_TEMP/release-metadata/THIRD_PARTY_LICENSES.html" \
+            "$stage/THIRD_PARTY_LICENSES.html"
+          install -m 0644 \
+            web/build/THIRD_PARTY_JAVASCRIPT_LICENSES.json \
+            "$stage/THIRD_PARTY_JAVASCRIPT_LICENSES.json"
+          tar -C "$stage" -czf "$output/$archive" \
+            executor LICENSE THIRD_PARTY_LICENSES.html \
+            THIRD_PARTY_JAVASCRIPT_LICENSES.json
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$output" && sha256sum "$archive" > "$archive.sha256")
+          else
+            (cd "$output" && shasum -a 256 "$archive" > "$archive.sha256")
+          fi
+
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "output=$output" >> "$GITHUB_OUTPUT"
+
+      - name: Attest release archive provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: ${{ steps.package.outputs.output }}/${{ steps.package.outputs.artifact }}.tar.gz
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: |
+            ${{ steps.package.outputs.output }}/${{ steps.package.outputs.artifact }}.tar.gz
+            ${{ steps.package.outputs.output }}/${{ steps.package.outputs.artifact }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  checksums:
+    name: Assemble checksum manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Download target artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release-artifacts
+          pattern: executor-*-*-*
+          merge-multiple: true
+
+      - name: Verify archives and assemble manifest
+        shell: bash
+        working-directory: release-artifacts
+        run: |
+          set -euo pipefail
+
+          expected_targets=(
+            aarch64-apple-darwin
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+          )
+
+          : > SHA256SUMS
+          for target in "${expected_targets[@]}"; do
+            sidecar="executor-${target}.tar.gz.sha256"
+            test -f "executor-${target}.tar.gz"
+            test -f "$sidecar"
+            cat "$sidecar" >> SHA256SUMS
+          done
+
+          sha256sum --check SHA256SUMS
+
+      - name: Upload complete release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-release-artifacts
+          path: release-artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14

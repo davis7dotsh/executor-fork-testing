@@ -135,7 +135,7 @@ const wrapPromiseExecutor = (pe: PromiseExecutor): EffectExecutor => {
 /**
  * Promise-wrap an Effect-native `ExecutionEngine` (from `./engine`).
  * Exposed separately so callers that already hold an Effect engine
- * (apps/cloud's execution-stack composes both) can convert it for hosts
+ * (legacy/cloud's execution-stack composes both) can convert it for hosts
  * that need the Promise surface (host-mcp).
  */
 export const toPromiseExecutionEngine = <E extends Cause.YieldableError>(

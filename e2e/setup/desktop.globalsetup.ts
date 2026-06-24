@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-const appsDesktop = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appsDesktop = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 
 export default function setup() {
   execFileSync("bun", ["run", "--filter", "@executor-js/local", "build"], {

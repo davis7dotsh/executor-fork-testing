@@ -17,9 +17,9 @@ ignorePaths = [
 name = "wrdn-authz"
 remote = "getsentry/warden-skills"
 paths = [
-  "apps/cloud/src/auth/**/*.ts",
-  "apps/cloud/src/api/**/*.ts",
-  "apps/cloud/src/routes/**/*.tsx",
+  "legacy/cloud/src/auth/**/*.ts",
+  "legacy/cloud/src/api/**/*.ts",
+  "legacy/cloud/src/routes/**/*.tsx",
   "packages/core/api/src/**/*.ts",
 ]
 
@@ -39,8 +39,8 @@ paths = [
 name = "wrdn-data-exfil"
 remote = "getsentry/warden-skills"
 paths = [
-  "apps/cloud/src/api/**/*.ts",
-  "apps/cloud/src/routes/**/*.tsx",
+  "legacy/cloud/src/api/**/*.ts",
+  "legacy/cloud/src/routes/**/*.tsx",
   "apps/local/src/server/**/*.ts",
   "packages/core/storage-*/src/**/*.ts",
   "packages/plugins/**/src/**/*.ts",
@@ -51,8 +51,8 @@ paths = [
 name = "wrdn-pii"
 remote = "getsentry/warden-skills"
 paths = [
-  "apps/cloud/src/**/*.ts",
-  "apps/cloud/src/**/*.tsx",
+  "legacy/cloud/src/**/*.ts",
+  "legacy/cloud/src/**/*.tsx",
   "apps/local/src/**/*.ts",
   "apps/local/src/**/*.tsx",
   "packages/core/storage-*/src/**/*.ts",

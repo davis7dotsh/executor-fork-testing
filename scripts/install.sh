@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP=executor
-REPO=RhysSullivan/executor
 
-MUTED='\033[0;2m'
-RED='\033[0;31m'
-ORANGE='\033[38;5;214m'
-NC='\033[0m'
+APP="executor"
+REPOSITORY="${EXECUTOR_REPOSITORY:-RhysSullivan/executor}"
+INSTALL_DIR="${EXECUTOR_INSTALL_DIR:-$HOME/.executor/bin}"
+requested_version="${VERSION:-}"
+binary_path=""
+local_archive_path=""
+local_checksum_path=""
+no_modify_path=false
 
 usage() {
     cat <<EOF
@@ -16,20 +18,28 @@ Usage: install.sh [options]
 
 Options:
     -h, --help              Display this help message
-    -v, --version <version> Install a specific version (e.g. 1.4.12)
+    -v, --version <version> Install a specific version, such as 2.0.0
     -b, --binary <path>     Install from a local binary instead of downloading
-        --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
+    -a, --archive <path>    Install a release archive from disk
+        --checksum <path>   Checksum sidecar for --archive (default: <path>.sha256)
+        --no-modify-path    Do not modify shell configuration files
+
+Environment:
+    EXECUTOR_INSTALL_DIR    Binary directory (default: \$HOME/.executor/bin)
+    EXECUTOR_REPOSITORY     GitHub owner/repository for downloads
+    VERSION                 Version to install when --version is omitted
 
 Examples:
-    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash
-    curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash -s -- --version 1.4.12
-    ./install.sh --binary /path/to/executor
+    curl -fsSL https://raw.githubusercontent.com/${REPOSITORY}/main/scripts/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/${REPOSITORY}/main/scripts/install.sh | bash -s -- --version 2.0.0
+    ./scripts/install.sh --binary ./target/release/executor
 EOF
 }
 
-requested_version=${VERSION:-}
-no_modify_path=false
-binary_path=""
+fail() {
+    printf 'Error: %s\n' "$1" >&2
+    exit 1
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,250 +48,259 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -v|--version)
-            if [[ -n "${2:-}" ]]; then
-                requested_version="$2"
-                shift 2
-            else
-                echo -e "${RED}Error: --version requires a version argument${NC}" >&2
-                exit 1
-            fi
+            [[ -n "${2:-}" ]] || fail "--version requires a version"
+            requested_version="$2"
+            shift 2
             ;;
         -b|--binary)
-            if [[ -n "${2:-}" ]]; then
-                binary_path="$2"
-                shift 2
-            else
-                echo -e "${RED}Error: --binary requires a path argument${NC}" >&2
-                exit 1
-            fi
+            [[ -n "${2:-}" ]] || fail "--binary requires a path"
+            binary_path="$2"
+            shift 2
+            ;;
+        -a|--archive)
+            [[ -n "${2:-}" ]] || fail "--archive requires a path"
+            local_archive_path="$2"
+            shift 2
+            ;;
+        --checksum)
+            [[ -n "${2:-}" ]] || fail "--checksum requires a path"
+            local_checksum_path="$2"
+            shift 2
             ;;
         --no-modify-path)
             no_modify_path=true
             shift
             ;;
         *)
-            echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
-            shift
+            fail "unknown option: $1"
             ;;
     esac
 done
 
-INSTALL_DIR="${EXECUTOR_INSTALL_DIR:-$HOME/.executor/bin}"
-mkdir -p "$INSTALL_DIR"
+if [[ -n "$binary_path" && -n "$local_archive_path" ]]; then
+    fail "--binary and --archive cannot be used together"
+fi
+if [[ -n "$local_checksum_path" && -z "$local_archive_path" ]]; then
+    fail "--checksum requires --archive"
+fi
 
-print_message() {
-    local level=$1 message=$2 color=""
-    case "$level" in
-        info) color="${NC}" ;;
-        warning) color="${ORANGE}" ;;
-        error) color="${RED}" ;;
-    esac
-    echo -e "${color}${message}${NC}"
-}
+case "$REPOSITORY" in
+    ''|/*|*/|*/*/*|*[!A-Za-z0-9._/-]*)
+        fail "EXECUTOR_REPOSITORY must be an owner/repository name"
+        ;;
+esac
+[[ "$INSTALL_DIR" == /* ]] || fail "EXECUTOR_INSTALL_DIR must be an absolute path"
+case "$INSTALL_DIR" in
+    *:*|*$'\n'*|*$'\r'*) fail "EXECUTOR_INSTALL_DIR cannot contain colons or line breaks" ;;
+esac
 
-if [[ -n "$binary_path" ]]; then
-    if [[ ! -f "$binary_path" ]]; then
-        print_message error "Error: binary not found at $binary_path"
-        exit 1
-    fi
-    specific_version="local"
-else
-    raw_os=$(uname -s)
-    case "$raw_os" in
-        Darwin*) os="darwin" ;;
-        Linux*) os="linux" ;;
-        MINGW*|MSYS*|CYGWIN*) os="windows" ;;
-        *)
-            print_message error "Unsupported OS: $raw_os"
-            exit 1
-            ;;
-    esac
+case "${OSTYPE:-}" in
+    darwin*) platform="apple-darwin" ;;
+    linux*) platform="unknown-linux-gnu" ;;
+    *) fail "Executor release binaries support only Linux and macOS" ;;
+esac
 
-    arch=$(uname -m)
-    case "$arch" in
-        aarch64|arm64) arch="arm64" ;;
-        x86_64|amd64) arch="x64" ;;
-        *)
-            print_message error "Unsupported architecture: $arch"
-            exit 1
-            ;;
-    esac
+machine="$(uname -m)"
+case "$machine" in
+    x86_64|amd64) architecture="x86_64" ;;
+    arm64|aarch64) architecture="aarch64" ;;
+    *) fail "unsupported architecture: $machine" ;;
+esac
 
-    # Apple Silicon under Rosetta reports x64 — install the native arm64 build.
-    if [[ "$os" == "darwin" && "$arch" == "x64" ]]; then
-        if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" == "1" ]]; then
-            arch="arm64"
-        fi
-    fi
-
-    is_musl=false
-    if [[ "$os" == "linux" ]]; then
-        if [[ -f /etc/alpine-release ]]; then
-            is_musl=true
-        elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-            is_musl=true
-        fi
-    fi
-
-    target="${os}-${arch}"
-    if [[ "$is_musl" == "true" ]]; then
-        target="${target}-musl"
-    fi
-
-    archive_ext=".zip"
-    if [[ "$os" == "linux" ]]; then
-        archive_ext=".tar.gz"
-    fi
-
-    filename="${APP}-${target}${archive_ext}"
-
-    if [[ "$os" == "linux" ]]; then
-        if ! command -v tar >/dev/null 2>&1; then
-            print_message error "Error: 'tar' is required but not installed."
-            exit 1
-        fi
-    else
-        if ! command -v unzip >/dev/null 2>&1; then
-            print_message error "Error: 'unzip' is required but not installed."
-            exit 1
-        fi
-    fi
-
-    if [[ -z "$requested_version" ]]; then
-        url="https://github.com/${REPO}/releases/latest/download/${filename}"
-        specific_version=$(
-            curl -s "https://api.github.com/repos/${REPO}/releases/latest" \
-                | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p'
-        )
-        if [[ -z "$specific_version" ]]; then
-            print_message error "Failed to fetch latest version metadata"
-            exit 1
-        fi
-    else
-        requested_version="${requested_version#v}"
-        url="https://github.com/${REPO}/releases/download/v${requested_version}/${filename}"
-        specific_version="$requested_version"
-
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" \
-            "https://github.com/${REPO}/releases/tag/v${requested_version}")
-        if [[ "$http_status" == "404" ]]; then
-            print_message error "Error: release v${requested_version} not found"
-            print_message info "${MUTED}Available releases: https://github.com/${REPO}/releases${NC}"
-            exit 1
-        fi
+if [[ "$platform" == "apple-darwin" && "$architecture" == "x86_64" ]]; then
+    if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0')" == "1" ]]; then
+        architecture="aarch64"
     fi
 fi
 
-check_existing_version() {
-    if command -v executor >/dev/null 2>&1; then
-        local installed
-        installed=$(executor --version 2>/dev/null || echo "")
-        if [[ "$installed" == "$specific_version" ]]; then
-            print_message info "${MUTED}Version ${NC}${specific_version}${MUTED} already installed${NC}"
-            exit 0
-        fi
-        print_message info "${MUTED}Replacing installed version ${NC}${installed}"
-    fi
+target="${architecture}-${platform}"
+archive="${APP}-${target}.tar.gz"
+
+make_temp_dir() {
+    mktemp -d "${TMPDIR:-/tmp}/${APP}-install.XXXXXXXX"
 }
 
-download_and_install() {
-    print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}${specific_version}"
-    local tmp_dir
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/${APP}_install_XXXXXXXXXX")
-    trap 'rm -rf "$tmp_dir"' RETURN
+verify_checksum() {
+    local checksum_file=$1 archive_path=$2 expected actual
+    expected="$(awk 'NF { print $1; exit }' "$checksum_file")"
+    [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || fail "release checksum is malformed"
 
-    curl -# -L -o "${tmp_dir}/${filename}" "$url"
-
-    if [[ "$os" == "linux" ]]; then
-        tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$archive_path" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$archive_path" | awk '{ print $1 }')"
     else
-        unzip -q "${tmp_dir}/${filename}" -d "$tmp_dir"
+        fail "sha256sum or shasum is required to verify the release"
     fi
 
-    # The archive is flat — the binary plus sidecars (emscripten-module.wasm,
-    # keyring.node) sit at the root. Copy them all into INSTALL_DIR so the
-    # binary's relative-path lookups still resolve.
-    rm -f "${tmp_dir}/${filename}"
-    cp -R "${tmp_dir}/." "${INSTALL_DIR}/"
+    [[ "$actual" == "$expected" ]] || fail "release checksum verification failed"
+}
 
-    chmod 755 "${INSTALL_DIR}/${APP}"
-    rm -rf "$tmp_dir"
+install_binary() {
+    local source=$1 temporary
+    mkdir -p "$INSTALL_DIR"
+    temporary="$(mktemp "${INSTALL_DIR}/.${APP}.XXXXXXXX")"
+    trap 'rm -f "$temporary"' RETURN
+    cp "$source" "$temporary"
+    chmod 0755 "$temporary"
+    mv -f "$temporary" "${INSTALL_DIR}/${APP}"
     trap - RETURN
 }
 
-install_from_binary() {
-    print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}from: ${NC}${binary_path}"
-    cp "$binary_path" "${INSTALL_DIR}/${APP}"
-    chmod 755 "${INSTALL_DIR}/${APP}"
+install_support_file() {
+    local source=$1 destination=$2 temporary
+    temporary="$(mktemp "${INSTALL_DIR}/.${destination}.XXXXXXXX")"
+    trap 'rm -f "$temporary"' RETURN
+    cp "$source" "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "${INSTALL_DIR}/${destination}"
+    trap - RETURN
 }
 
 if [[ -n "$binary_path" ]]; then
-    install_from_binary
+    [[ -f "$binary_path" ]] || fail "binary not found at $binary_path"
+    install_binary "$binary_path"
 else
-    check_existing_version
-    download_and_install
+    command -v tar >/dev/null 2>&1 || fail "tar is required"
+
+    temporary_directory="$(make_temp_dir)"
+    trap 'rm -rf "$temporary_directory"' EXIT
+    if [[ -n "$local_archive_path" ]]; then
+        [[ -f "$local_archive_path" ]] || fail "archive not found at $local_archive_path"
+        archive_path="$local_archive_path"
+        checksum_path="${local_checksum_path:-${local_archive_path}.sha256}"
+        [[ -f "$checksum_path" ]] || fail "checksum not found at $checksum_path"
+    else
+        command -v curl >/dev/null 2>&1 || fail "curl is required"
+        requested_version="${requested_version#v}"
+        if [[ -n "$requested_version" ]]; then
+            case "$requested_version" in
+                *[!A-Za-z0-9._-]*) fail "the requested version contains unsafe characters" ;;
+            esac
+            release_base="https://github.com/${REPOSITORY}/releases/download/v${requested_version}"
+            version_label="v${requested_version}"
+        else
+            release_base="https://github.com/${REPOSITORY}/releases/latest/download"
+            version_label="latest"
+        fi
+        archive_path="${temporary_directory}/${archive}"
+        checksum_path="${archive_path}.sha256"
+
+        printf 'Downloading Executor %s for %s\n' "$version_label" "$target"
+        curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --max-filesize 268435456 \
+            --output "$archive_path" "${release_base}/${archive}"
+        curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --max-filesize 1048576 \
+            --output "$checksum_path" "${release_base}/${archive}.sha256"
+    fi
+    [[ "$(wc -c < "$archive_path")" -le 268435456 ]] \
+        || fail "release archive exceeds 256 MiB"
+    [[ "$(wc -c < "$checksum_path")" -le 1048576 ]] \
+        || fail "release checksum exceeds 1 MiB"
+    verify_checksum "$checksum_path" "$archive_path"
+
+    members_path="${temporary_directory}/archive-members.txt"
+    (
+        ulimit -f 2048
+        ulimit -t 30
+        tar -tzf "$archive_path" > "$members_path"
+    )
+    archive_members="$(< "$members_path")"
+    expected_members=$'executor\nLICENSE\nTHIRD_PARTY_LICENSES.html\nTHIRD_PARTY_JAVASCRIPT_LICENSES.json'
+    [[ "$archive_members" == "$expected_members" ]] \
+        || fail "release archive has unexpected members"
+    verbose_members_path="${temporary_directory}/archive-members-verbose.txt"
+    (
+        ulimit -f 2048
+        ulimit -t 30
+        tar -tvzf "$archive_path" > "$verbose_members_path"
+    )
+    while IFS= read -r member; do
+        [[ "${member:0:1}" == "-" ]] \
+            || fail "release archive members must be regular files"
+    done < "$verbose_members_path"
+
+    extracted_directory="${temporary_directory}/extracted"
+    mkdir "$extracted_directory"
+    extract_member() {
+        local member=$1 file_blocks=$2
+        (
+            ulimit -f "$file_blocks"
+            ulimit -t 60
+            tar -xOzf "$archive_path" "$member" \
+                > "${extracted_directory}/${member}"
+        )
+    }
+    extract_member executor 524288
+    extract_member LICENSE 4096
+    extract_member THIRD_PARTY_LICENSES.html 131072
+    extract_member THIRD_PARTY_JAVASCRIPT_LICENSES.json 131072
+
+    extracted_binary="${extracted_directory}/${APP}"
+    [[ -f "$extracted_binary" && -s "$extracted_binary" && ! -L "$extracted_binary" ]] \
+        || fail "release archive does not contain a regular executor binary"
+    for support_file in \
+        LICENSE \
+        THIRD_PARTY_LICENSES.html \
+        THIRD_PARTY_JAVASCRIPT_LICENSES.json; do
+        [[ -s "${extracted_directory}/${support_file}" ]] \
+            || fail "release archive contains an empty support file"
+    done
+    install_binary "$extracted_binary"
+    install_support_file "${extracted_directory}/LICENSE" LICENSE
+    install_support_file \
+        "${extracted_directory}/THIRD_PARTY_LICENSES.html" \
+        THIRD_PARTY_LICENSES.html
+    install_support_file \
+        "${extracted_directory}/THIRD_PARTY_JAVASCRIPT_LICENSES.json" \
+        THIRD_PARTY_JAVASCRIPT_LICENSES.json
 fi
 
 add_to_path() {
     local config_file=$1 command=$2
-    if grep -Fxq "$command" "$config_file"; then
-        print_message info "${MUTED}Already in ${NC}${config_file}"
-    elif [[ -w "$config_file" ]]; then
-        echo -e "\n# executor" >> "$config_file"
-        echo "$command" >> "$config_file"
-        print_message info "${MUTED}Added ${NC}${APP} ${MUTED}to \$PATH in ${NC}${config_file}"
+    if grep -Fqx "$command" "$config_file"; then
+        return
+    fi
+    if [[ -w "$config_file" ]]; then
+        printf '\n# Executor\n%s\n' "$command" >> "$config_file"
+        printf 'Added Executor to PATH in %s\n' "$config_file"
     else
-        print_message warning "Manually add to ${config_file}:"
-        print_message info "  $command"
+        printf 'Add this to %s:\n  %s\n' "$config_file" "$command"
     fi
 }
 
-XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-current_shell=$(basename "${SHELL:-bash}")
+if [[ "$no_modify_path" != "true" && ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+    current_shell="$(basename "${SHELL:-bash}")"
+    case "$current_shell" in
+        fish)
+            config_file="$HOME/.config/fish/config.fish"
+            quoted_install_dir=${INSTALL_DIR//\\/\\\\}
+            quoted_install_dir=${quoted_install_dir//\'/\\\'}
+            path_command="fish_add_path -- '$quoted_install_dir'"
+            ;;
+        zsh)
+            config_file="${ZDOTDIR:-$HOME}/.zshrc"
+            printf -v quoted_install_dir '%q' "$INSTALL_DIR"
+            path_command="export PATH=$quoted_install_dir:\$PATH"
+            ;;
+        *)
+            config_file="$HOME/.bashrc"
+            printf -v quoted_install_dir '%q' "$INSTALL_DIR"
+            path_command="export PATH=$quoted_install_dir:\$PATH"
+            ;;
+    esac
 
-case "$current_shell" in
-    fish)
-        config_files="$HOME/.config/fish/config.fish"
-        ;;
-    zsh)
-        config_files="${ZDOTDIR:-$HOME}/.zshrc ${ZDOTDIR:-$HOME}/.zshenv $XDG_CONFIG_HOME/zsh/.zshrc $XDG_CONFIG_HOME/zsh/.zshenv"
-        ;;
-    bash)
-        config_files="$HOME/.bashrc $HOME/.bash_profile $HOME/.profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
-        ;;
-    *)
-        config_files="$HOME/.bashrc $HOME/.bash_profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
-        ;;
-esac
-
-if [[ "$no_modify_path" != "true" ]]; then
-    config_file=""
-    for file in $config_files; do
-        if [[ -f "$file" ]]; then
-            config_file=$file
-            break
-        fi
-    done
-
-    if [[ -z "$config_file" ]]; then
-        print_message warning "No config file found for ${current_shell}. Add manually:"
-        print_message info "  export PATH=${INSTALL_DIR}:\$PATH"
-    elif [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        case "$current_shell" in
-            fish) add_to_path "$config_file" "fish_add_path $INSTALL_DIR" ;;
-            *)    add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH" ;;
-        esac
+    if [[ -f "$config_file" ]]; then
+        add_to_path "$config_file" "$path_command"
+    else
+        printf 'Add Executor to PATH:\n  %s\n' "$path_command"
     fi
 fi
 
-if [[ -n "${GITHUB_ACTIONS-}" && "${GITHUB_ACTIONS}" == "true" ]]; then
-    echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-    print_message info "${MUTED}Added ${NC}${INSTALL_DIR}${MUTED} to \$GITHUB_PATH${NC}"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '%s\n' "$INSTALL_DIR" >> "$GITHUB_PATH"
 fi
 
-print_message info ""
-print_message info "${MUTED}Installed ${NC}${APP} ${MUTED}to ${NC}${INSTALL_DIR}/${APP}"
-print_message info ""
-print_message info "${MUTED}Get started:${NC}"
-print_message info "  ${APP} web"
-print_message info ""
+printf '\nInstalled Executor at %s\n' "${INSTALL_DIR}/${APP}"
+printf 'Start it with: executor server\n'

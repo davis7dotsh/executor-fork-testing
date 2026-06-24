@@ -46,8 +46,8 @@ Authz on cloud/API surfaces:
 
 ```bash
 npm exec --yes --package=@sentry/warden -- \
-  warden "apps/cloud/src/auth/**/*.ts" "apps/cloud/src/api/**/*.ts" \
-  "apps/cloud/src/routes/**/*.tsx" "packages/core/api/src/**/*.ts" \
+  warden "legacy/cloud/src/auth/**/*.ts" "legacy/cloud/src/api/**/*.ts" \
+  "legacy/cloud/src/routes/**/*.tsx" "packages/core/api/src/**/*.ts" \
   --skill wrdn-authz --fail-on off --report-on low --min-confidence low \
   --parallel 2 --log -o .warden-runs/authz.jsonl
 ```
@@ -69,7 +69,7 @@ npm exec --yes --package=@sentry/warden -- \
 Data exfiltration on backend/API/storage/plugin SDK surfaces:
 
 ```bash
-find apps/cloud/src/api apps/cloud/src/auth apps/local/src/server \
+find legacy/cloud/src/api legacy/cloud/src/auth apps/local/src/server \
   packages/core/api/src packages/core/storage-core/src packages/core/storage-file/src \
   packages/core/storage-postgres/src packages/core/storage-drizzle/src \
   packages/plugins/mcp/src packages/plugins/openapi/src packages/plugins/graphql/src \

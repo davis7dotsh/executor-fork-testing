@@ -25,7 +25,7 @@
 //      once; catches any cause that slipped past the typed channel and
 //      produces the same `InternalError({ traceId })` shape.
 //
-// Distinct from `apps/cloud/src/services/telemetry.ts` — that's the
+// Distinct from `legacy/cloud/src/services/telemetry.ts`, that's the
 // OTEL bridge wiring spans to Axiom; this is exception capture in the
 // Sentry sense.
 // ---------------------------------------------------------------------------

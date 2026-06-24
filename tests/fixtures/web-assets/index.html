@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Executor fixture</title>
+    <link rel="stylesheet" href="/_app/immutable/assets/app.fixture.css" />
+  </head>
+  <body>
+    <main>Executor embedded web fixture</main>
+    <script>
+      globalThis.__executorBootstrap = "fixture";
+    </script>
+    <script type="module" src="/_app/immutable/entry/start.fixture.js"></script>
+  </body>
+</html>

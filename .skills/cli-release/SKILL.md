@@ -19,8 +19,8 @@ The CLI binary bundles:
 
 Does **not** ship in the CLI:
 
-- `apps/cloud/**` (Cloudflare Workers deployment)
-- `apps/marketing/**`, `apps/desktop/**`
+- `legacy/cloud/**` (Cloudflare Workers deployment)
+- `apps/marketing/**`, `legacy/desktop/**`
 - `examples/**`, `tests/**`
 
 **Implication for changelogs**: when asked "what changed since the last release", scope is `git log v<last>..HEAD -- apps/cli apps/local packages`, not just `apps/cli`. Skipping `apps/local` and `packages` misses the bulk of product changes (Connections UI, OAuth plugins, SDK scope, OTEL, etc.).

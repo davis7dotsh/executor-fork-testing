@@ -1,5 +1,5 @@
 // Single shared instantiation of the self-host plugin list, mirroring
-// `apps/cloud/src/api/cloud-plugins.ts`. The API composition
+// `legacy/cloud/src/api/cloud-plugins.ts`. The API composition
 // (`composePluginApi`/`composePluginHandlerLayer`) and the per-request
 // middleware (`providePluginExtensions`, `PluginExtensionServices<...>`) all
 // derive their typed views from this one tuple, so adding/removing a plugin is

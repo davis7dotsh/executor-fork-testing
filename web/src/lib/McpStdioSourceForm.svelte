@@ -200,7 +200,11 @@
   {:else if templates.data?.length === 0}
     <div class="notice">
       <strong>No trusted local templates are configured.</strong>
-      <small>Add templates through Executor's local CLI or configuration, then try again.</small>
+      <small>
+        Add templates to the machine-admin JSON registry selected by
+        <code>--mcp-stdio-templates</code> or <code>EXECUTOR_MCP_STDIO_TEMPLATES_FILE</code>,
+        restart Executor, then try again.
+      </small>
     </div>
     <button type="button" disabled={templates.loading} onclick={() => (refreshKey += 1)}>
       {templates.loading ? "Refreshing..." : "Refresh templates"}

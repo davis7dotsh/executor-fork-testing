@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
-const appDir = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appDir = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 
 // (launch exe, bundled executor binary) inside the packaged bundle, per platform.
 const bundlePaths = (): { exe: string; executor: string } => {

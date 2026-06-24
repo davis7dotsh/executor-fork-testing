@@ -117,8 +117,9 @@ before using it.
 - `packages/react`: shared React UI and atom/client integration.
 - `packages/hosts/mcp`: MCP host surface for exposing Executor through MCP.
 - `packages/kernel/*`: execution runtimes and code execution substrate.
-- `apps/local`, `apps/cloud`, `apps/cli`, and `apps/desktop`: product entry
-  points that compose the packages.
+- `src` and `web`: the active local/self-hosted Rust and Svelte product.
+- `apps/local` and `apps/cli`: retained TypeScript compatibility entry points.
+- `legacy/cloud` and `legacy/desktop`: archived deployment entry points.
 
 ## Other
 

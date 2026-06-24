@@ -53,17 +53,17 @@ executor.har
 secret.key
 
 # desktop app build artifacts
-apps/desktop/resources/
+legacy/desktop/resources/
 
 # cloud local dev database
 .pglite
-apps/cloud/.dev-db/
-apps/cloud/.e2e-db/
+legacy/cloud/.dev-db/
+legacy/cloud/.e2e-db/
 
 # e2e suite: generated run artifacts + throwaway target state (the * also
 # covers ad-hoc variants like .e2e-stub-db-manual from debugging boots)
 e2e/runs/
-apps/cloud/.e2e-stub-db*/
+legacy/cloud/.e2e-stub-db*/
 apps/host-selfhost/.e2e-data*/
 
 # playwright e2e artifacts

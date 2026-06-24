@@ -5,7 +5,7 @@
 // real McpSessionDO, and real bearers minted from the authorization server the
 // product itself advertises (discovery → DCR → authorize → token).
 //
-// Ported from apps/cloud/src/mcp-flow.test.ts (workerd-pool SELF.fetch with
+// Ported from legacy/cloud/src/mcp-flow.test.ts (workerd-pool SELF.fetch with
 // test-seam bearers). DO-internal coverage from that file (forced runtime
 // eviction, idle-alarm firing, alarm scheduling, storage seeding) is clock /
 // internals dependent and intentionally NOT carried — only black-box

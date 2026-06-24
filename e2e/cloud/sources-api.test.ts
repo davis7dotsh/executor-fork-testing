@@ -6,7 +6,7 @@
 // execution proves the whole chain: catalog row → connection → stamped tool →
 // QuickJS execution → live upstream request.
 //
-// Ported from apps/cloud/src/api/sources-api.node.test.ts. Cross-user
+// Ported from legacy/cloud/src/api/sources-api.node.test.ts. Cross-user
 // isolation of personal connections (alice/bob in one org) is NOT covered
 // here: minting a second member of an existing org has no public API surface.
 import { randomBytes } from "node:crypto";

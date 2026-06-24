@@ -2,6 +2,8 @@
 name = "executor"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1"
@@ -17,7 +19,12 @@ hmac = "0.12"
 ipnet = "2.12.0"
 jsonschema = { version = "0.46.6", default-features = false }
 libc = "0.2"
-oxc = { version = "=0.137.0", default-features = false, features = ["semantic", "transformer", "codegen", "ast_visit"] }
+oxc = { version = "=0.137.0", default-features = false, features = [
+  "semantic",
+  "transformer",
+  "codegen",
+  "ast_visit",
+] }
 percent-encoding = "2"
 rand = "0.8.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
@@ -35,7 +42,18 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 subtle = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs", "sync", "process", "io-util", "io-std"] }
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "net",
+  "signal",
+  "time",
+  "fs",
+  "sync",
+  "process",
+  "io-util",
+  "io-std",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
@@ -45,3 +63,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+base64 = "0.22"
+sha2 = "0.10"

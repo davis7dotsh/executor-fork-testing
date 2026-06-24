@@ -131,7 +131,3 @@ jobs:
           RELEASE_TAG: ${{ steps.validate_release.outputs.tag }}
         run: |
           gh workflow run publish-executor-package.yml --ref "$RELEASE_TAG" -f tag="$RELEASE_TAG"
-
-      # Desktop build downloads CLI binaries from the release, so it must
-      # run after CLI publish completes. Trigger it from the CLI workflow
-      # or manually via: gh workflow run publish-desktop.yml -f tag=vX.Y.Z

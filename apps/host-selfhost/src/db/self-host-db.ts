@@ -23,7 +23,7 @@ import { SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "../config";
 
 // ---------------------------------------------------------------------------
 // SQLite executor DB factory, inline (like apps/local's sqlite-fumadb.ts and
-// apps/cloud's fuma.ts — each app owns its DB wiring; there is no shared
+// legacy/cloud's fuma.ts, each app owns its DB wiring; there is no shared
 // storage package). Differences from apps/local: busy_timeout + synchronous
 // pragmas for the multi-user HTTP server, and the idempotent
 // `ensureDrizzleRuntimeSchemaFromTables` schema-ensure (the drizzle adapter

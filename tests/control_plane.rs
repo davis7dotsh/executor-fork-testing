@@ -1245,7 +1245,7 @@ async fn health_bootstrap_and_errors_have_stable_shapes() {
         json!({ "setupRequired": false, "authenticated": true })
     );
 
-    let missing = send_empty(executor.router(), Method::GET, "/missing", &[]).await;
+    let missing = send_empty(executor.router(), Method::GET, "/api/v1/missing", &[]).await;
     assert_error(missing, StatusCode::NOT_FOUND, "not_found").await;
 }
 

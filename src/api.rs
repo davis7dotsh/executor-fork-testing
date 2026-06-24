@@ -11,7 +11,7 @@ use axum::{
         ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, State,
         rejection::JsonRejection,
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -586,7 +586,8 @@ async fn request_id_middleware(
     );
     response
         .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
     response
 }
 
@@ -1096,13 +1097,22 @@ async fn require_gateway_token(
     })
 }
 
-async fn not_found(Extension(request_id): Extension<RequestId>) -> ApiError {
+async fn not_found(
+    Extension(request_id): Extension<RequestId>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = crate::web_assets::response(&method, &uri, &headers) {
+        return response;
+    }
     ApiError::new(
         &request_id,
         StatusCode::NOT_FOUND,
         "not_found",
         "The requested resource does not exist.",
     )
+    .into_response()
 }
 
 async fn method_not_allowed(Extension(request_id): Extension<RequestId>) -> ApiError {

@@ -22,12 +22,14 @@ the self-host Docker image.
      - performs a full dry-run release build before publish
      - publishes the CLI npm package under the correct dist-tag
      - creates or updates the GitHub release with build artifacts
-     - dispatches `.github/workflows/publish-desktop.yml`
      - dispatches `.github/workflows/publish-selfhost-docker.yml`
 6. The self-host Docker workflow publishes `ghcr.io/rhyssullivan/executor-selfhost`
    for `linux/amd64` and `linux/arm64`:
    - stable releases get `vX.Y.Z`, `X.Y.Z`, and `latest`
    - prereleases get `vX.Y.Z-...`, `X.Y.Z-...`, and `beta`
+
+The archived Electron workflow is manual-only and is not part of the active
+release path.
 
 ## Beta releases
 

@@ -19,7 +19,7 @@ const setCookieFor = (response: Response, name: string): string => {
 };
 
 // state = base64url(JSON { nonce, returnTo? }) — the app's login-state
-// envelope (apps/cloud/src/auth/login-state.ts).
+// envelope (legacy/cloud/src/auth/login-state.ts).
 const decodeLoginState = Schema.decodeUnknownOption(
   Schema.fromJsonString(
     Schema.Struct({ nonce: Schema.String, returnTo: Schema.optional(Schema.String) }),

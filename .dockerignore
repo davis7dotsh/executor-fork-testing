@@ -8,3 +8,6 @@
 **/.next
 **/*.log
 .claude
+secrets
+**/secret.key
+**/master.key

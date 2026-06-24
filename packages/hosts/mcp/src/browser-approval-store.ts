@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // In-process browser-approval store — the single-process equivalent of the
-// Durable Object's persisted approval responses (apps/cloud, host-cloudflare).
+// Durable Object's persisted approval responses (legacy/cloud, host-cloudflare).
 //
 // It is the bridge between the two halves of a browser approval:
 //   - the MCP `resume` tool long-polls `store.waitForResponse(executionId)`,

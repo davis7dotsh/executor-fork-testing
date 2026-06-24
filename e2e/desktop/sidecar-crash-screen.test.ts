@@ -20,10 +20,10 @@ import { _electron } from "playwright";
 import { scenario } from "../src/scenario";
 import { RunDir } from "../src/services";
 
-const appDir = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appDir = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 
 // require("electron") resolves to the binary path (electron's index.js
-// exports it) — resolved from apps/desktop so we get the app's pinned
+// exports it), resolved from legacy/desktop so we get the app's pinned
 // version out of the workspace store.
 const electronBinary = createRequire(join(appDir, "package.json"))("electron") as string;
 

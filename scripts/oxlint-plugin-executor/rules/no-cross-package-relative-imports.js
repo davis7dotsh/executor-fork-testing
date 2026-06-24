@@ -50,7 +50,7 @@ function findPackageRoot(absolutePath) {
 
 function collectPackageRoots() {
   const roots = [];
-  for (const root of ["packages", "apps", "examples"]) {
+  for (const root of ["packages", "apps", "legacy", "examples"]) {
     collectPackageRootsFrom(path.join(repoRoot, root), roots);
   }
   return roots;
