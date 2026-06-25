@@ -1947,7 +1947,7 @@ scenario(
                 expect(persisted).not.toContain(credential);
                 expect(persisted).not.toContain(submittedPayload);
 
-                await page.getByRole("link", { name: "Tools" }).click();
+                await page.getByRole("link", { name: "Tools", exact: true }).click();
                 expect(new URL(page.url()).pathname).toBe("/sources");
                 const warning = page.locator("#source-navigation-status");
                 await expectLocatorText(warning, "still being submitted");
@@ -1988,7 +1988,7 @@ scenario(
 
               await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
               await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
-              await page.getByRole("link", { name: "Tools" }).click();
+              await page.getByRole("link", { name: "Tools", exact: true }).click();
               await page.waitForURL((url) => url.pathname === "/tools");
               expect(
                 sessionDeletes,
