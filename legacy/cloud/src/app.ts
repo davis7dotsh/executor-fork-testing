@@ -35,7 +35,7 @@ import { WorkerTelemetryLive } from "./observability/telemetry";
 // capture — and Autumn BILLING entering ONLY as extensions: the engine
 // metering decorator, the account seat-gate, the `/api/billing/*` proxy route,
 // and the createOrganization free-limit gate. `diff` against
-// `apps/host-selfhost/src/app.ts` is the entire product difference.
+// `legacy/host-selfhost/src/app.ts` is the entire product difference.
 //
 // `ExecutorApp.make` owns the assembly (the execution-stack middleware wrapping
 // the protected API, the MCP envelope, the account API on the /api-prefixed

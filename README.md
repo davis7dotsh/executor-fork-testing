@@ -14,8 +14,14 @@ The active product supports:
 - a stateful Streamable HTTP MCP endpoint and a local stdio bridge
 - native Linux and macOS binaries, plus Docker
 
-Windows is not a release target. The previous managed cloud and Electron
-products are archived in [`legacy/`](legacy/README.md).
+Windows is not a release target. The previous TypeScript CLI, local app,
+hosted deployments, managed cloud, and Electron products are archived in
+[`legacy/`](legacy/README.md).
+
+`Cargo.toml` is the native product version source. Published releases provide
+four checksum-verified Linux and macOS archives plus the multi-platform
+`ghcr.io/<repository-owner>/executor` image. See [installation](docs/install.md)
+and [release operations](RELEASING.md).
 
 ## Try it from this checkout
 
@@ -76,6 +82,7 @@ Client commands talk to an already-running Executor server. They never open a
 second copy of the database.
 
 ```sh
+./target/release/executor --version
 export EXECUTOR_API_TOKEN='token-shown-by-the-dashboard'
 
 ./target/release/executor tools sources
@@ -177,7 +184,7 @@ driving the real first-boot, source, tool-mode, approval, log, token, and OAuth
 journeys in Chromium.
 
 See [`RUNNING.md`](RUNNING.md) for the current repository workflow and e2e
-status. Default commands exclude the archived cloud and desktop products.
+status. Default commands exclude all archived application packages.
 
 ## License
 

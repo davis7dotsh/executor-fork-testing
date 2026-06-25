@@ -1,5 +1,5 @@
 // Boot recipe for the selfhost PRODUCTION Docker artifact: build the image
-// from this checkout's apps/host-selfhost/Dockerfile (or use
+// from this checkout's legacy/host-selfhost/Dockerfile (or use
 // E2E_SELFHOST_DOCKER_IMAGE, e.g. a published ghcr tag), then run it.
 //
 // The container runs with HOST networking, for the same reason the dev-server
@@ -56,8 +56,8 @@ const resolveImage = async (logFile?: string): Promise<string> => {
   const pinned = process.env.E2E_SELFHOST_DOCKER_IMAGE;
   if (pinned) return pinned;
   const image = "executor-selfhost:e2e";
-  log(logFile, `building ${image} from ${repoRoot}apps/host-selfhost/Dockerfile`);
-  await exec("docker", ["build", "-f", "apps/host-selfhost/Dockerfile", "-t", image, "."], {
+  log(logFile, `building ${image} from ${repoRoot}legacy/host-selfhost/Dockerfile`);
+  await exec("docker", ["build", "-f", "legacy/host-selfhost/Dockerfile", "-t", image, "."], {
     cwd: repoRoot,
     maxBuffer: 64 * 1024 * 1024,
   }).catch((error: { stdout?: string; stderr?: string }) => {

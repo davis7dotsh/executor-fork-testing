@@ -1,4 +1,4 @@
-use std::{future::Future, pin::pin, time::Duration};
+use std::{future::Future, io, net::SocketAddr, pin::pin, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Response, StatusCode, header};
@@ -9,8 +9,6 @@ use tokio::{
     task::JoinSet,
 };
 use url::Url;
-
-use super::terminal::safe_field;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SESSION_HEADER: &str = "mcp-session-id";
@@ -56,7 +54,7 @@ async fn bridge<R, W, S>(
     token: &str,
     allow_insecure_http: bool,
     input: R,
-    mut output: W,
+    output: W,
     shutdown: S,
 ) -> Result<()>
 where
@@ -64,15 +62,44 @@ where
     W: AsyncWrite + Unpin,
     S: Future<Output = ()>,
 {
+    bridge_with_resolver(
+        base_url,
+        token,
+        allow_insecure_http,
+        input,
+        output,
+        shutdown,
+        super::client::resolve_system_addresses,
+    )
+    .await
+}
+
+async fn bridge_with_resolver<R, W, S, F>(
+    base_url: &str,
+    token: &str,
+    allow_insecure_http: bool,
+    input: R,
+    mut output: W,
+    shutdown: S,
+    resolver: F,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    S: Future<Output = ()>,
+    F: FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>>,
+{
     let mut endpoint =
         super::client::normalized_base_url_with_policy(base_url, allow_insecure_http)?;
     endpoint.set_path("mcp");
-    let http = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .context("could not initialize the MCP HTTP client")?;
+        .connect_timeout(Duration::from_secs(5));
+    let http =
+        super::client::pin_plaintext_loopback(builder, &endpoint, allow_insecure_http, resolver)?
+            .build()
+            .context("could not initialize the MCP HTTP client")?;
     let mut session = None;
     let result = bridge_session(
         &http,
@@ -123,7 +150,7 @@ where
         bail!("the first MCP message must initialize a stateful Executor session");
     }
     let reply = tokio::select! {
-        reply = decode_http_response(initialize_response) => reply?,
+        reply = decode_http_response(initialize_response, token) => reply?,
         _ = &mut shutdown => return Ok(()),
     };
     write_protocol_reply(output, reply.stdout).await?;
@@ -232,7 +259,7 @@ async fn post_message(
         .send()
         .await
         .context("Executor is not reachable; start `executor server` first")?;
-    decode_http_response(response).await
+    decode_http_response(response, token).await
 }
 
 fn response_session_id(response: &Response) -> Result<Option<String>> {
@@ -251,7 +278,7 @@ fn response_session_id(response: &Response) -> Result<Option<String>> {
     Ok(response_session)
 }
 
-async fn decode_http_response(response: Response) -> Result<HttpReply> {
+async fn decode_http_response(response: Response, token: &str) -> Result<HttpReply> {
     let _response_session = response_session_id(&response)?;
     let status = response.status();
     let body = tokio::time::timeout(
@@ -267,7 +294,7 @@ async fn decode_http_response(response: Response) -> Result<HttpReply> {
                 value
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .map(safe_field)
+                    .map(|message| super::client::safe_field_redacting_secret(message, token))
             })
             .unwrap_or_else(|| {
                 status
@@ -408,7 +435,7 @@ async fn read_response_bounded(mut response: Response) -> Result<Vec<u8>> {
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use axum::{
@@ -592,6 +619,211 @@ mod tests {
         .expect_err("server is stopped");
         assert!(error.to_string().contains("start `executor server` first"));
         assert!(captured.lock().expect("output").is_empty());
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_poisoned_localhost_before_a_bearer_request() {
+        let input = std::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+        );
+        let output = VecWriter::default();
+        let captured = Arc::clone(&output.bytes);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&resolutions);
+
+        let error = bridge_with_resolver(
+            "http://poison.localhost:4788",
+            "top-secret-token",
+            false,
+            input,
+            output,
+            std::future::pending(),
+            move |hostname, port| {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(hostname, "poison.localhost");
+                Ok(vec![
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    SocketAddr::from(([203, 0, 113, 10], port)),
+                ])
+            },
+        )
+        .await
+        .expect_err("poisoned resolution");
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert!(captured.lock().expect("output").is_empty());
+        assert!(error.to_string().contains("loopback"));
+        assert!(!error.to_string().contains("top-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn bridge_pins_resolved_localhost_before_forwarding_bearer_tokens() {
+        let state = TestState::default();
+        let router = Router::new()
+            .route("/mcp", post(post_mcp).delete(delete_mcp))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("server");
+        });
+        let input = std::io::Cursor::new(
+            concat!(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let output = VecWriter::default();
+        let captured = Arc::clone(&output.bytes);
+
+        bridge_with_resolver(
+            &format!("http://bridge.localhost:{}/", address.port()),
+            "pinned-secret",
+            false,
+            input,
+            output,
+            std::future::pending(),
+            move |hostname, port| {
+                assert_eq!(hostname, "bridge.localhost");
+                assert_eq!(port, address.port());
+                Ok(vec![address])
+            },
+        )
+        .await
+        .expect("pinned bridge");
+
+        assert_eq!(
+            String::from_utf8(captured.lock().expect("output").clone())
+                .expect("UTF-8")
+                .lines()
+                .count(),
+            1
+        );
+        let requests = state.requests.lock().expect("requests");
+        assert_eq!(
+            requests.first().and_then(|request| request.0.as_deref()),
+            Some("Bearer pinned-secret")
+        );
+        drop(requests);
+        assert_eq!(*state.deletes.lock().expect("deletes"), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_bearer_requests_never_follow_redirects() {
+        async fn redirect(State(location): State<String>, headers: HeaderMap) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer redirect-secret")
+            );
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, location)],
+            )
+        }
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect target listener");
+        let target_address = target.local_addr().expect("target address");
+        let router = Router::new()
+            .route("/mcp", post(redirect))
+            .with_state(format!("http://{target_address}/steal"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect server listener");
+        let address = listener.local_addr().expect("redirect server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("server");
+        });
+        let input = std::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+        );
+        let output = VecWriter::default();
+        let captured = Arc::clone(&output.bytes);
+
+        let error = bridge(
+            &format!("http://{address}"),
+            "redirect-secret",
+            false,
+            input,
+            output,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("redirect must not be followed");
+
+        assert!(captured.lock().expect("output").is_empty());
+        assert!(!error.to_string().contains("redirect-secret"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target received a bearer-bearing request"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_error_messages_cannot_reflect_the_bearer_token() {
+        async fn reflected(headers: HeaderMap) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer secret-reflection-token")
+            );
+            let mut response = (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "Bearer secret-reflection-token was rejected"
+                    }
+                })),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(SESSION_HEADER, "session-1".parse().expect("session header"));
+            response
+        }
+        async fn close() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let router = Router::new().route("/mcp", post(reflected).delete(close));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("server");
+        });
+        let input = std::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+        );
+
+        let error = bridge(
+            &format!("http://{address}"),
+            "secret-reflection-token",
+            false,
+            input,
+            VecWriter::default(),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("reflected MCP error");
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("secret-reflection-token"));
+        assert!(rendered.contains("[redacted]"));
+        server.abort();
     }
 
     #[tokio::test]

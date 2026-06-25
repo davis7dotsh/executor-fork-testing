@@ -25,7 +25,13 @@
     source,
     disabled = false,
     onbusychange,
-  }: { source: Source; disabled?: boolean; onbusychange?: (busy: boolean) => void } = $props();
+    onmutationchange,
+  }: {
+    source: Source;
+    disabled?: boolean;
+    onbusychange?: (busy: boolean) => void;
+    onmutationchange?: (busy: boolean) => void;
+  } = $props();
 
   const auth = useAuthState();
   const latest = createLatestRequest();
@@ -47,6 +53,7 @@
   let saveController: AbortController | null = null;
   let lifetime = 0;
   let reportedBusy = false;
+  let reportedMutation = false;
   let httpCredential = $derived(buildMcpHttpCredential(httpDraft));
   let stdioCredential = $derived(validateTemplateDraft(stdioFields, stdioSecrets));
 
@@ -57,6 +64,7 @@
       cleanupLoad?.();
       saveController?.abort();
       if (reportedBusy) onbusychange?.(false);
+      if (reportedMutation) onmutationchange?.(false);
     };
   });
 
@@ -68,15 +76,34 @@
   });
 
   $effect(() => {
-    if (!disabled) return;
+    if (saving === reportedMutation) return;
+    reportedMutation = saving;
+    onmutationchange?.(saving);
+  });
+
+  $effect(() => {
+    const isDisabled = disabled;
     untrack(() => {
-      cleanupLoad?.();
-      cleanupLoad = null;
-      saveController?.abort();
-      saveController = null;
-      loading = false;
-      saving = false;
-      clearSecretDrafts();
+      if (!isDisabled) {
+        if (open && revision === null && !loading && error === null) loadEditor();
+        return;
+      }
+
+      if (cleanupLoad !== null) {
+        cleanupLoad();
+        cleanupLoad = null;
+        loading = false;
+        revision = null;
+        error = null;
+      }
+      if (saveController !== null) {
+        saveController.abort();
+        saveController = null;
+        saving = false;
+        revision = null;
+        error = null;
+        clearSecretDrafts();
+      }
     });
   });
 

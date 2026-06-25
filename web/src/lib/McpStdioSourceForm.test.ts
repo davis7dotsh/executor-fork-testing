@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import { Effect, Schema } from "effect";
+import { Effect } from "effect";
+import { ApiError, type ApiResult, type McpStdioSourceInput, type Source } from "./api";
 import McpStdioSourceForm from "./McpStdioSourceForm.svelte";
 
-const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
-
-function sourceFixture() {
+function sourceFixture(): Source {
   return {
     id: "source-stdio",
     kind: "mcp_stdio",
@@ -26,6 +25,14 @@ function sourceFixture() {
   };
 }
 
+function deferred<Value>() {
+  let resolve = (_value: Value) => {};
+  const promise = new Promise<Value>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -33,21 +40,19 @@ afterEach(() => {
 
 describe("MCP stdio source form", () => {
   it("shows only trusted templates and preserves secret bytes in create payloads", async () => {
-    const bodies: unknown[] = [];
+    const inputs: McpStdioSourceInput[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn<typeof fetch>(async (input, init) => {
-        if (String(input) === "/api/v1/mcp/stdio/templates") {
-          return Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] });
-        }
-        expect(String(input)).toBe("/api/v1/sources");
-        expect(init?.method).toBe("POST");
-        bodies.push(decodeJson(String(init?.body)));
-        return Response.json(sourceFixture(), { status: 201 });
-      }),
+      vi.fn<typeof fetch>(async () =>
+        Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] }),
+      ),
     );
+    const create = vi.fn(async (input: McpStdioSourceInput) => {
+      inputs.push(input);
+      return { ok: true, value: sourceFixture() } as const;
+    });
     const created = vi.fn();
-    render(McpStdioSourceForm, { oncreated: created });
+    render(McpStdioSourceForm, { create, oncreated: created });
 
     await screen.findByRole("option", { name: "github" });
     await fireEvent.input(screen.getByLabelText("Source name"), {
@@ -59,8 +64,8 @@ describe("MCP stdio source form", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Connect source" }));
 
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(bodies).toEqual([
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(inputs).toEqual([
       {
         kind: "mcp_stdio",
         displayName: "Local GitHub",
@@ -83,7 +88,7 @@ describe("MCP stdio source form", () => {
         }),
       ),
     );
-    render(McpStdioSourceForm, { oncreated: vi.fn() });
+    render(McpStdioSourceForm, { create: vi.fn(), oncreated: vi.fn() });
 
     const selector = await screen.findByLabelText<HTMLSelectElement>("Trusted template");
     const secret = screen.getByLabelText<HTMLInputElement>("TOKEN");
@@ -99,7 +104,7 @@ describe("MCP stdio source form", () => {
       "fetch",
       vi.fn<typeof fetch>(async () => Response.json({ templates: [] })),
     );
-    render(McpStdioSourceForm, { oncreated: vi.fn() });
+    render(McpStdioSourceForm, { create: vi.fn(), oncreated: vi.fn() });
 
     expect(await screen.findByText("No trusted local templates are configured.")).toBeDefined();
     expect(screen.getByText(/machine-admin JSON registry selected by/)).toBeDefined();
@@ -121,7 +126,7 @@ describe("MCP stdio source form", () => {
         Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] }),
       );
     vi.stubGlobal("fetch", fetcher);
-    render(McpStdioSourceForm, { oncreated: vi.fn() });
+    render(McpStdioSourceForm, { create: vi.fn(), oncreated: vi.fn() });
 
     await screen.findByRole("option", { name: "github" });
     await fireEvent.click(screen.getByRole("button", { name: "Refresh templates" }));
@@ -148,7 +153,7 @@ describe("MCP stdio source form", () => {
         Response.json({ templates: [{ name: "github", secretFields: ["API_KEY"] }] }),
       );
     vi.stubGlobal("fetch", fetcher);
-    render(McpStdioSourceForm, { oncreated: vi.fn() });
+    render(McpStdioSourceForm, { create: vi.fn(), oncreated: vi.fn() });
 
     const oldSecret = await screen.findByLabelText<HTMLInputElement>("TOKEN");
     await fireEvent.input(oldSecret, { target: { value: "must-be-forgotten" } });
@@ -160,15 +165,65 @@ describe("MCP stdio source form", () => {
     expect(document.body.textContent).not.toContain("must-be-forgotten");
   });
 
-  it("clears entered secrets and restores controls after a failed create", async () => {
+  it("reports not busy on unmount and ignores a late create completion", async () => {
+    const creation = deferred<ApiResult<Source>>();
+    const request = { signal: null as AbortSignal | null };
+    const busy = vi.fn();
+    const created = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] }),
+        ),
+      ),
+    );
+    const create = vi.fn((_input: McpStdioSourceInput, signal: AbortSignal) => {
+      request.signal = signal;
+      return creation.promise;
+    });
+    const mounted = render(McpStdioSourceForm, { create, oncreated: created, onbusychange: busy });
+
+    await screen.findByRole("option", { name: "github" });
+    await fireEvent.input(screen.getByLabelText("Source name"), {
+      target: { value: "Local GitHub" },
+    });
+    await fireEvent.input(screen.getByLabelText("TOKEN"), {
+      target: { value: "forget-on-unmount" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Connect source" }));
+    await waitFor(() => expect(busy).toHaveBeenLastCalledWith(true));
+
+    mounted.unmount();
+    expect(request.signal?.aborted).toBe(true);
+    expect(busy).toHaveBeenLastCalledWith(false);
+    creation.resolve({ ok: true, value: sourceFixture() });
+    await creation.promise;
+    await Promise.resolve();
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("clears template secrets and focuses a coordinator failure", async () => {
+    const busy = vi.fn();
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
         Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] }),
-      )
-      .mockImplementationOnce(() => Effect.runPromise(Effect.fail("offline")));
+      );
     vi.stubGlobal("fetch", fetcher);
-    render(McpStdioSourceForm, { oncreated: vi.fn() });
+    const create = vi.fn(
+      async () =>
+        ({
+          ok: false,
+          error: new ApiError({
+            code: "source_create_recovery_pending",
+            displayMessage: "Source recovery is pending.",
+            requestId: null,
+            status: 0,
+          }),
+        }) as const,
+    );
+    render(McpStdioSourceForm, { create, oncreated: vi.fn(), onbusychange: busy });
 
     await screen.findByRole("option", { name: "github" });
     await fireEvent.input(screen.getByLabelText("Source name"), {
@@ -181,6 +236,8 @@ describe("MCP stdio source form", () => {
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeDefined());
     expect(screen.getByLabelText<HTMLInputElement>("TOKEN").value).toBe("");
+    expect(busy).toHaveBeenLastCalledWith(false);
+    expect(screen.getByText("Source recovery is pending.")).toBeDefined();
     expect(document.activeElement).toBe(document.getElementById("mcp-stdio-error"));
   });
 });

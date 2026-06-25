@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -19,7 +20,7 @@ use axum::{
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
 
 use crate::{
@@ -42,6 +43,7 @@ mod catalog;
 mod oauth;
 pub(crate) mod openapi;
 mod protocols;
+mod token_delivery;
 
 const SESSION_COOKIE: &str = "executor_session";
 const CSRF_COOKIE: &str = "executor_csrf";
@@ -61,6 +63,9 @@ const MAX_LOGIN_RATE_LIMIT_CLIENTS: usize = 4096;
 const MAX_FORWARDED_FOR_HOPS: usize = 64;
 const MAX_FORWARDED_FOR_BYTES: usize = 4 * 1024;
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+const IDEMPOTENCY_REPLAYED: &str = "idempotency-replayed";
+const REVOKE_RECONCILED: &str = "revoke-reconciled";
 const TOKEN_LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 60;
 const TOKEN_LAST_USED_WRITE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TOKEN_LAST_USED_ATTEMPTS: usize = 4096;
@@ -85,6 +90,7 @@ struct AppState {
     token_last_used_tracker: Arc<TokenLastUsedTracker>,
     trusted_proxies: Arc<[IpNet]>,
     background_tasks: TaskTracker,
+    source_creation_supervisors: protocols::SourceCreationSupervisorRegistry,
 }
 
 #[derive(Clone)]
@@ -379,6 +385,7 @@ struct SessionResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTokenRequest {
     name: String,
 }
@@ -422,7 +429,7 @@ struct GatewayIdentity {
 
 struct AdminMutation(i64);
 
-struct AdminAuthentication;
+struct AdminAuthentication(i64);
 
 struct GatewayAuthentication(GatewayIdentity);
 
@@ -488,8 +495,8 @@ impl FromRequestParts<AppState> for AdminAuthentication {
             .get::<RequestId>()
             .expect("request ID middleware runs before authentication")
             .clone();
-        require_admin(&request_id, state, &parts.headers).await?;
-        Ok(Self)
+        let admin = require_admin(&request_id, state, &parts.headers).await?;
+        Ok(Self(admin.id))
     }
 }
 
@@ -539,6 +546,7 @@ pub(crate) fn router(
         token_last_used_tracker: Arc::new(TokenLastUsedTracker::new()),
         trusted_proxies: config.trusted_proxies.clone(),
         background_tasks,
+        source_creation_supervisors: protocols::SourceCreationSupervisorRegistry::default(),
     };
     let middleware_state = state.clone();
 
@@ -951,8 +959,9 @@ async fn create_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<CreateTokenRequest>, JsonRejection>,
-) -> Result<impl IntoResponse, ApiError> {
-    require_admin_mutation(&request_id, &state, &headers).await?;
+) -> Result<Response, ApiError> {
+    let admin = require_admin_mutation(&request_id, &state, &headers).await?;
+    let idempotency_key = required_idempotency_key(&request_id, &headers)?;
     let Json(payload) = parse_json(&request_id, payload)?;
     let name = payload.name.trim();
     if name.is_empty()
@@ -967,43 +976,121 @@ async fn create_token(
         ));
     }
 
-    let token = generate_secret("exr_");
-    let digest = state.database.keyring.digest("api-token", token.as_bytes());
-    let id = Uuid::new_v4().to_string();
-    let prefix = token.chars().take(8).collect::<String>();
-    let suffix = token
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    let created_at = unix_timestamp();
-    sqlx::query(
-        "INSERT INTO api_tokens \
-         (id, name, token_digest, token_prefix, token_suffix, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+    let claim = token_delivery::claim_token_creation(
+        &state.database.pool,
+        &state.database.keyring,
+        admin.id,
+        name,
+        idempotency_key,
+        unix_timestamp(),
     )
-    .bind(&id)
-    .bind(name)
-    .bind(digest.to_vec())
-    .bind(prefix)
-    .bind(suffix)
-    .bind(created_at)
-    .execute(&state.database.pool)
     .await
-    .map_err(|error| ApiError::internal_logged(&request_id, error))?;
+    .map_err(|error| token_delivery_error(&request_id, error))?;
 
-    Ok((
+    match claim {
+        token_delivery::TokenCreationClaim::Fresh(token) => {
+            Ok(created_token_response(token, false))
+        }
+        token_delivery::TokenCreationClaim::Replay(token) => {
+            Ok(created_token_response(token, true))
+        }
+        token_delivery::TokenCreationClaim::Mismatch => Err(ApiError::new(
+            &request_id,
+            StatusCode::CONFLICT,
+            "idempotency_mismatch",
+            "The Idempotency-Key is already bound to a different token creation request.",
+        )),
+        token_delivery::TokenCreationClaim::Revoked => {
+            let mut response = ApiError::new(
+                &request_id,
+                StatusCode::CONFLICT,
+                "idempotency_replay_revoked",
+                "The token created by this Idempotency-Key has been revoked.",
+            )
+            .into_response();
+            response
+                .headers_mut()
+                .insert(IDEMPOTENCY_REPLAYED, HeaderValue::from_static("true"));
+            Ok(response)
+        }
+    }
+}
+
+fn required_idempotency_key<'a>(
+    request_id: &RequestId,
+    headers: &'a HeaderMap,
+) -> Result<&'a str, ApiError> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY).iter();
+    let Some(value) = values.next() else {
+        return Err(ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "idempotency_key_required",
+            "An Idempotency-Key header is required when creating an API token.",
+        ));
+    };
+    if values.next().is_some() {
+        return Err(ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "The Idempotency-Key header is invalid.",
+        ));
+    }
+    let key = value.to_str().map_err(|_| {
+        ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "The Idempotency-Key header is invalid.",
+        )
+    })?;
+    token_delivery::validate_idempotency_key(key).map_err(|_| {
+        ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "The Idempotency-Key header is invalid.",
+        )
+    })?;
+    Ok(key)
+}
+
+fn token_delivery_error(
+    request_id: &RequestId,
+    error: token_delivery::TokenDeliveryError,
+) -> ApiError {
+    match error {
+        token_delivery::TokenDeliveryError::InvalidKey => ApiError::new(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "The Idempotency-Key header is invalid.",
+        ),
+        error @ (token_delivery::TokenDeliveryError::Database(_)
+        | token_delivery::TokenDeliveryError::CorruptData) => {
+            ApiError::internal_logged(request_id, error)
+        }
+    }
+}
+
+fn created_token_response(token: token_delivery::DeliveredToken, replayed: bool) -> Response {
+    let mut response = (
         StatusCode::CREATED,
         Json(CreatedTokenResponse {
-            id,
-            name: name.to_owned(),
-            token,
-            created_at,
+            id: token.id,
+            name: token.name,
+            token: token.token,
+            created_at: token.created_at,
         }),
-    ))
+    )
+        .into_response();
+    if replayed {
+        response
+            .headers_mut()
+            .insert(IDEMPOTENCY_REPLAYED, HeaderValue::from_static("true"));
+    }
+    response
 }
 
 async fn list_tokens(
@@ -1028,24 +1115,90 @@ async fn revoke_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(token_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     require_admin_mutation(&request_id, &state, &headers).await?;
+    let cleanup_state = state.clone();
+    let cleanup_request_id = request_id.clone();
+    let cleanup = async move {
+        revoke_token_and_cleanup(&cleanup_request_id, &cleanup_state, &token_id).await
+    };
+    let result = spawn_supervised_result(&state.background_tasks, cleanup).ok_or_else(|| {
+        ApiError::new(
+            &request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "Executor is shutting down.",
+        )
+    })?;
+    let reconciled = result
+        .await
+        .map_err(|error| ApiError::internal_logged(&request_id, error))??;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if reconciled {
+        response
+            .headers_mut()
+            .insert(REVOKE_RECONCILED, HeaderValue::from_static("true"));
+    }
+    Ok(response)
+}
+
+async fn revoke_token_and_cleanup(
+    request_id: &RequestId,
+    state: &AppState,
+    token_id: &str,
+) -> Result<bool, ApiError> {
     let changed = state
         .tool_calls
-        .revoke_owner_token(&token_id)
+        .revoke_owner_token(token_id)
         .await
-        .map_err(|error| ApiError::internal_logged(&request_id, error))?;
-    if !changed {
-        return Err(ApiError::new(
-            &request_id,
-            StatusCode::NOT_FOUND,
-            "token_not_found",
-            "The API token was not found or was already revoked.",
-        ));
-    }
-    state.execution.revoke_owner(&token_id).await;
-    state.mcp.revoke_token(&token_id);
-    Ok(StatusCode::NO_CONTENT)
+        .map_err(|error| ApiError::internal_logged(request_id, error))?;
+    let reconciled = if changed {
+        false
+    } else {
+        let state =
+            sqlx::query_as::<_, (Option<i64>,)>("SELECT revoked_at FROM api_tokens WHERE id = ?")
+                .bind(token_id)
+                .fetch_optional(&state.database.pool)
+                .await
+                .map_err(|error| ApiError::internal_logged(request_id, error))?;
+        match state {
+            None => {
+                return Err(ApiError::new(
+                    request_id,
+                    StatusCode::NOT_FOUND,
+                    "token_not_found",
+                    "The API token was not found.",
+                ));
+            }
+            Some((Some(_),)) => true,
+            Some((None,)) => {
+                return Err(ApiError::internal_logged(
+                    request_id,
+                    "an active API token could not be revoked",
+                ));
+            }
+        }
+    };
+    state.mcp.revoke_token(token_id);
+    state.execution.revoke_owner(token_id).await;
+    Ok(reconciled)
+}
+
+fn spawn_supervised_result<T, F>(
+    background_tasks: &TaskTracker,
+    future: F,
+) -> Option<oneshot::Receiver<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    background_tasks
+        .spawn_supervised(move |shutdown| async move {
+            let _shutdown = shutdown;
+            let _ = sender.send(future.await);
+        })
+        .then_some(receiver)
 }
 
 async fn gateway_whoami(
@@ -1353,14 +1506,17 @@ fn clear_cookie(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     };
 
     use tempfile::TempDir;
-    use tokio::time::timeout;
+    use tokio::{sync::oneshot, time::timeout};
 
-    use super::TokenLastUsedTracker;
+    use super::{TokenLastUsedTracker, spawn_supervised_result};
     use crate::{
         AppConfig,
         database::{Database, DatabaseError, OpenedDatabase},
@@ -1401,6 +1557,29 @@ mod tests {
         .expect("token last-used write completes")
         .expect("token last-used write semaphore remains open");
         drop(permit);
+    }
+
+    #[tokio::test]
+    async fn dropping_token_revoke_waiter_does_not_cancel_supervised_cleanup() {
+        let background_tasks = TaskTracker::default();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let task_cleaned = cleaned.clone();
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = oneshot::channel();
+        let waiter = spawn_supervised_result(&background_tasks, async move {
+            let _ = started_sender.send(());
+            let _ = release_receiver.await;
+            task_cleaned.store(true, Ordering::Release);
+        })
+        .expect("token revoke cleanup is supervised");
+
+        started_receiver.await.expect("cleanup task starts");
+        drop(waiter);
+        background_tasks.abort_all();
+        release_sender.send(()).expect("cleanup task releases");
+        background_tasks.shutdown().await;
+
+        assert!(cleaned.load(Ordering::Acquire));
     }
 
     #[tokio::test]

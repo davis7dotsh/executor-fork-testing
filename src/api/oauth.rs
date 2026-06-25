@@ -27,6 +27,23 @@ use crate::protocols::AvailableOAuthCredential;
 
 const CALLBACK_UI_PATH: &str = "/sources";
 
+#[derive(Clone, Copy)]
+enum CallbackOutcome {
+    Failed,
+    Success,
+    SuccessRefreshFailed,
+}
+
+impl CallbackOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Success => "success",
+            Self::SuccessRefreshFailed => "success_refresh_failed",
+        }
+    }
+}
+
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/sources/{sourceId}/oauth", get(list_connections))
@@ -162,12 +179,21 @@ async fn list_connections(
 async fn save_connection(
     Extension(request_id): Extension<RequestId>,
     State(state): State<AppState>,
-    OAuthAdminMutation(_admin): OAuthAdminMutation,
+    OAuthAdminMutation(admin): OAuthAdminMutation,
     Path((source_id, credential_key)): Path<(String, String)>,
     payload: Result<Json<SaveConnectionBody>, JsonRejection>,
 ) -> Result<Json<ConnectionListItem>, ApiError> {
     let Json(payload) = parse_json(&request_id, payload)?;
     require_eligible_credential(&request_id, &state, &source_id, &credential_key).await?;
+    state
+        .sources
+        .ensure_managed_oauth_origin_bound(
+            &source_id,
+            &credential_key,
+            AuditContext::admin(&request_id.0, admin.id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
     let connection = state
         .oauth
         .save_connection(
@@ -197,6 +223,15 @@ async fn begin_authorization(
 ) -> Result<Json<AuthorizationStartResponse>, ApiError> {
     let Json(payload) = parse_json(&request_id, payload)?;
     require_eligible_credential(&request_id, &state, &source_id, &credential_key).await?;
+    state
+        .sources
+        .ensure_managed_oauth_origin_bound(
+            &source_id,
+            &credential_key,
+            AuditContext::admin(&request_id.0, admin.id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
     let authorization = state
         .oauth
         .begin_authorization(
@@ -273,16 +308,28 @@ async fn disconnect(
 async fn delete_connection(
     Extension(request_id): Extension<RequestId>,
     State(state): State<AppState>,
-    OAuthAdminMutation(_admin): OAuthAdminMutation,
+    OAuthAdminMutation(admin): OAuthAdminMutation,
     Path((source_id, credential_key)): Path<(String, String)>,
     query: Result<Query<RevisionQuery>, QueryRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Query(query) = query.map_err(|_| invalid_revision(&request_id))?;
-    state
+    match state
         .oauth
         .delete_connection(&source_id, &credential_key, query.expected_revision)
         .await
-        .map_err(|error| oauth_error(&request_id, error))?;
+    {
+        Ok(()) | Err(OAuthError::NotFound) => {}
+        Err(error) => return Err(oauth_error(&request_id, error)),
+    }
+    state
+        .sources
+        .retire_managed_oauth_origin(
+            &source_id,
+            &credential_key,
+            AuditContext::admin(&request_id.0, admin.id),
+        )
+        .await
+        .map_err(|error| protocol_error(&request_id, error))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -298,7 +345,9 @@ async fn complete_callback(
             .await
         {
             Ok(redirect) => redirect.into_response(),
-            Err(_) => callback_redirect(&state, "failed", &connection_id).into_response(),
+            Err(_) => {
+                callback_redirect(&state, CallbackOutcome::Failed, &connection_id).into_response()
+            }
         };
     with_callback_headers(response)
 }
@@ -328,31 +377,39 @@ async fn complete_callback_result(
     {
         Ok(result) => result,
         Err(OAuthError::AuthorizationDenied { connection_id }) => {
-            return Ok(callback_redirect(state, "failed", &connection_id));
+            return Ok(callback_redirect(
+                state,
+                CallbackOutcome::Failed,
+                &connection_id,
+            ));
         }
         Err(error) => return Err(oauth_error(request_id, error)),
     };
-    state
+    let outcome = match state
         .sources
         .refresh(
             &result.source_id,
             AuditContext::admin(&request_id.0, admin.id),
         )
         .await
-        .map_err(|error| protocol_error(request_id, error))?;
-    Ok(callback_redirect(state, "success", &result.connection_id))
+    {
+        Ok(_) => CallbackOutcome::Success,
+        Err(_) => CallbackOutcome::SuccessRefreshFailed,
+    };
+    Ok(callback_redirect(state, outcome, &result.connection_id))
 }
 
-fn callback_redirect(state: &AppState, result: &'static str, connection_id: &str) -> Redirect {
+fn callback_redirect(state: &AppState, outcome: CallbackOutcome, connection_id: &str) -> Redirect {
     Redirect::to(&callback_target(
         state.origin.as_ref(),
-        result,
+        outcome,
         connection_id,
     ))
 }
 
-fn callback_target(origin: &str, result: &'static str, connection_id: &str) -> String {
+fn callback_target(origin: &str, outcome: CallbackOutcome, connection_id: &str) -> String {
     let connection_id = utf8_percent_encode(connection_id, NON_ALPHANUMERIC);
+    let result = outcome.as_str();
     format!("{origin}{CALLBACK_UI_PATH}?oauth={connection_id}&result={result}")
 }
 
@@ -425,7 +482,9 @@ mod tests {
         response::{IntoResponse, Redirect},
     };
 
-    use super::{ConnectionListItem, callback_target, oauth_error, with_callback_headers};
+    use super::{
+        CallbackOutcome, ConnectionListItem, callback_target, oauth_error, with_callback_headers,
+    };
     use crate::{
         api::RequestId,
         oauth::{ClientAuthentication, ConnectionStatus, ConnectionView, OAuthError},
@@ -436,10 +495,22 @@ mod tests {
         assert_eq!(
             callback_target(
                 "https://executor.example",
-                "failed",
+                CallbackOutcome::Failed,
                 "connection&result=success#fragment",
             ),
             "https://executor.example/sources?oauth=connection%26result%3Dsuccess%23fragment&result=failed"
+        );
+    }
+
+    #[test]
+    fn callback_target_allows_the_partial_success_outcome() {
+        assert_eq!(
+            callback_target(
+                "https://executor.example",
+                CallbackOutcome::SuccessRefreshFailed,
+                "connection",
+            ),
+            "https://executor.example/sources?oauth=connection&result=success_refresh_failed"
         );
     }
 
@@ -456,19 +527,69 @@ mod tests {
     }
 
     #[test]
-    fn upstream_errors_are_replaced_with_a_safe_generic_response() {
-        let error = oauth_error(
-            &RequestId("request-id".to_owned()),
-            OAuthError::Upstream {
-                code: "provider_error",
-            },
-        );
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error.code, "oauth_upstream_failed");
-        assert_eq!(
-            error.message,
-            "The OAuth provider could not complete the request."
-        );
+    fn oauth_errors_have_exhaustive_status_and_redaction_contracts() {
+        let cases = [
+            (
+                OAuthError::Validation {
+                    code: "invalid_oauth_input",
+                    message: "The OAuth input is invalid.",
+                },
+                StatusCode::BAD_REQUEST,
+                "invalid_oauth_input",
+                "The OAuth input is invalid.",
+            ),
+            (
+                OAuthError::NotFound,
+                StatusCode::NOT_FOUND,
+                "oauth_connection_not_found",
+                "The OAuth connection does not exist.",
+            ),
+            (
+                OAuthError::Conflict {
+                    code: "oauth_binding_changed",
+                    message: "The OAuth binding changed.",
+                },
+                StatusCode::CONFLICT,
+                "oauth_binding_changed",
+                "The OAuth binding changed.",
+            ),
+            (
+                OAuthError::UnauthorizedTransaction,
+                StatusCode::BAD_REQUEST,
+                "invalid_oauth_transaction",
+                "The OAuth transaction is invalid for this administrator session.",
+            ),
+            (
+                OAuthError::AuthorizationDenied {
+                    connection_id: "secret-connection-id".to_owned(),
+                },
+                StatusCode::BAD_REQUEST,
+                "oauth_authorization_denied",
+                "OAuth authorization was denied.",
+            ),
+            (
+                OAuthError::Upstream {
+                    code: "provider_secret_marker",
+                },
+                StatusCode::BAD_GATEWAY,
+                "oauth_upstream_failed",
+                "The OAuth provider could not complete the request.",
+            ),
+            (
+                OAuthError::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "The request could not be completed.",
+            ),
+        ];
+        for (source, status, code, message) in cases {
+            let error = oauth_error(&RequestId("request-id".to_owned()), source);
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+            assert!(!error.message.contains("provider_secret_marker"));
+            assert!(!error.message.contains("secret-connection-id"));
+        }
     }
 
     #[test]

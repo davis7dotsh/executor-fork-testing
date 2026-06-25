@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import {
   ApiError,
   authorizeOAuthConnection,
@@ -14,6 +14,7 @@ import {
   deleteOpenApiCredentials,
   getApproval,
   getOpenApiCredentials,
+  getSourceCreationResolution,
   getSourceCredentials,
   getBootstrap,
   disconnectOAuthConnection,
@@ -32,6 +33,8 @@ import {
   putOAuthConnection,
   putGraphqlCredentials,
   refreshOpenApiSource,
+  revokeToken,
+  sealMissingSourceCreation,
   setSourceMode,
 } from "./api";
 
@@ -136,6 +139,7 @@ function approvalDetailFixture() {
 }
 
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const validTokenSecret = `exr_${"A".repeat(43)}`;
 
 describe("dashboard API client", () => {
   it("normalizes bootstrap data from the control API", async () => {
@@ -153,32 +157,146 @@ describe("dashboard API client", () => {
     document.cookie = "executor_csrf=csrf_test_value; Path=/";
     let observedHeaders = new Headers();
     let observedCredentials: RequestCredentials | undefined;
-    const created = await createToken("Laptop", async (_input, init) => {
+    const created = await createToken("Laptop", "a".repeat(64), async (_input, init) => {
       observedHeaders = new Headers(init?.headers);
       observedCredentials = init?.credentials;
       return Response.json(
         {
           id: "token-id",
           name: "Laptop",
-          token: "exr_secret",
+          token: validTokenSecret,
           createdAt: 123,
         },
-        { status: 201 },
+        { status: 201, headers: { "cache-control": "no-store" } },
       );
     });
 
     expect(observedHeaders.get("x-executor-csrf")).toBe("csrf_test_value");
     expect(observedHeaders.get("content-type")).toBe("application/json");
+    expect(observedHeaders.get("idempotency-key")).toBe("a".repeat(64));
+    expect(
+      [...observedHeaders.keys()].filter((header) => header === "idempotency-key"),
+    ).toHaveLength(1);
     expect(observedCredentials).toBe("same-origin");
     expect(created).toEqual({
       ok: true,
       value: {
         id: "token-id",
         name: "Laptop",
-        token: "exr_secret",
+        token: validTokenSecret,
         createdAt: 123,
       },
+      replayProvenance: "none",
+      responseDisposition: "authoritative",
     });
+  });
+
+  it("accepts only strict no-store token creation and replay responses", async () => {
+    const createdToken = {
+      id: "token-id",
+      name: "Laptop",
+      token: validTokenSecret,
+      createdAt: 123,
+    };
+    const fresh = await createToken("Laptop", "1".repeat(64), async () =>
+      Response.json(createdToken, {
+        status: 201,
+        headers: { "cache-control": "private, no-store" },
+      }),
+    );
+    const replay = await createToken("Laptop", "1".repeat(64), async () =>
+      Response.json(createdToken, {
+        status: 201,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "true",
+        },
+      }),
+    );
+    const missingNoStore = await createToken("Laptop", "1".repeat(64), async () =>
+      Response.json(createdToken, { status: 201 }),
+    );
+    const wrongStatus = await createToken("Laptop", "1".repeat(64), async () =>
+      Response.json(createdToken, {
+        status: 200,
+        headers: { "cache-control": "no-store" },
+      }),
+    );
+    const invalidReplay = await createToken("Laptop", "1".repeat(64), async () =>
+      Response.json(createdToken, {
+        status: 201,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "false",
+        },
+      }),
+    );
+
+    expect(fresh).toMatchObject({
+      ok: true,
+      replayProvenance: "none",
+      responseDisposition: "authoritative",
+    });
+    expect(replay).toMatchObject({
+      ok: true,
+      replayProvenance: "authoritative",
+      responseDisposition: "authoritative",
+    });
+    for (const result of [missingNoStore, wrongStatus, invalidReplay]) {
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "invalid_response" },
+        responseDisposition: "ambiguous",
+      });
+    }
+  });
+
+  it("keeps semantically malformed token successes ambiguous", async () => {
+    const valid = {
+      id: "token-id",
+      name: "Laptop",
+      token: validTokenSecret,
+      createdAt: 123,
+    };
+    const malformed = [
+      { ...valid, id: "" },
+      { ...valid, id: "x".repeat(129) },
+      { ...valid, name: "Different agent" },
+      { ...valid, token: "exr_not-a-32-byte-secret" },
+      { ...valid, token: `exr_${"A".repeat(42)}_` },
+      { ...valid, createdAt: -1 },
+      { ...valid, createdAt: Number.MAX_SAFE_INTEGER + 1 },
+    ];
+
+    for (const body of malformed) {
+      const result = await createToken("Laptop", "2".repeat(64), async () =>
+        Response.json(body, {
+          status: 201,
+          headers: { "cache-control": "no-store" },
+        }),
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "invalid_response" },
+        responseDisposition: "ambiguous",
+      });
+    }
+  });
+
+  it("automatically retries one ambiguous token revocation", async () => {
+    const calls: Array<{ path: string; method: string | undefined }> = [];
+    const result = await revokeToken("token/one", async (input, init) => {
+      calls.push({ path: String(input), method: init?.method });
+      if (calls.length === 1) return Effect.runPromise(Effect.fail("response lost"));
+      return new Response(null, { status: 204 });
+    });
+
+    expect(result).toEqual({ ok: true, value: undefined });
+    expect(calls).toEqual([
+      { path: "/api/v1/tokens/token%2Fone", method: "DELETE" },
+      { path: "/api/v1/tokens/token%2Fone", method: "DELETE" },
+    ]);
   });
 
   it("does not attach a stale CSRF token to login", async () => {
@@ -190,6 +308,512 @@ describe("dashboard API client", () => {
     });
 
     expect(observedHeaders.has("x-executor-csrf")).toBe(false);
+  });
+
+  it("sends exactly one opaque idempotency header for every source connector", async () => {
+    const observations: Array<{
+      headers: Headers;
+      body: unknown;
+      credentials: RequestCredentials | undefined;
+    }> = [];
+    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observations.push({
+        headers: new Headers(init?.headers),
+        body: decodeJson(String(init?.body)),
+        credentials: init?.credentials,
+      });
+      return Response.json(sourceFixture(), { status: 201 });
+    };
+
+    await createOpenApiSource(
+      {
+        kind: "openapi",
+        displayName: "OpenAPI",
+        spec: { type: "inline", content: "openapi: 3.1.0" },
+      },
+      "openapi-key",
+      fetcher,
+    );
+    await createGraphqlSource(
+      {
+        kind: "graphql",
+        displayName: "GraphQL",
+        endpoint: "https://api.example.test/graphql",
+      },
+      "graphql-key",
+      fetcher,
+    );
+    await createMcpHttpSource(
+      {
+        kind: "mcp_http",
+        displayName: "MCP HTTP",
+        endpoint: "https://mcp.example.test/mcp",
+      },
+      "mcp-http-key",
+      fetcher,
+    );
+    await createMcpStdioSource(
+      {
+        kind: "mcp_stdio",
+        displayName: "MCP stdio",
+        templateName: "local",
+        secretValues: {},
+      },
+      "mcp-stdio-key",
+      fetcher,
+    );
+
+    expect(observations.map(({ headers }) => headers.get("idempotency-key"))).toEqual([
+      "openapi-key",
+      "graphql-key",
+      "mcp-http-key",
+      "mcp-stdio-key",
+    ]);
+    for (const observation of observations) {
+      expect(
+        [...observation.headers.keys()].filter((name) => name === "idempotency-key"),
+      ).toHaveLength(1);
+      expect(observation.credentials).toBe("same-origin");
+      expect(JSON.stringify(observation.body)).not.toContain("-key");
+    }
+  });
+
+  it("preserves failed source-create replay metadata and transport ambiguity", async () => {
+    const input = {
+      kind: "graphql" as const,
+      displayName: "GraphQL",
+      endpoint: "https://api.example.test/graphql",
+    };
+    const replayedFailure = await createGraphqlSource(input, "replayed-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "internal_error",
+            message: "The stored source creation failed.",
+            requestId: "stored-failure",
+          },
+        },
+        {
+          status: 500,
+          headers: { "cache-control": "no-store", "idempotency-replayed": "true" },
+        },
+      ),
+    );
+    const firstFailure = await createGraphqlSource(input, "first-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "internal_error",
+            message: "Source creation failed.",
+            requestId: "first-failure",
+          },
+        },
+        { status: 500 },
+      ),
+    );
+    const duplicateReplayHeaders = new Headers();
+    duplicateReplayHeaders.set("Cache-Control", "no-store");
+    duplicateReplayHeaders.append("Idempotency-Replayed", "true");
+    duplicateReplayHeaders.append("idempotency-replayed", "true");
+    const invalidReplayFailure = await createGraphqlSource(input, "invalid-replay-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "internal_error",
+            message: "Source creation failed.",
+            requestId: "invalid-replay-failure",
+          },
+        },
+        { status: 500, headers: duplicateReplayHeaders },
+      ),
+    );
+    const transportFailure = await createGraphqlSource(input, "transport-key", async () =>
+      Effect.runPromise(Effect.fail("connection lost")),
+    );
+
+    expect(replayedFailure).toEqual({
+      ok: false,
+      error: new ApiError({
+        code: "internal_error",
+        displayMessage: "The stored source creation failed.",
+        requestId: "stored-failure",
+        status: 500,
+      }),
+      replayProvenance: "authoritative",
+      responseDisposition: "authoritative",
+    });
+    expect(firstFailure).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", status: 500 },
+      replayProvenance: "none",
+    });
+    expect(invalidReplayFailure).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", status: 500 },
+      replayProvenance: "invalid",
+    });
+    expect(transportFailure).toMatchObject({
+      ok: false,
+      error: { code: "network_error", status: 0 },
+      replayProvenance: "none",
+    });
+  });
+
+  it("keeps malformed replayed failure bodies ambiguous", async () => {
+    const input = {
+      kind: "graphql" as const,
+      displayName: "GraphQL",
+      endpoint: "https://api.example.test/graphql",
+    };
+    const headers = {
+      "cache-control": "no-store",
+      "idempotency-replayed": "true",
+    };
+    const malformedText = await createGraphqlSource(
+      input,
+      "text-key",
+      async () => new Response("gateway failure", { status: 500, headers }),
+    );
+    const malformedJson = await createGraphqlSource(
+      input,
+      "json-key",
+      async () => new Response('{"error":', { status: 500, headers }),
+    );
+    const incompleteError = await createGraphqlSource(input, "incomplete-key", async () =>
+      Response.json(
+        { error: { code: "internal_error", message: "Stored failure." } },
+        { status: 500, headers },
+      ),
+    );
+    const missingNoStore = await createGraphqlSource(input, "cache-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "internal_error",
+            message: "Stored failure.",
+            requestId: "stored-failure",
+          },
+        },
+        { status: 500, headers: { "idempotency-replayed": "true" } },
+      ),
+    );
+
+    for (const result of [malformedText, malformedJson, incompleteError, missingNoStore]) {
+      expect(result.ok).toBe(false);
+      expect(result.replayProvenance).toBe("invalid");
+    }
+  });
+
+  it("requires a valid source body and replay contract for authoritative success", async () => {
+    const input = {
+      kind: "graphql" as const,
+      displayName: "GraphQL",
+      endpoint: "https://api.example.test/graphql",
+    };
+    const replayHeaders = {
+      "cache-control": "private, No-Store",
+      "idempotency-replayed": "true",
+    };
+    const authoritative = await createGraphqlSource(input, "success-key", async () =>
+      Response.json(sourceFixture(), { status: 201, headers: replayHeaders }),
+    );
+    const incompleteBody = await createGraphqlSource(input, "incomplete-key", async () =>
+      Response.json({ ...sourceFixture(), id: undefined }, { status: 201, headers: replayHeaders }),
+    );
+    const missingNoStore = await createGraphqlSource(input, "cache-key", async () =>
+      Response.json(sourceFixture(), {
+        status: 201,
+        headers: { "idempotency-replayed": "true" },
+      }),
+    );
+
+    expect(authoritative).toMatchObject({ ok: true, replayProvenance: "authoritative" });
+    expect(incompleteBody).toMatchObject({
+      ok: false,
+      error: { code: "invalid_response" },
+      replayProvenance: "invalid",
+    });
+    expect(missingNoStore).toMatchObject({ ok: true, replayProvenance: "invalid" });
+  });
+
+  it("looks up source creation using only a no-store authenticated header", async () => {
+    const result = await getSourceCreationResolution("lookup-key", async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/idempotency");
+      expect(init?.method).toBe("GET");
+      expect(init?.body).toBeUndefined();
+      expect(init?.credentials).toBe("same-origin");
+      expect(init?.cache).toBe("no-store");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("idempotency-key")).toBe("lookup-key");
+      expect(headers.has("content-type")).toBe(false);
+      return Response.json({ status: "missing" }, { headers: { "cache-control": "no-store" } });
+    });
+
+    expect(result).toEqual({ ok: true, value: { kind: "status", status: "missing" } });
+  });
+
+  it("accepts a case-insensitive no-store directive from combined Fetch headers", async () => {
+    const headers = new Headers();
+    headers.append("Cache-Control", "private");
+    headers.append("cache-control", "No-Store");
+    expect(headers.get("cache-control")).toBe("private, No-Store");
+
+    const result = await getSourceCreationResolution("lookup-key", async () =>
+      Response.json({ status: "missing" }, { headers }),
+    );
+
+    expect(result).toEqual({ ok: true, value: { kind: "status", status: "missing" } });
+  });
+
+  it("strictly distinguishes successful and failed stored replays", async () => {
+    const completed = await getSourceCreationResolution("completed-key", async () =>
+      Response.json(sourceFixture(), {
+        status: 201,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "true",
+        },
+      }),
+    );
+    const failed = await getSourceCreationResolution("failed-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "invalid_source",
+            message: "The source is invalid.",
+            requestId: "failed-request",
+          },
+        },
+        {
+          status: 422,
+          headers: {
+            "cache-control": "no-store",
+            "idempotency-replayed": "true",
+          },
+        },
+      ),
+    );
+
+    expect(completed.ok && completed.value.kind).toBe("replay");
+    expect(completed.ok && completed.value.kind === "replay" && completed.value.result.ok).toBe(
+      true,
+    );
+    expect(failed).toEqual({
+      ok: true,
+      value: {
+        kind: "replay",
+        result: {
+          ok: false,
+          error: new ApiError({
+            code: "invalid_source",
+            displayMessage: "The source is invalid.",
+            requestId: "failed-request",
+            status: 422,
+          }),
+        },
+      },
+    });
+  });
+
+  it("accepts failed replays only for HTTP error statuses across every source path", async () => {
+    const input = {
+      kind: "graphql" as const,
+      displayName: "GraphQL",
+      endpoint: "https://api.example.test/graphql",
+    };
+    const invalidStatuses = [199, 200, 204, 302, 399, 600] as const;
+    const authoritativeStatuses = [400, 599] as const;
+
+    function failedReplayResponse(status: number) {
+      const nativeStatus = status < 200 ? 200 : status > 599 ? 599 : status;
+      const init = {
+        status: nativeStatus,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "true",
+        },
+      };
+      const response =
+        nativeStatus === 204
+          ? new Response(null, init)
+          : Response.json(
+              {
+                error: {
+                  code: "internal_error",
+                  message: "The stored source creation failed.",
+                  requestId: `failed-${status}`,
+                },
+              },
+              init,
+            );
+      if (nativeStatus !== status) Object.defineProperty(response, "status", { value: status });
+      return response;
+    }
+
+    for (const status of invalidStatuses) {
+      const direct = await createGraphqlSource(input, `direct-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+      const lookup = await getSourceCreationResolution(`lookup-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+      const seal = await sealMissingSourceCreation(`seal-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+
+      expect(direct.ok).toBe(false);
+      expect(direct.replayProvenance).toBe("invalid");
+      for (const result of [lookup, seal]) {
+        expect(result).toMatchObject({
+          ok: false,
+          error: { code: "invalid_response" },
+        });
+      }
+    }
+
+    for (const status of authoritativeStatuses) {
+      const direct = await createGraphqlSource(input, `direct-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+      const lookup = await getSourceCreationResolution(`lookup-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+      const seal = await sealMissingSourceCreation(`seal-${status}`, async () =>
+        failedReplayResponse(status),
+      );
+
+      expect(direct.ok).toBe(false);
+      expect(direct.replayProvenance).toBe("authoritative");
+      for (const result of [lookup, seal]) {
+        expect(result).toMatchObject({
+          ok: true,
+          value: {
+            kind: "replay",
+            result: { ok: false, error: { code: "internal_error", status } },
+          },
+        });
+      }
+    }
+  });
+
+  it("seals with no body and validates the in-progress retry contract", async () => {
+    document.cookie = "executor_csrf=seal_csrf; Path=/";
+    const result = await sealMissingSourceCreation("seal-key", async (input, init) => {
+      expect(String(input)).toBe("/api/v1/sources/idempotency/seal");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBeUndefined();
+      expect(init?.credentials).toBe("same-origin");
+      expect(init?.cache).toBe("no-store");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("idempotency-key")).toBe("seal-key");
+      expect(headers.get("x-executor-csrf")).toBe("seal_csrf");
+      expect(headers.has("content-type")).toBe(false);
+      return Response.json(
+        {
+          error: {
+            code: "idempotency_in_progress",
+            message: "Source creation is still in progress.",
+            requestId: "seal-request",
+          },
+        },
+        {
+          status: 409,
+          headers: { "cache-control": "no-store", "retry-after": "1" },
+        },
+      );
+    });
+
+    expect(result).toEqual({ ok: true, value: { kind: "status", status: "in_progress" } });
+  });
+
+  it("normalizes terminal seal races without treating them as transport failures", async () => {
+    const result = await sealMissingSourceCreation("expired-key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "idempotency_expired_unknown",
+            message: "The record expired.",
+            requestId: "expired-request",
+          },
+        },
+        { status: 410, headers: { "cache-control": "no-store" } },
+      ),
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      value: { kind: "status", status: "expired_unknown" },
+    });
+  });
+
+  it("rejects malformed source creation status metadata", async () => {
+    const missingNoStore = await getSourceCreationResolution("key", async () =>
+      Response.json({ status: "missing" }),
+    );
+    const unknownStatus = await getSourceCreationResolution("key", async () =>
+      Response.json({ status: "completed" }, { headers: { "cache-control": "no-store" } }),
+    );
+    const invalidReplayHeader = await getSourceCreationResolution("key", async () =>
+      Response.json(sourceFixture(), {
+        status: 201,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "false",
+        },
+      }),
+    );
+    const invalidReplayStatus = await getSourceCreationResolution("key", async () =>
+      Response.json(sourceFixture(), {
+        status: 200,
+        headers: {
+          "cache-control": "no-store",
+          "idempotency-replayed": "true",
+        },
+      }),
+    );
+    const missingRetryAfter = await sealMissingSourceCreation("key", async () =>
+      Response.json(
+        {
+          error: {
+            code: "idempotency_in_progress",
+            message: "Still running.",
+            requestId: "request",
+          },
+        },
+        { status: 409, headers: { "cache-control": "no-store" } },
+      ),
+    );
+
+    for (const result of [
+      missingNoStore,
+      unknownStatus,
+      invalidReplayHeader,
+      invalidReplayStatus,
+      missingRetryAfter,
+    ]) {
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error.code).toBe("invalid_response");
+    }
+  });
+
+  it("rejects excess properties in lookup and seal status responses", async () => {
+    const lookup = await getSourceCreationResolution("key", async () =>
+      Response.json(
+        { status: "missing", outcome: "completed" },
+        { headers: { "cache-control": "no-store" } },
+      ),
+    );
+    const seal = await sealMissingSourceCreation("key", async () =>
+      Response.json(
+        { status: "missing", outcome: "completed" },
+        { headers: { "cache-control": "no-store" } },
+      ),
+    );
+
+    for (const result of [lookup, seal]) {
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error.code).toBe("invalid_response");
+    }
   });
 
   it("keeps token list responses masked", async () => {
@@ -513,6 +1137,7 @@ describe("dashboard API client", () => {
           schemes: { bearerAuth: { type: "bearer", token: secret } },
         },
       },
+      "openapi-import-key",
       async (input, init) => {
         expect(String(input)).toBe("/api/v1/sources");
         expect(init?.method).toBe("POST");
@@ -536,6 +1161,7 @@ describe("dashboard API client", () => {
         endpoint: "https://mcp.example.test/rpc?tenant=private",
         allowPrivateNetwork: false,
       },
+      "mcp-http-create-key",
       async (input, init) => {
         expect(String(input)).toBe("/api/v1/sources");
         body = decodeJson(String(init?.body));
@@ -585,6 +1211,7 @@ describe("dashboard API client", () => {
           endpoint: "https://mcp.example.test/mcp",
           credential,
         },
+        `mcp-http-credential-${credential.type}`,
         async (_input, init) => {
           bodies.push(decodeJson(String(init?.body)));
           return Response.json({
@@ -621,6 +1248,7 @@ describe("dashboard API client", () => {
         allowPrivateNetwork: false,
         credential: { type: "bearer", token: "bearer-secret" },
       },
+      "graphql-create-key",
       async (input, init) => {
         expect(String(input)).toBe("/api/v1/sources");
         body = decodeJson(String(init?.body));
@@ -716,6 +1344,7 @@ describe("dashboard API client", () => {
         templateName: "github-local",
         secretValues: { GITHUB_TOKEN: secret },
       },
+      "mcp-stdio-create-key",
       async (input, init) => {
         expect(String(input)).toBe("/api/v1/sources");
         expect(init?.method).toBe("POST");

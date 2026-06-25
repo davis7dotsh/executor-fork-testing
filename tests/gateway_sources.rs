@@ -124,6 +124,7 @@ async fn create_gateway_token(app: &ExecutorApp, admin: &AdminSession) -> String
             (header::COOKIE.as_str(), admin.cookie.as_str()),
             (header::ORIGIN.as_str(), ORIGIN),
             ("x-executor-csrf", admin.csrf.as_str()),
+            ("idempotency-key", "gateway-sources-token"),
         ],
     )
     .await;

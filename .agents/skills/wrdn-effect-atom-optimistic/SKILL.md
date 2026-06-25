@@ -41,7 +41,7 @@ When the trace cannot resolve with the files at hand, drop the finding.
 - `useState` for a "busy" / "submitting" boolean used to disable a button while the mutation runs. That is not optimistic state.
 - `setTimeout` / `setInterval` based debouncing or rate-limiting around a mutation. Different concern.
 - Toast / error-message state. UI feedback, not optimistic data.
-- Server-only code (`legacy/cloud`, `apps/local`, `packages/core/**`). This skill is React-specific; do not flag backend handlers, plugin storage, or test helpers.
+- Server-only code (`legacy/cloud`, `legacy/local`, `packages/core/**`). This skill is React-specific; do not flag backend handlers, plugin storage, or test helpers.
 - Storybook files, test files, and example-only code. The pattern matters in shipped UI; not in fixtures.
 
 ## Severity ladder

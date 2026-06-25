@@ -103,8 +103,8 @@ export const buildMcpInstallCommand = (input: {
 
   const innerArgs = input.isDev
     ? input.devCliCwd
-      ? ["bun", "run", "--cwd", input.devCliCwd, "dev:cli", "mcp"]
-      : ["bun", "run", "dev:cli", "mcp"]
+      ? ["bun", "run", "--cwd", input.devCliCwd, "legacy:dev:cli", "mcp"]
+      : ["bun", "run", "legacy:dev:cli", "mcp"]
     : ["executor", "mcp"];
   if (input.scopeDir) {
     innerArgs.push("--scope", input.scopeDir);

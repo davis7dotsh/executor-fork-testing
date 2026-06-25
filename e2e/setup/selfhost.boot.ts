@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { bootProcesses, waitForHttp, type BootedProcesses } from "./boot";
 
-export const selfhostDir = fileURLToPath(new URL("../../apps/host-selfhost/", import.meta.url));
+export const selfhostDir = fileURLToPath(new URL("../../legacy/host-selfhost/", import.meta.url));
 
 export interface SelfhostBootOptions {
   readonly port: number;

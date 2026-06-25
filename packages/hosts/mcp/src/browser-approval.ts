@@ -9,7 +9,7 @@
 // host's `BrowserApprovalStore` — consumes it.
 //
 // Three hosts implement that flow over two transports: the in-process handler
-// (apps/local, host-selfhost) and the Durable Object (cloud, host-cloudflare).
+// (legacy/local, host-selfhost) and the Durable Object (cloud, host-cloudflare).
 // The wire-shape pieces are identical across all of them, so they live here
 // once: how the mode is read off the request, how the approval URL is built,
 // the resume-payload schema, and the acknowledgement text/structured content.

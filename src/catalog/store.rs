@@ -18,11 +18,14 @@ use super::{
     OAuthBindingExpectation, RequestLogPage, RequestLogRecord, RequestOutcome, RequestSurface,
     SourceHealth, SourceKind, SourceRecord, StagedToolBinding, StoredCredential, StoredToolBinding,
     ToolBinding, ToolMode, ToolPage, ToolRecord, ToolSummary, UpdateSource, effective_mode, search,
+    source_idempotency,
 };
 use crate::{crypto::Keyring, unix_timestamp};
 
 const CREDENTIAL_PURPOSE: &str = "source-credential-v1";
-const RESERVED_SOURCE_SLUGS: [&str; 5] = ["tools", "search", "describe", "sources", "executor"];
+const RESERVED_SOURCE_SLUGS: [&str; 6] =
+    ["tools", "search", "describe", "sources", "executor", "then"];
+const RESERVED_TOOL_NAMES: [&str; 1] = ["then"];
 const TOOL_ERROR_TYPESCRIPT: &str =
     "{ code: string; message: string; status?: number; details?: unknown; retryable?: boolean }";
 const TOOL_HTTP_META_TYPESCRIPT: &str = "{ status: number; headers: { [k: string]: string; } }";
@@ -291,6 +294,15 @@ impl CatalogStore {
         &self.pool
     }
 
+    pub(crate) fn source_creation_idempotency(
+        &self,
+    ) -> source_idempotency::SourceCreationIdempotencyStore {
+        source_idempotency::SourceCreationIdempotencyStore::new(
+            self.pool.clone(),
+            self.keyring.clone(),
+        )
+    }
+
     pub async fn global_revision(&self) -> Result<i64, CatalogError> {
         Ok(
             sqlx::query_scalar("SELECT revision FROM catalog_state WHERE id = 1")
@@ -517,6 +529,17 @@ impl CatalogStore {
             .fetch_one(&mut *transaction)
             .await?
             .try_into()?;
+        if let Some(reservation) = audit.source_creation_idempotency() {
+            let response_body = serde_json::to_vec(&source)?;
+            source_idempotency::complete_source_creation_in(
+                &mut transaction,
+                &self.keyring,
+                reservation,
+                &response_body,
+                now,
+            )
+            .await?;
+        }
         transaction.commit().await?;
         let sync = CatalogSyncResult {
             source_id,
@@ -584,12 +607,28 @@ impl CatalogStore {
             Some(&source_id),
             None,
             Some(&format!("tools.{slug}")),
-            json!({ "kind": input.kind, "slug": slug }),
+            source_created_audit_metadata(audit, input.kind, &slug),
             now,
         )
         .await?;
+        let source: SourceRecord = sqlx::query_as::<_, SourceRow>(SOURCE_SELECT_BY_ID)
+            .bind(&source_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            .try_into()?;
+        if let Some(reservation) = audit.source_creation_idempotency() {
+            let response_body = serde_json::to_vec(&source)?;
+            source_idempotency::complete_source_creation_in(
+                &mut transaction,
+                &self.keyring,
+                reservation,
+                &response_body,
+                now,
+            )
+            .await?;
+        }
         transaction.commit().await?;
-        self.source(&source_id).await
+        Ok(source)
     }
 
     pub async fn list_sources(&self) -> Result<Vec<SourceRecord>, CatalogError> {
@@ -1515,6 +1554,18 @@ impl CatalogStore {
         expected_revision: i64,
         audit: AuditContext<'_>,
     ) -> Result<ToolRecord, CatalogError> {
+        self.set_tool_mode_with_source_revision(tool_id, mode, expected_revision, audit)
+            .await
+            .map(|(tool, _, _)| tool)
+    }
+
+    pub(crate) async fn set_tool_mode_with_source_revision(
+        &self,
+        tool_id: &str,
+        mode: Option<ToolMode>,
+        expected_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<(ToolRecord, String, i64), CatalogError> {
         let _write = self.mutation_lock.write().await;
         let now = unix_timestamp();
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1567,7 +1618,8 @@ impl CatalogStore {
         )
         .await?;
         transaction.commit().await?;
-        self.tool(tool_id).await
+        let tool = self.tool(tool_id).await?;
+        Ok((tool, row.0, source_revision))
     }
 
     pub async fn bulk_set_source_tool_modes(
@@ -3419,7 +3471,7 @@ async fn finalize_catalog_apply(
             Some(source_id),
             None,
             Some(source_path),
-            json!({ "kind": source_kind, "slug": slug }),
+            source_created_audit_metadata(audit, source_kind, slug),
             now,
         )
         .await?;
@@ -3453,6 +3505,24 @@ async fn finalize_catalog_apply(
     )
     .await?;
     Ok((revisions.0, revisions.1, global_revision))
+}
+
+fn source_created_audit_metadata(
+    audit: AuditContext<'_>,
+    source_kind: SourceKind,
+    slug: &str,
+) -> Value {
+    let mut metadata = json!({ "kind": source_kind, "slug": slug });
+    if let Some(idempotency_record_id) = audit.source_creation_idempotency_id() {
+        metadata
+            .as_object_mut()
+            .expect("source audit metadata is an object")
+            .insert(
+                "idempotencyRecordId".to_owned(),
+                Value::String(idempotency_record_id.to_owned()),
+            );
+    }
+    metadata
 }
 
 async fn apply_artifacts(
@@ -3532,10 +3602,11 @@ async fn apply_tools(
         .map(|tool| tool.stable_key.clone())
         .collect::<HashSet<_>>();
     validate_tool_history(&existing_by_key, &staged_keys)?;
-    let used_names = existing_by_key
+    let mut used_names = existing_by_key
         .values()
         .map(|(local_name, _)| local_name.clone())
         .collect::<HashSet<_>>();
+    used_names.extend(RESERVED_TOOL_NAMES.into_iter().map(str::to_owned));
     let mut name_allocator = NameAllocator::new(used_names);
     for tool in tools {
         let local_name = existing_by_key

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
-  import { createMcpHttpSource, type ApiError, type Source } from "$lib/api";
+  import { type ApiError, type ApiResult, type McpHttpSourceInput, type Source } from "$lib/api";
   import { useAuthState } from "$lib/auth.svelte";
   import { unexpectedRequestError } from "$lib/catalog-state";
   import {
@@ -9,8 +9,17 @@
     requiresPrivateNetworkOptIn,
     type McpHttpAuthDraft,
   } from "$lib/mcp-source-state";
-
-  let { oncreated }: { oncreated: (source: Source) => void } = $props();
+  let {
+    create,
+    oncreated,
+    onbusychange,
+    disabled = false,
+  }: {
+    create: (input: McpHttpSourceInput, signal: AbortSignal) => Promise<ApiResult<Source>>;
+    oncreated?: (source: Source) => void;
+    onbusychange?: (busy: boolean) => void;
+    disabled?: boolean;
+  } = $props();
 
   const auth = useAuthState();
   let endpoint = $state("");
@@ -31,6 +40,7 @@
   let credentialPayload = $derived(buildMcpHttpCredential(credentialDraft));
   let activeController: AbortController | null = null;
   let lifetime = 0;
+  let reportedBusy = false;
 
   $effect(() => {
     lifetime += 1;
@@ -39,13 +49,20 @@
       activeController?.abort();
       activeController = null;
       credentialDraft = { ...credentialDraft, secret: "" };
+      if (reportedBusy) onbusychange?.(false);
     };
+  });
+
+  $effect(() => {
+    if (busy === reportedBusy) return;
+    reportedBusy = busy;
+    onbusychange?.(busy);
   });
 
   async function connect(event: SubmitEvent) {
     event.preventDefault();
     const currentCredential = credentialPayload;
-    if (busy || localOptInMissing || currentCredential === null) return;
+    if (busy || disabled || localOptInMissing || currentCredential === null) return;
 
     activeController?.abort();
     const controller = new AbortController();
@@ -53,48 +70,41 @@
     activeController = controller;
     busy = true;
     error = null;
-    const settled = await createMcpHttpSource(
-      {
-        kind: "mcp_http",
-        displayName: displayName.trim(),
-        ...(description.trim() ? { description: description.trim() } : {}),
-        endpoint: endpoint.trim(),
-        allowPrivateNetwork,
-        ...(currentCredential.credential === null
-          ? {}
-          : { credential: currentCredential.credential }),
-      },
-      undefined,
-      controller.signal,
-    ).then(
-      (result) => ({ ok: true, result }) as const,
-      () => ({ ok: false }) as const,
+    const input = {
+      kind: "mcp_http",
+      displayName: displayName.trim(),
+      ...(description.trim() ? { description: description.trim() } : {}),
+      endpoint: endpoint.trim(),
+      allowPrivateNetwork,
+      ...(currentCredential.credential === null
+        ? {}
+        : { credential: currentCredential.credential }),
+    } satisfies McpHttpSourceInput;
+    credentialDraft = { ...credentialDraft, secret: "" };
+    const result = await create(input, controller.signal).then(
+      (response) => response,
+      () => ({ ok: false, error: unexpectedRequestError() }) as const,
     );
     if (owner !== lifetime || activeController !== controller || controller.signal.aborted) return;
+
     activeController = null;
     busy = false;
-    credentialDraft = { ...credentialDraft, secret: "" };
 
-    if (!settled.ok) {
-      error = unexpectedRequestError();
-      await focusError();
-      return;
-    }
-    if (!settled.result.ok) {
-      if (!auth?.recoverFromApiError(settled.result.error)) {
-        error = settled.result.error;
+    if (!result.ok) {
+      if (!auth?.recoverFromApiError(result.error)) {
+        error = result.error;
         await focusError();
       }
       return;
     }
 
-    const source = settled.result.value;
+    const source = result.value;
     endpoint = "";
     displayName = "";
     description = "";
     allowPrivateNetwork = false;
     credentialDraft = { type: "none", headerName: "", username: "", secret: "" };
-    oncreated(source);
+    oncreated?.(source);
   }
 
   async function focusError() {
@@ -104,7 +114,7 @@
 </script>
 
 <form class="mcp-form" onsubmit={connect} aria-labelledby="mcp-http-form-title">
-  <fieldset disabled={busy}>
+  <fieldset disabled={busy || disabled}>
     <legend id="mcp-http-form-title">MCP Streamable HTTP</legend>
     <p>
       Connect a remote or local MCP server. Executor negotiates the protocol and imports its tool
@@ -211,7 +221,7 @@
   <button
     class="primary"
     type="submit"
-    disabled={busy || localOptInMissing || credentialPayload === null}
+    disabled={busy || disabled || localOptInMissing || credentialPayload === null}
   >
     {busy ? "Connecting..." : "Connect source"}
   </button>

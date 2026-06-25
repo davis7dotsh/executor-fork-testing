@@ -59,7 +59,7 @@
   "overrides": [
     {
       "files": [
-        "apps/cli/src/**/*.{ts,tsx}",
+        "legacy/cli/src/**/*.{ts,tsx}",
         "legacy/desktop/src/main/**/*.{ts,tsx}",
         "scripts/**/*.{ts,js}",
         "apps/*/scripts/**/*.{ts,js}",

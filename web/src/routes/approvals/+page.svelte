@@ -3,12 +3,12 @@
   import { page } from "$app/state";
   import { onMount, tick, untrack } from "svelte";
   import DashboardShell from "$lib/DashboardShell.svelte";
-  import ErrorNotice from "$lib/ErrorNotice.svelte";
   import { useAuthState } from "$lib/auth.svelte";
   import {
     decideApproval,
     getApproval,
     listApprovals,
+    type ApiError,
     type ApprovalDecision,
     type ApprovalDetail,
     type ApprovalPage,
@@ -31,33 +31,78 @@
   } from "$lib/approval-url";
   import {
     beginIdentityResourceLoad,
-    beginResourceLoad,
     createLatestRequest,
     emptyResource,
     settleResourceLoad,
     unexpectedRequestError,
   } from "$lib/catalog-state";
 
+  type RefreshIntent = {
+    readonly generation: number;
+    readonly announce: boolean;
+  };
+
+  type ApprovalNavigation = {
+    readonly url: URL;
+    readonly goto: (destination: string) => void | Promise<void>;
+  };
+
+  type ApprovalPollEnvironment = {
+    readonly schedule: (callback: () => void, delay: number) => number;
+    readonly cancel: (handle: number) => void;
+    readonly isVisible: () => boolean;
+  };
+
+  let {
+    approvalNavigation,
+    approvalPollEnvironment,
+  }: {
+    approvalNavigation?: ApprovalNavigation;
+    approvalPollEnvironment?: ApprovalPollEnvironment;
+  } = $props();
+
   const auth = useAuthState();
   const listRequest = createLatestRequest();
   const detailRequest = createLatestRequest();
-  let searchKey = $derived(page.url.search);
+  let searchKey = $derived((approvalNavigation?.url ?? page.url).search);
   let urlState = $derived(parseApprovalsUrl(new URLSearchParams(searchKey)));
   let listKey = $derived(approvalsListKey(urlState));
   let resource = $state(emptyResource<ApprovalPage>());
+  let resourceIdentity = $state<string | null>(null);
   let detail = $state(emptyResource<ApprovalDetail>());
   let detailIdentity = $state<string | null>(null);
-  let refreshKey = $state(0);
-  let detailRefreshKey = $state(0);
+  let listRefresh = $state<RefreshIntent>({ generation: 0, announce: false });
+  let detailRefresh = $state<RefreshIntent>({ generation: 0, announce: false });
+  let announceListLoading = $state(false);
+  let announceDetailLoading = $state(false);
+  let announceListError = $state(false);
+  let announceDetailError = $state(false);
   let detailReturnId = $state<string | null>(null);
   let now = $state(Date.now());
   let confirming = $state<ApprovalDecision | null>(null);
   let decisionById = $state<Record<string, ApprovalDecision | undefined>>({});
-  let decisionError = $state<import("$lib/api").ApiError | null>(null);
+  let decisionFenceById = $state<Record<string, number | undefined>>({});
+  let decisionError = $state<ApiError | null>(null);
   let announcement = $state("");
   let disposed = false;
+  let decisionUnavailable = $derived.by(() => {
+    const approval = detail.data;
+    if (
+      !auth.authenticated ||
+      approval === null ||
+      detail.loading ||
+      detail.stale ||
+      detailIdentity !== urlState.approval ||
+      approval.id !== urlState.approval ||
+      !canDecideApproval(approval, now)
+    ) {
+      return true;
+    }
+    const fencedRevision = decisionFenceById[approval.id];
+    return fencedRevision !== undefined && approval.revision <= fencedRevision;
+  });
   let decisionReadOnly = $derived(
-    resource.loading || resource.stale || detail.loading || detail.stale,
+    decisionUnavailable || (detail.data !== null && decisionById[detail.data.id] !== undefined),
   );
 
   onMount(() => {
@@ -79,39 +124,67 @@
   });
 
   $effect(() => {
+    const environment = approvalPollEnvironment;
     return createApprovalPoller({
-      schedule: (callback, delay) => window.setTimeout(callback, delay),
-      cancel: (handle) => window.clearTimeout(handle),
-      isVisible: () => document.visibilityState === "visible",
+      schedule: environment?.schedule ?? ((callback, delay) => window.setTimeout(callback, delay)),
+      cancel: environment?.cancel ?? ((handle) => window.clearTimeout(handle)),
+      isVisible: environment?.isVisible ?? (() => document.visibilityState === "visible"),
       isListLoading: () => resource.loading,
       hasDetail: () => urlState.approval !== null,
       isDetailLoading: () => detail.loading,
-      refreshList: () => (refreshKey += 1),
-      refreshDetail: () => (detailRefreshKey += 1),
+      refreshList: () => requestListRefresh(false),
+      refreshDetail: () => requestDetailRefresh(false),
     });
   });
 
   $effect(() => {
     const key = listKey;
-    const requestKey = `${key}\u0000${refreshKey}`;
+    const refresh = listRefresh;
+    const requestKey = `${key}\u0000${refresh.generation}`;
     const status = urlState.status === "all" ? null : urlState.status;
     const cursor = urlState.cursor;
-    resource = beginResourceLoad(untrack(() => resource));
+    const identityChanged = untrack(() => resourceIdentity) !== key;
+    const previousResource = untrack(() => resource);
+    const preservePassiveError =
+      !identityChanged && !refresh.announce && previousResource.error !== null;
+    const announceFailure = identityChanged || refresh.announce || previousResource.error === null;
+    const started = beginIdentityResourceLoad(
+      previousResource,
+      untrack(() => resourceIdentity),
+      key,
+    );
+    resourceIdentity = started.identity;
+    resource = preservePassiveError
+      ? { ...started.state, error: previousResource.error }
+      : started.state;
+    announceListLoading = identityChanged || refresh.announce;
     return listRequest.start(
       async (signal) => ({
         requestKey,
         result: await listApprovals({ status, cursor, limit: 50 }, undefined, signal),
       }),
       ({ requestKey: completedKey, result }) => {
-        if (completedKey !== `${listKey}\u0000${refreshKey}`) return;
+        if (completedKey !== `${listKey}\u0000${listRefresh.generation}`) return;
         if (!result.ok && auth.recoverFromApiError(result.error)) return;
-        resource = settleResourceLoad(resource, result);
+        const settled = settleResourceLoad(resource, result);
+        resource =
+          !result.ok && preservePassiveError && previousResource.error !== null
+            ? { ...settled, error: previousResource.error }
+            : settled;
+        announceListError = !result.ok && (announceFailure || announceListError);
+        announceListLoading = false;
       },
       () => {
-        resource = settleResourceLoad(resource, {
+        const settled = settleResourceLoad(resource, {
           ok: false,
           error: unexpectedRequestError(),
         });
+        resource =
+          preservePassiveError && previousResource.error !== null
+            ? { ...settled, error: previousResource.error }
+            : settled;
+        announceListError = announceFailure || announceListError;
+        announceListLoading = false;
       },
     );
   });
@@ -134,12 +207,15 @@
 
   $effect(() => {
     const approvalId = urlState.approval;
-    const requestKey = `${approvalId ?? ""}\u0000${detailRefreshKey}`;
+    const refresh = detailRefresh;
+    const requestKey = `${approvalId ?? ""}\u0000${refresh.generation}`;
     if (approvalId === null) {
       confirming = null;
       decisionError = null;
       detail = { data: null, loading: false, error: null, stale: false };
       detailIdentity = null;
+      announceDetailLoading = false;
+      announceDetailError = false;
       return;
     }
     const identityChanged = untrack(() => detailIdentity) !== approvalId;
@@ -147,26 +223,57 @@
       confirming = null;
       decisionError = null;
     }
+    const previousDetailResource = untrack(() => detail);
+    const preservePassiveError =
+      !identityChanged && !refresh.announce && previousDetailResource.error !== null;
+    const announceFailure =
+      identityChanged || refresh.announce || previousDetailResource.error === null;
     const started = beginIdentityResourceLoad(
-      untrack(() => detail),
+      previousDetailResource,
       untrack(() => detailIdentity),
       approvalId,
     );
     detailIdentity = started.identity;
-    detail = started.state;
+    detail = preservePassiveError
+      ? { ...started.state, error: previousDetailResource.error }
+      : started.state;
+    announceDetailLoading = identityChanged || refresh.announce;
     return detailRequest.start(
       async (signal) => ({
         requestKey,
         result: await getApproval(approvalId, undefined, signal),
       }),
       ({ requestKey: completedKey, result }) => {
-        if (completedKey !== `${urlState.approval ?? ""}\u0000${detailRefreshKey}`) return;
+        if (completedKey !== `${urlState.approval ?? ""}\u0000${detailRefresh.generation}`) return;
         if (!result.ok && auth.recoverFromApiError(result.error)) return;
         const decisionHadFocus =
           document.getElementById("approval-decision-region")?.contains(document.activeElement) ??
           false;
-        if (result.ok) decisionError = null;
-        detail = settleResourceLoad(detail, result, { retainDataOnError: false });
+        const previousDetail = detail.data;
+        if (result.ok) {
+          decisionError = null;
+          if (
+            previousDetail !== null &&
+            (previousDetail.revision !== result.value.revision ||
+              previousDetail.status !== result.value.status)
+          ) {
+            confirming = null;
+          }
+          const fencedRevision = decisionFenceById[result.value.id];
+          if (
+            fencedRevision !== undefined &&
+            (result.value.revision > fencedRevision || result.value.status !== "pending")
+          ) {
+            delete decisionFenceById[result.value.id];
+          }
+        }
+        const settled = settleResourceLoad(detail, result, { retainDataOnError: false });
+        detail =
+          !result.ok && preservePassiveError && previousDetailResource.error !== null
+            ? { ...settled, error: previousDetailResource.error }
+            : settled;
+        announceDetailError = !result.ok && (announceFailure || announceDetailError);
+        announceDetailLoading = false;
         if (decisionHadFocus && (!result.ok || !canDecideApproval(result.value, Date.now()))) {
           announcement = result.ok
             ? `This approval is now ${approvalStatusLabel(result.value.status)}.`
@@ -180,18 +287,32 @@
         }
       },
       () => {
-        detail = settleResourceLoad(
+        const settled = settleResourceLoad(
           detail,
           { ok: false, error: unexpectedRequestError() },
           { retainDataOnError: false },
         );
+        detail =
+          preservePassiveError && previousDetailResource.error !== null
+            ? { ...settled, error: previousDetailResource.error }
+            : settled;
+        announceDetailError = announceFailure || announceDetailError;
+        announceDetailLoading = false;
       },
     );
   });
 
+  function requestListRefresh(announce: boolean) {
+    listRefresh = { generation: listRefresh.generation + 1, announce };
+  }
+
+  function requestDetailRefresh(announce: boolean) {
+    detailRefresh = { generation: detailRefresh.generation + 1, announce };
+  }
+
   function refreshApprovals() {
-    refreshKey += 1;
-    if (urlState.approval !== null) detailRefreshKey += 1;
+    requestListRefresh(true);
+    if (urlState.approval !== null) requestDetailRefresh(true);
   }
 
   async function beginConfirmation(decision: ApprovalDecision) {
@@ -211,16 +332,23 @@
     const select = event.currentTarget;
     if (!(select instanceof HTMLSelectElement)) return;
     const status = select.value as ApprovalStatusFilter;
-    void goto(approvalsUrl(urlState, { status, cursor: null, approval: null }));
+    void navigate(approvalsUrl(urlState, { status, cursor: null, approval: null }));
   }
 
   async function submitDecision(approval: ApprovalDetail, decision: ApprovalDecision) {
-    if (decisionById[approval.id] !== undefined || decisionReadOnly) return;
+    if (
+      decisionReadOnly ||
+      detail.data?.id !== approval.id ||
+      detail.data.revision !== approval.revision ||
+      detail.data.status !== approval.status
+    ) {
+      return;
+    }
     if (!canDecideApproval(approval, Date.now())) {
       confirming = null;
       announcement = "The approval deadline passed. Reloaded it for review.";
-      refreshKey += 1;
-      detailRefreshKey += 1;
+      requestListRefresh(false);
+      requestDetailRefresh(false);
       await tick();
       document.getElementById("approval-detail-panel")?.focus();
       return;
@@ -233,8 +361,8 @@
     const toolLabel = approval.toolDisplayName ?? approval.path;
     announcement = `${decision === "approve" ? "Approving" : "Denying"} ${toolLabel}...`;
     const result = await decideApproval(approval.id, decision, approval.revision);
-    delete decisionById[approval.id];
     if (disposed) return;
+    delete decisionById[approval.id];
 
     if (!result.ok) {
       if (auth.recoverFromApiError(result.error)) return;
@@ -242,12 +370,16 @@
       decisionError = result.error;
       confirming = null;
       if (result.error.status === 409 || result.error.status === 410) {
+        decisionFenceById[approval.id] = Math.max(
+          decisionFenceById[approval.id] ?? approval.revision,
+          approval.revision,
+        );
         announcement =
           result.error.status === 409
             ? "This approval changed before your decision. Reloaded it for review."
             : "The approval deadline passed. Reloaded it for review.";
-        refreshKey += 1;
-        detailRefreshKey += 1;
+        requestListRefresh(false);
+        requestDetailRefresh(false);
         await tick();
         document.getElementById("approval-detail-panel")?.focus();
       } else {
@@ -276,7 +408,7 @@
         stale: false,
       };
     }
-    refreshKey += 1;
+    requestListRefresh(false);
 
     if (!scope.sameDetail) return;
     announcement = `${toolLabel} was ${decision === "approve" ? "approved" : "denied"}.`;
@@ -285,11 +417,11 @@
 
     if (scope.sameList && submittedStatus === "pending") {
       const target = focusTargetAfterDecision(submittedItems, approval.id);
-      await goto(approvalsUrl(urlState, { approval: null }));
+      await navigate(approvalsUrl(urlState, { approval: null }));
       await tick();
       document.getElementById(target)?.focus();
     } else {
-      detailRefreshKey += 1;
+      requestDetailRefresh(false);
     }
   }
 
@@ -314,7 +446,11 @@
 
   function closeDetail() {
     detailReturnId = detail.data?.id ?? urlState.approval;
-    void goto(approvalsUrl(urlState, { approval: null }));
+    void navigate(approvalsUrl(urlState, { approval: null }));
+  }
+
+  function navigate(destination: string) {
+    return approvalNavigation?.goto(destination) ?? goto(destination);
   }
 
   function handleWindowKeydown(event: KeyboardEvent) {
@@ -325,6 +461,15 @@
 </script>
 
 <svelte:window onkeydown={handleWindowKeydown} />
+
+{#snippet approvalError(error: ApiError, announce: boolean)}
+  <div class="notice error" role={announce ? "alert" : undefined}>
+    <strong>{error.displayMessage}</strong>
+    {#if error.requestId !== null}
+      <small>Request reference: <code>{error.requestId}</code></small>
+    {/if}
+  </div>
+{/snippet}
 
 <DashboardShell title="Approvals" description="Review each sensitive tool call before it can run.">
   <p class="visually-hidden" aria-live="polite">{announcement}</p>
@@ -357,26 +502,32 @@
       </select>
     </label>
     <div class="button-row">
-      {#if resource.loading}<span class="muted-status" role="status">Refreshing...</span>{/if}
+      {#if resource.loading}<span
+          class="muted-status"
+          role={announceListLoading && resource.data !== null ? "status" : undefined}
+          >Refreshing...</span
+        >{/if}
       <button type="button" disabled={resource.loading} onclick={refreshApprovals}>Refresh</button>
     </div>
   </section>
 
   {#if resource.stale && resource.error !== null}
-    <div class="stale-notice" role="status">
-      Showing the last loaded approval page read-only while Executor reconnects.
-      <ErrorNotice error={resource.error} />
+    <div class="stale-notice" role={announceListError ? "status" : undefined}>
+      Showing the last loaded approval page while Executor reconnects.
+      {@render approvalError(resource.error, false)}
     </div>
   {:else if resource.error !== null}
     <section class="surface table-unavailable">
-      <ErrorNotice error={resource.error} />
+      {@render approvalError(resource.error, announceListError)}
       <button type="button" onclick={refreshApprovals}>Try again</button>
     </section>
   {/if}
 
   <section class="surface table-card" aria-busy={resource.loading}>
     {#if resource.data === null && resource.loading}
-      <div class="loading-panel" aria-live="polite">Loading approvals...</div>
+      <div class="loading-panel" aria-live={announceListLoading ? "polite" : undefined}>
+        Loading approvals...
+      </div>
     {:else if resource.data !== null && resource.data.items.length === 0}
       <div class="table-empty">
         <p>
@@ -481,16 +632,23 @@
       </div>
       {#if detail.error !== null}
         <div class="detail-body">
-          <ErrorNotice error={detail.error} />
-          <button id="retry-approval-detail" type="button" onclick={() => (detailRefreshKey += 1)}
-            >Retry details</button
+          {@render approvalError(detail.error, announceDetailError)}
+          <button
+            id="retry-approval-detail"
+            type="button"
+            onclick={() => requestDetailRefresh(true)}>Retry details</button
           >
         </div>
       {:else if detail.loading && detail.data === null}
-        <div class="loading-panel" role="status">Loading approval detail...</div>
+        <div class="loading-panel" role={announceDetailLoading ? "status" : undefined}>
+          Loading approval detail...
+        </div>
       {:else if detail.data !== null}
         <div class="detail-body">
-          {#if detail.loading}<p class="muted-status" role="status">
+          {#if detail.loading}<p
+              class="muted-status"
+              role={announceDetailLoading ? "status" : undefined}
+            >
               Refreshing approval detail...
             </p>{/if}
           <div class="approval-detail-heading">
@@ -573,9 +731,9 @@
 
           {#if canDecideApproval(detail.data, now)}
             <div id="approval-decision-region" class="approval-decision">
-              {#if decisionReadOnly}
-                <p class="muted-status" role="status">
-                  Decisions are paused while the latest approval state loads.
+              {#if decisionUnavailable}
+                <p class="muted-status">
+                  Decisions are paused until the current approval state is ready.
                 </p>
               {/if}
               {#if confirming === null}
@@ -589,14 +747,14 @@
                     id="start-approve"
                     class="primary"
                     type="button"
-                    disabled={decisionReadOnly || decisionById[detail.data.id] !== undefined}
+                    disabled={decisionReadOnly}
                     onclick={() => beginConfirmation("approve")}>Approve once</button
                   >
                   <button
                     id="start-deny"
                     class="danger-link"
                     type="button"
-                    disabled={decisionReadOnly || decisionById[detail.data.id] !== undefined}
+                    disabled={decisionReadOnly}
                     onclick={() => beginConfirmation("deny")}>Deny</button
                   >
                 </div>
@@ -612,7 +770,7 @@
                       class:primary={confirming === "approve"}
                       class:danger-button={confirming === "deny"}
                       type="button"
-                      disabled={decisionReadOnly || decisionById[detail.data.id] !== undefined}
+                      disabled={decisionReadOnly}
                       onclick={() => submitDecision(detail.data!, confirming!)}
                     >
                       {decisionById[detail.data.id] !== undefined
@@ -641,7 +799,7 @@
             </div>
           {/if}
 
-          {#if decisionError !== null}<ErrorNotice error={decisionError} />{/if}
+          {#if decisionError !== null}{@render approvalError(decisionError, true)}{/if}
         </div>
       {/if}
     </aside>

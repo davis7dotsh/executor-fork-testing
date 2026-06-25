@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, fs, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use axum::{
     Router,
@@ -22,6 +29,7 @@ use tower::ServiceExt;
 
 const ORIGIN: &str = "http://127.0.0.1:4788";
 const PASSWORD: &str = "correct-horse-battery-staple";
+static TOKEN_IDEMPOTENCY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct TestExecutor {
     directory: TempDir,
@@ -147,6 +155,10 @@ impl TestExecutor {
     }
 
     async fn create_api_token(&self, admin: &AdminSession, name: &str) -> String {
+        let idempotency_key = format!(
+            "catalog-api-token-{}",
+            TOKEN_IDEMPOTENCY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
         let response = send_json(
             self.router(),
             Method::POST,
@@ -156,6 +168,7 @@ impl TestExecutor {
                 (header::COOKIE.as_str(), &admin.cookie),
                 (header::ORIGIN.as_str(), ORIGIN),
                 ("x-executor-csrf", &admin.csrf),
+                ("idempotency-key", idempotency_key.as_str()),
             ],
         )
         .await;

@@ -64,7 +64,7 @@ legacy/cloud/.e2e-db/
 # covers ad-hoc variants like .e2e-stub-db-manual from debugging boots)
 e2e/runs/
 legacy/cloud/.e2e-stub-db*/
-apps/host-selfhost/.e2e-data*/
+legacy/host-selfhost/.e2e-data*/
 
 # playwright e2e artifacts
 test-results/

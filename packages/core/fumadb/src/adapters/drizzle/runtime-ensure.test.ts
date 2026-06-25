@@ -38,8 +38,8 @@ const columnNames = async (client: ReturnType<typeof createClient>): Promise<rea
   return info.rows.map((row) => String(row["name"]));
 };
 
-// This is the boot bring-up that backs apps/local, apps/host-selfhost, and
-// apps/host-cloudflare: `CREATE TABLE IF NOT EXISTS` never alters an existing
+// This is the boot bring-up that backs legacy/local, legacy/host-selfhost, and
+// legacy/host-cloudflare: `CREATE TABLE IF NOT EXISTS` never alters an existing
 // table, so without column evolution a file from an earlier baseline would
 // 500 on the first query against a new column. (Cloud Postgres gets the same
 // columns from a generated drizzle migration instead.)

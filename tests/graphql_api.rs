@@ -89,7 +89,12 @@ async fn graphql_create_redacts_the_locator_and_query_tools_invoke() {
         Method::POST,
         "/api/v1/tokens",
         json!({ "name": "GraphQL test" }),
-        &admin_headers(&admin),
+        &[
+            (header::COOKIE.as_str(), admin.cookie.as_str()),
+            (header::ORIGIN.as_str(), ORIGIN),
+            ("x-executor-csrf", admin.csrf.as_str()),
+            ("idempotency-key", "graphql-api-token"),
+        ],
     )
     .await;
     let token = body(token_response).await["token"]

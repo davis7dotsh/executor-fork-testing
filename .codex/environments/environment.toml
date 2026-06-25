@@ -67,9 +67,9 @@ icon = "run"
 command = "bun i"
 
 [[actions]]
-name = "Run Local Server"
+name = "Run Legacy Local Server"
 icon = "tool"
 command = '''
-cd apps/local
+cd legacy/local
 bun dev
 '''

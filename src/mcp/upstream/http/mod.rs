@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex as StateMutex, MutexGuard},
+    sync::{
+        Arc, Mutex as StateMutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -7,11 +10,11 @@ use reqwest::{
     Method, StatusCode,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
-use rmcp::model::ProtocolVersion;
+use rmcp::model::{CallToolResult, ProtocolVersion};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::sync::{RwLock as AsyncRwLock, broadcast};
-use url::Url;
+use tokio::sync::{Notify, RwLock as AsyncRwLock, broadcast, oneshot};
+use url::{Host, Url};
 
 #[cfg(test)]
 use crate::outbound::OutboundResponse;
@@ -31,6 +34,7 @@ const MAX_SSE_RECONNECTS: usize = 3;
 const MAX_LOGICAL_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MCP_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFICATION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SESSION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct StreamableHttpConfig {
@@ -89,6 +93,8 @@ pub enum StreamableHttpError {
     SessionChanged,
     #[error("the MCP server selected an unsupported protocol version")]
     ProtocolVersionMismatch,
+    #[error("MCP HTTP endpoints must use HTTPS, except for loopback HTTP")]
+    InsecureEndpoint,
     #[error("the MCP transport has not been initialized")]
     NotInitialized,
     #[error("the MCP transport is already initialized")]
@@ -113,16 +119,69 @@ struct TransportState {
     generation: u64,
 }
 
+#[derive(Default)]
+struct SessionTerminationTracker {
+    pending: AtomicUsize,
+    drained: Notify,
+}
+
+impl SessionTerminationTracker {
+    fn start(self: &Arc<Self>) -> SessionTerminationPermit {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        SessionTerminationPermit {
+            tracker: self.clone(),
+        }
+    }
+
+    async fn wait(&self) {
+        while self.pending.load(Ordering::Acquire) != 0 {
+            self.drained.notified().await;
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
+    }
+}
+
+struct SessionTerminationPermit {
+    tracker: Arc<SessionTerminationTracker>,
+}
+
+impl Drop for SessionTerminationPermit {
+    fn drop(&mut self) {
+        self.tracker.pending.fetch_sub(1, Ordering::AcqRel);
+        self.tracker.drained.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct InitializationCleanupInterleave {
+    drained: Notify,
+    resume: Notify,
+}
+
 struct InitializationGuard {
     state: Arc<StateMutex<TransportState>>,
+    client: HardenedHttpClient,
+    endpoint: Url,
+    headers: HeaderMap,
+    requested_protocol_version: ProtocolVersion,
+    session_terminations: Arc<SessionTerminationTracker>,
     generation: u64,
     committed: bool,
 }
 
 impl InitializationGuard {
-    fn new(state: Arc<StateMutex<TransportState>>, generation: u64) -> Self {
+    fn new(transport: &StreamableHttpTransport, generation: u64) -> Self {
         Self {
-            state,
+            state: transport.state.clone(),
+            client: transport.client.clone(),
+            endpoint: transport.endpoint.clone(),
+            headers: transport.headers.clone(),
+            requested_protocol_version: transport.requested_protocol_version.clone(),
+            session_terminations: transport.session_terminations.clone(),
             generation,
             committed: false,
         }
@@ -138,15 +197,38 @@ impl Drop for InitializationGuard {
         if self.committed {
             return;
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.generation == self.generation {
+        let cleanup = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation != self.generation {
+                return;
+            }
             state.generation = state.generation.wrapping_add(1);
-            state.session_id = None;
-            state.negotiated_protocol_version = None;
+            let session_id = state.session_id.take();
+            let protocol_version = state
+                .negotiated_protocol_version
+                .take()
+                .unwrap_or_else(|| self.requested_protocol_version.clone());
             state.initialized = false;
+            session_id.map(|session_id| {
+                (
+                    session_id,
+                    protocol_version,
+                    self.session_terminations.start(),
+                )
+            })
+        };
+        if let Some((session_id, protocol_version, permit)) = cleanup {
+            let _ = spawn_session_termination(
+                self.client.clone(),
+                self.endpoint.clone(),
+                self.headers.clone(),
+                session_id,
+                protocol_version,
+                permit,
+            );
         }
     }
 }
@@ -166,6 +248,10 @@ pub struct StreamableHttpTransport {
     client_version: Arc<str>,
     state: Arc<StateMutex<TransportState>>,
     lifecycle: Arc<AsyncRwLock<()>>,
+    session_terminations: Arc<SessionTerminationTracker>,
+    #[cfg(test)]
+    initialization_cleanup_interleave:
+        Arc<StateMutex<Option<Arc<InitializationCleanupInterleave>>>>,
     tool_list_changed: broadcast::Sender<()>,
 }
 
@@ -187,10 +273,17 @@ impl StreamableHttpTransport {
         }
         let policy = OutboundPolicy {
             allow_private_networks: config.allow_private_networks,
+            require_https_or_loopback: true,
             max_redirects: 0,
             ..OutboundPolicy::default()
         };
+        if let Ok(endpoint) = Url::parse(&config.endpoint)
+            && endpoint.scheme() == "http"
+        {
+            validate_transport_endpoint(&endpoint)?;
+        }
         let endpoint = parse_url(&config.endpoint, &policy)?;
+        validate_transport_endpoint(&endpoint)?;
         let (tool_list_changed, _) = broadcast::channel(16);
         Ok(Self {
             endpoint,
@@ -201,23 +294,43 @@ impl StreamableHttpTransport {
             client_version: Arc::from(config.client_version),
             state: Arc::new(StateMutex::new(TransportState::default())),
             lifecycle: Arc::new(AsyncRwLock::new(())),
+            session_terminations: Arc::new(SessionTerminationTracker::default()),
+            #[cfg(test)]
+            initialization_cleanup_interleave: Arc::new(StateMutex::new(None)),
             tool_list_changed,
         })
     }
 
     pub async fn initialize(&self) -> Result<Value, StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         let _lifecycle = self.lifecycle.write().await;
-        let generation = {
+        let generation = loop {
+            self.session_terminations.wait().await;
+            #[cfg(test)]
+            {
+                let interleave = self
+                    .initialization_cleanup_interleave
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(interleave) = interleave {
+                    interleave.drained.notify_one();
+                    interleave.resume.notified().await;
+                }
+            }
             let state = self.lock_state();
+            if self.session_terminations.has_pending() {
+                continue;
+            }
             if state.initialized {
                 return Err(StreamableHttpError::AlreadyInitialized);
             }
-            state.generation
+            break state.generation;
         };
-        let mut initialization = InitializationGuard::new(self.state.clone(), generation);
+        let mut initialization = InitializationGuard::new(self, generation);
 
         let id = json!(0);
-        let result = match self
+        let result = self
             .request_result(
                 json!({
                     "jsonrpc": "2.0",
@@ -236,33 +349,19 @@ impl StreamableHttpTransport {
                 false,
                 true,
             )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                self.reset_state().await;
-                return Err(error);
-            }
-        };
+            .await?;
         let Some(selected_version_value) = result
             .as_object()
             .and_then(|result| result.get("protocolVersion"))
         else {
-            self.reset_state().await;
             return Err(StreamableHttpError::InvalidResponse);
         };
         let selected_version =
-            match serde_json::from_value::<ProtocolVersion>(selected_version_value.clone()) {
-                Ok(version) => version,
-                Err(_) => {
-                    self.reset_state().await;
-                    return Err(StreamableHttpError::InvalidResponse);
-                }
-            };
+            serde_json::from_value::<ProtocolVersion>(selected_version_value.clone())
+                .map_err(|_| StreamableHttpError::InvalidResponse)?;
         if selected_version != self.requested_protocol_version
             || selected_version != ProtocolVersion::V_2025_11_25
         {
-            self.reset_state().await;
             return Err(StreamableHttpError::ProtocolVersionMismatch);
         }
         self.lock_state().negotiated_protocol_version = Some(selected_version);
@@ -271,10 +370,7 @@ impl StreamableHttpTransport {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        if let Err(error) = self.send_internal(notification, false, false).await {
-            self.reset_state().await;
-            return Err(error);
-        }
+        self.send_internal(notification, false, false).await?;
         self.lock_state().initialized = true;
         initialization.commit();
         Ok(result)
@@ -332,62 +428,64 @@ impl StreamableHttpTransport {
         if name.is_empty() || name.len() > 1024 || !arguments.is_object() {
             return Err(StreamableHttpError::InvalidRequest);
         }
-        self.request_result(
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": { "name": name, "arguments": arguments }
-            }),
-            &id,
-            true,
-            false,
-        )
-        .await
+        let result = self
+            .request_result(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments }
+                }),
+                &id,
+                true,
+                false,
+            )
+            .await?;
+        validate_call_tool_result(&result)?;
+        Ok(result)
     }
 
     pub async fn terminate(&self) -> Result<(), StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         let _lifecycle = self.lifecycle.write().await;
-        let (session_id, protocol_version, generation) = {
-            let state = self.lock_state();
-            (
-                state.session_id.clone(),
-                state.negotiated_protocol_version.clone(),
-                state.generation,
-            )
+        let cleanup = loop {
+            self.session_terminations.wait().await;
+            let mut state = self.lock_state();
+            if self.session_terminations.has_pending() {
+                continue;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            let session_id = state.session_id.take();
+            let protocol_version = state.negotiated_protocol_version.take();
+            state.initialized = false;
+            break session_id.map(|session_id| {
+                (
+                    session_id,
+                    protocol_version,
+                    self.session_terminations.start(),
+                )
+            });
         };
-        let Some(session_id) = session_id else {
-            self.reset_state_if_generation(generation).await;
+        let Some((session_id, protocol_version, permit)) = cleanup else {
             return Ok(());
         };
-        let mut headers = self.headers.clone();
-        headers.insert(
-            MCP_SESSION_ID,
-            HeaderValue::from_str(&session_id)
-                .map_err(|_| StreamableHttpError::InvalidSessionId)?,
-        );
-        if let Some(protocol_version) = protocol_version {
-            headers.insert(
-                MCP_PROTOCOL_VERSION,
-                HeaderValue::from_str(protocol_version.as_str())
-                    .map_err(|_| StreamableHttpError::InvalidProtocolVersion)?,
-            );
-        }
-        self.reset_state_if_generation(generation).await;
-        let response = self
-            .client
-            .execute(OutboundRequest {
-                method: Method::DELETE,
-                url: self.endpoint.clone(),
-                headers,
-                body: Vec::new(),
-            })
-            .await;
-        let response = response?;
-        if response.status.is_success() || response.status == StatusCode::NOT_FOUND {
+        let protocol_version =
+            protocol_version.unwrap_or_else(|| self.requested_protocol_version.clone());
+        let result = spawn_session_termination(
+            self.client.clone(),
+            self.endpoint.clone(),
+            self.headers.clone(),
+            session_id,
+            protocol_version,
+            permit,
+        )?;
+        let status = result
+            .await
+            .map_err(|_| StreamableHttpError::InvalidResponse)??;
+        if status.is_success() || status == StatusCode::NOT_FOUND {
             Ok(())
         } else {
-            Err(StreamableHttpError::HttpStatus(response.status))
+            Err(StreamableHttpError::HttpStatus(status))
         }
     }
 
@@ -405,6 +503,7 @@ impl StreamableHttpTransport {
     /// Runs the optional standalone GET SSE stream until it closes or fails.
     /// The caller owns cancellation and may restart this future after errors.
     pub async fn listen_notifications(&self) -> Result<(), StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         let (session_id, protocol_version, generation) = {
             let state = self.lock_state();
             if !state.initialized {
@@ -518,6 +617,7 @@ impl StreamableHttpTransport {
         require_initialized: bool,
         accept_new_session: bool,
     ) -> Result<Vec<Value>, StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         validate_outgoing_message(&message)?;
         let (session_id, protocol_version, generation) = {
             let state = self.lock_state();
@@ -602,7 +702,7 @@ impl StreamableHttpTransport {
                 error,
                 StreamableHttpError::InvalidSessionId | StreamableHttpError::SessionChanged
             ) {
-                self.reset_state_if_generation(generation).await;
+                self.terminate_state_session_if_generation(generation).await;
             }
             return Err(error);
         }
@@ -783,6 +883,7 @@ impl StreamableHttpTransport {
         last_event_id: Option<&str>,
         long_lived: bool,
     ) -> Result<OutboundStreamResponse, StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         let mut headers = self.headers.clone();
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(session_id) = session_id {
@@ -867,6 +968,7 @@ impl StreamableHttpTransport {
         response: Value,
         generation: u64,
     ) -> Result<(), StreamableHttpError> {
+        validate_transport_endpoint(&self.endpoint)?;
         validate_outgoing_message(&response)?;
         let (session_id, protocol_version) = {
             let state = self.lock_state();
@@ -977,7 +1079,7 @@ impl StreamableHttpTransport {
                     StreamableHttpError::InvalidSessionId | StreamableHttpError::SessionChanged
                 ) =>
             {
-                self.reset_state_if_generation(generation).await;
+                self.terminate_state_session_if_generation(generation).await;
                 Err(error)
             }
             Err(error) => Err(error),
@@ -998,6 +1100,7 @@ impl StreamableHttpTransport {
         }
     }
 
+    #[cfg(test)]
     async fn reset_state(&self) {
         let mut state = self.lock_state();
         state.generation = state.generation.wrapping_add(1);
@@ -1014,6 +1117,103 @@ impl StreamableHttpTransport {
             state.negotiated_protocol_version = None;
             state.initialized = false;
         }
+    }
+
+    async fn terminate_state_session_if_generation(&self, generation: u64) {
+        let cleanup = {
+            let mut state = self.lock_state();
+            if state.generation != generation {
+                return;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            let session_id = state.session_id.take();
+            let protocol_version = state
+                .negotiated_protocol_version
+                .take()
+                .unwrap_or_else(|| self.requested_protocol_version.clone());
+            state.initialized = false;
+            session_id.map(|session_id| {
+                (
+                    session_id,
+                    protocol_version,
+                    self.session_terminations.start(),
+                )
+            })
+        };
+        if let Some((session_id, protocol_version, permit)) = cleanup {
+            let _ = spawn_session_termination(
+                self.client.clone(),
+                self.endpoint.clone(),
+                self.headers.clone(),
+                session_id,
+                protocol_version,
+                permit,
+            );
+        }
+    }
+}
+
+fn spawn_session_termination(
+    client: HardenedHttpClient,
+    endpoint: Url,
+    mut headers: HeaderMap,
+    session_id: String,
+    protocol_version: ProtocolVersion,
+    permit: SessionTerminationPermit,
+) -> Result<oneshot::Receiver<Result<StatusCode, StreamableHttpError>>, StreamableHttpError> {
+    validate_transport_endpoint(&endpoint)?;
+    let session_id =
+        HeaderValue::from_str(&session_id).map_err(|_| StreamableHttpError::InvalidSessionId)?;
+    let protocol_version = HeaderValue::from_str(protocol_version.as_str())
+        .map_err(|_| StreamableHttpError::InvalidProtocolVersion)?;
+    headers.insert(MCP_SESSION_ID, session_id);
+    headers.insert(MCP_PROTOCOL_VERSION, protocol_version);
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| StreamableHttpError::InvalidResponse)?;
+    let (result_tx, result_rx) = oneshot::channel();
+    let cleanup = async move {
+        let _permit = permit;
+        let result = tokio::time::timeout(
+            SESSION_TERMINATION_TIMEOUT,
+            client.execute(OutboundRequest {
+                method: Method::DELETE,
+                url: endpoint,
+                headers,
+                body: Vec::new(),
+            }),
+        )
+        .await
+        .map_err(|_| StreamableHttpError::Outbound(OutboundError::Timeout))
+        .and_then(|response| response.map(|response| response.status).map_err(Into::into));
+        let _ = result_tx.send(result);
+    };
+    drop(runtime.spawn(cleanup));
+    Ok(result_rx)
+}
+
+fn validate_transport_endpoint(endpoint: &Url) -> Result<(), StreamableHttpError> {
+    if endpoint.scheme() == "https"
+        || (endpoint.scheme() == "http" && is_loopback_endpoint(endpoint))
+    {
+        Ok(())
+    } else {
+        Err(StreamableHttpError::InsecureEndpoint)
+    }
+}
+
+fn is_loopback_endpoint(endpoint: &Url) -> bool {
+    match endpoint.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => {
+            let domain = domain.strip_suffix('.').unwrap_or(domain);
+            domain.eq_ignore_ascii_case("localhost")
+                || domain
+                    .to_ascii_lowercase()
+                    .strip_suffix(".localhost")
+                    .is_some_and(|prefix| !prefix.is_empty())
+        }
+        None => false,
     }
 }
 
@@ -1058,6 +1258,18 @@ fn validate_id(id: &Value) -> Result<(), StreamableHttpError> {
     } else {
         Err(StreamableHttpError::InvalidRequest)
     }
+}
+
+fn validate_call_tool_result(result: &Value) -> Result<(), StreamableHttpError> {
+    if result
+        .get("structuredContent")
+        .is_some_and(|structured_content| !structured_content.is_object())
+    {
+        return Err(StreamableHttpError::InvalidResponse);
+    }
+    serde_json::from_value::<CallToolResult>(result.clone())
+        .map_err(|_| StreamableHttpError::InvalidResponse)?;
+    Ok(())
 }
 
 fn validate_outgoing_message(message: &Value) -> Result<(), StreamableHttpError> {

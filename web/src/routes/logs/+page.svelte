@@ -7,7 +7,6 @@
   import { getRequestLog, listRequestLogs, type RequestLog, type RequestLogPage } from "$lib/api";
   import {
     beginIdentityResourceLoad,
-    beginResourceLoad,
     createLatestRequest,
     emptyResource,
     settleResourceLoad,
@@ -15,13 +14,19 @@
   } from "$lib/catalog-state";
   import { logsListKey, logsUrl, parseLogsUrl } from "$lib/catalog-url";
 
+  let { search }: { search?: string } = $props();
+
   const auth = useAuthState();
   const listRequest = createLatestRequest();
   const detailRequest = createLatestRequest();
-  let searchKey = $derived(page.url.search);
+  let searchKey = $derived(search ?? page.url.search);
   let urlState = $derived(parseLogsUrl(new URLSearchParams(searchKey)));
   let listKey = $derived(logsListKey(urlState));
-  let resource = $state(emptyResource<RequestLogPage>());
+  let listResource = $state(emptyResource<RequestLogPage>());
+  let listIdentity = $state<string | null>(null);
+  let resource = $derived(
+    listIdentity === listKey ? listResource : emptyResource<RequestLogPage>(),
+  );
   let detail = $state(emptyResource<RequestLog>());
   let detailIdentity = $state<string | null>(null);
   let refreshKey = $state(0);
@@ -32,16 +37,23 @@
     const key = listKey;
     const requestKey = `${key}\u0000${refreshKey}`;
     const cursor = key || null;
-    resource = beginResourceLoad(untrack(() => resource));
+    const started = beginIdentityResourceLoad(
+      untrack(() => listResource),
+      untrack(() => listIdentity),
+      key,
+    );
+    listIdentity = started.identity;
+    listResource = started.state;
     return listRequest.start(
       async (signal) => ({ requestKey, result: await listRequestLogs(cursor, undefined, signal) }),
       ({ requestKey: completedKey, result }) => {
-        if (completedKey !== `${listKey}\u0000${refreshKey}`) return;
+        if (completedKey !== `${listKey}\u0000${refreshKey}` || listIdentity !== key) return;
         if (!result.ok && auth.recoverFromApiError(result.error)) return;
-        resource = settleResourceLoad(resource, result);
+        listResource = settleResourceLoad(listResource, result);
       },
       () => {
-        resource = settleResourceLoad(resource, {
+        if (requestKey !== `${listKey}\u0000${refreshKey}` || listIdentity !== key) return;
+        listResource = settleResourceLoad(listResource, {
           ok: false,
           error: unexpectedRequestError(),
         });

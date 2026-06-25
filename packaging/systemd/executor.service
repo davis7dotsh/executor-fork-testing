@@ -1,6 +1,6 @@
 [Unit]
 Description=Executor self-hosted gateway
-Documentation=https://github.com/RhysSullivan/executor
+Documentation=https://github.com/davis7dotsh/executor-fork-testing/blob/main/docs/systemd.md
 After=network-online.target
 Wants=network-online.target
 
@@ -13,7 +13,6 @@ EnvironmentFile=-/etc/executor/executor.env
 ExecStart=/usr/local/bin/executor server \
     --bind 127.0.0.1:4788 \
     --data-dir /var/lib/executor \
-    --master-key-file /var/lib/executor/master.key \
     --mcp-stdio-templates /etc/executor/mcp-stdio-templates.json
 Restart=on-failure
 RestartSec=2s

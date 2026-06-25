@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d AS packager
+
+ARG SOURCE_DATE_EPOCH
+ARG BUILDKIT_IMAGE
+ARG BUILDX_VERSION
+ARG MACOS_BUILD_CLANG_VERSION
+ARG MACOS_BUILD_LD_VERSION
+ARG MACOS_BUILD_SDK_VERSION
+ARG MACOS_BUILD_XCODE_BUILD
+ARG MACOS_BUILD_XCODE_VERSION
+ARG MACOS_FLOOR_CLANG_VERSION
+ARG MACOS_FLOOR_LD_VERSION
+ARG MACOS_FLOOR_SDK_VERSION
+ARG MACOS_FLOOR_XCODE_BUILD
+ARG MACOS_FLOOR_XCODE_VERSION
+ARG REPRODUCIBILITY_RUN
+ARG UBUNTU_SNAPSHOT=20260623T000000Z
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -E \
+      "s|^deb |deb [snapshot=${UBUNTU_SNAPSHOT}] |" \
+      /etc/apt/sources.list && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get -o APT::Get::Always-Include-Phased-Updates=true install \
+      --yes --no-install-recommends \
+      python3-minimal && \
+    rm -rf \
+      /var/cache/ldconfig/aux-cache \
+      /var/lib/apt/lists/* \
+      /var/log/apt/* \
+      /var/log/dpkg.log
+
+COPY scripts/package-release-archive.py /usr/local/bin/package-release-archive.py
+COPY --from=release-inputs / /release-inputs
+
+RUN set -eux; \
+    test -n "$SOURCE_DATE_EPOCH"; \
+    test -n "$REPRODUCIBILITY_RUN"; \
+    mkdir -p /output /staging; \
+    { \
+      printf 'buildx=%s\n' "$BUILDX_VERSION"; \
+      printf 'buildkit=%s\n' "$BUILDKIT_IMAGE"; \
+      printf 'macos-release-xcode=%s (%s)\n' "$MACOS_BUILD_XCODE_VERSION" "$MACOS_BUILD_XCODE_BUILD"; \
+      printf 'macos-release-sdk=%s\n' "$MACOS_BUILD_SDK_VERSION"; \
+      printf 'macos-release-clang=%s\n' "$MACOS_BUILD_CLANG_VERSION"; \
+      printf 'macos-release-ld=%s\n' "$MACOS_BUILD_LD_VERSION"; \
+      printf 'macos-floor-xcode=%s (%s)\n' "$MACOS_FLOOR_XCODE_VERSION" "$MACOS_FLOOR_XCODE_BUILD"; \
+      printf 'macos-floor-sdk=%s\n' "$MACOS_FLOOR_SDK_VERSION"; \
+      printf 'macos-floor-clang=%s\n' "$MACOS_FLOOR_CLANG_VERSION"; \
+      printf 'macos-floor-ld=%s\n' "$MACOS_FLOOR_LD_VERSION"; \
+      printf 'ubuntu-packager=22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d\n'; \
+      printf 'ubuntu-snapshot=%s\n' "$UBUNTU_SNAPSHOT"; \
+      python3 -c 'import sys, zlib; print(f"python={sys.version.split()[0]}"); print(f"zlib-build={zlib.ZLIB_VERSION}"); print(f"zlib-runtime={zlib.ZLIB_RUNTIME_VERSION}")'; \
+    } > /output/BUILD-TOOLCHAINS.txt; \
+    for target in \
+      aarch64-apple-darwin \
+      aarch64-unknown-linux-gnu \
+      x86_64-apple-darwin \
+      x86_64-unknown-linux-gnu; do \
+        stage="/staging/$target"; \
+        archive="executor-${target}.tar.gz"; \
+        mkdir "$stage"; \
+        install -m 0755 "/release-inputs/native/$target/executor" "$stage/executor"; \
+        install -m 0644 /release-inputs/LICENSE "$stage/LICENSE"; \
+        install -m 0644 \
+          /release-inputs/THIRD_PARTY_LICENSES.html \
+          "$stage/THIRD_PARTY_LICENSES.html"; \
+        install -m 0644 \
+          /release-inputs/THIRD_PARTY_JAVASCRIPT_LICENSES.json \
+          "$stage/THIRD_PARTY_JAVASCRIPT_LICENSES.json"; \
+        python3 /usr/local/bin/package-release-archive.py \
+          --source "$stage" \
+          --output "/output/$archive" \
+          --epoch "$SOURCE_DATE_EPOCH"; \
+        (cd /output && sha256sum "$archive" > "$archive.sha256"); \
+    done
+
+FROM scratch AS artifacts
+
+COPY --from=packager /output/ /

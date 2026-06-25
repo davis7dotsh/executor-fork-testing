@@ -1,5 +1,6 @@
 mod schema;
 mod search;
+pub(crate) mod source_idempotency;
 mod store;
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
@@ -27,6 +28,7 @@ pub enum AuditActor {
 pub struct AuditContext<'a> {
     request_id: Option<&'a str>,
     actor: AuditActor,
+    source_creation_idempotency: Option<&'a source_idempotency::SourceCreationReservation>,
 }
 
 impl<'a> AuditContext<'a> {
@@ -34,6 +36,7 @@ impl<'a> AuditContext<'a> {
         Self {
             request_id,
             actor: AuditActor::System,
+            source_creation_idempotency: None,
         }
     }
 
@@ -41,7 +44,16 @@ impl<'a> AuditContext<'a> {
         Self {
             request_id: Some(request_id),
             actor: AuditActor::Admin { id },
+            source_creation_idempotency: None,
         }
+    }
+
+    pub(crate) const fn with_source_creation_idempotency(
+        mut self,
+        reservation: &'a source_idempotency::SourceCreationReservation,
+    ) -> Self {
+        self.source_creation_idempotency = Some(reservation);
+        self
     }
 
     pub(crate) const fn request_id(self) -> Option<&'a str> {
@@ -53,6 +65,17 @@ impl<'a> AuditContext<'a> {
             AuditActor::System => None,
             AuditActor::Admin { id } => Some(id),
         }
+    }
+
+    pub(crate) const fn source_creation_idempotency(
+        self,
+    ) -> Option<&'a source_idempotency::SourceCreationReservation> {
+        self.source_creation_idempotency
+    }
+
+    pub(crate) fn source_creation_idempotency_id(self) -> Option<&'a str> {
+        self.source_creation_idempotency
+            .map(source_idempotency::SourceCreationReservation::id)
     }
 }
 

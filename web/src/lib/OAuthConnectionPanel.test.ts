@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import OAuthConnectionPanel from "./OAuthConnectionPanel.svelte";
 import type {
   OAuthConnectionOperations,
@@ -63,6 +64,12 @@ function deferred<Value>() {
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+function focusedCancel() {
+  const focused = document.activeElement ?? document.body;
+  expect(focused).toBe(screen.getByRole("button", { name: "Cancel" }));
+  return focused;
 }
 
 afterEach(() => cleanup());
@@ -246,6 +253,37 @@ describe("managed OAuth connection panel", () => {
     expect(request.signal?.aborted).toBe(true);
   });
 
+  it("reports only OAuth writes as mutations and clears the fence on unmount", async () => {
+    const response = deferred<OAuthOperationResult<OAuthConnectionSummary>>();
+    const request = { signal: null as AbortSignal | null };
+    const api = operations();
+    api.save.mockImplementation((_sourceId, _credentialKey, _input, signal) => {
+      request.signal = signal;
+      return response.promise;
+    });
+    const onmutationchange = vi.fn();
+    const mounted = render(OAuthConnectionPanel, {
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      operations: api,
+      onmutationchange,
+    });
+
+    await screen.findByText("Connected");
+    expect(onmutationchange).not.toHaveBeenCalled();
+    await fireEvent.input(screen.getByLabelText(/Requested scopes/), {
+      target: { value: "read profile" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(onmutationchange).toHaveBeenLastCalledWith(true));
+
+    mounted.unmount();
+    expect(request.signal?.aborted).toBe(true);
+    expect(onmutationchange).toHaveBeenLastCalledWith(false);
+    response.resolve(success(summary({ revision: 5 })));
+    await response.promise;
+  });
+
   it("aborts and rejects an authorization completion after the panel identity changes", async () => {
     const authorization = deferred<OAuthOperationResult<{ authorizationUrl: string }>>();
     const request = { signal: null as AbortSignal | null };
@@ -426,14 +464,13 @@ describe("managed OAuth connection panel", () => {
   });
 
   it("allows access-token-only disconnects and closes confirmation when status clears", async () => {
+    const refreshed = deferred<OAuthOperationResult<OAuthConnectionList>>();
     const api = operations();
     api.load
       .mockResolvedValueOnce(
         success(connectionList([summary({ status: "connected", hasRefreshToken: false })])),
       )
-      .mockResolvedValueOnce(
-        success(connectionList([summary({ status: "ready_to_connect", hasRefreshToken: false })])),
-      );
+      .mockImplementationOnce(() => refreshed.promise);
     const mounted = render(OAuthConnectionPanel, {
       sourceId: "source-1",
       credentialKey: "provider-oauth",
@@ -447,6 +484,7 @@ describe("managed OAuth connection panel", () => {
     expect(disconnect.disabled).toBe(false);
     await fireEvent.click(disconnect);
     expect(screen.getByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    focusedCancel();
 
     await mounted.rerender({
       sourceId: "source-1",
@@ -454,12 +492,123 @@ describe("managed OAuth connection panel", () => {
       callbackRefreshKey: "success:oauth-1",
       operations: api,
     });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(2));
+    const panelHeading = screen.getByRole("heading", { name: "provider-oauth" });
+    expect(document.activeElement).toBe(panelHeading);
+    refreshed.resolve(
+      success(connectionList([summary({ status: "ready_to_connect", hasRefreshToken: false })])),
+    );
+    const disabledDisconnect = await screen.findByRole<HTMLButtonElement>("button", {
+      name: "Disconnect tokens",
+    });
     await waitFor(() =>
       expect(screen.queryByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeNull(),
     );
+    expect(disabledDisconnect.disabled).toBe(true);
+    expect(document.activeElement).toBe(panelHeading);
+  });
+
+  it("restores Cancel after a refresh removes focused disconnect confirmation", async () => {
+    const refreshed = deferred<OAuthOperationResult<OAuthConnectionList>>();
+    const api = operations();
+    api.load
+      .mockResolvedValueOnce(success(connectionList([summary()])))
+      .mockImplementationOnce(() => refreshed.promise);
+    const mounted = render(OAuthConnectionPanel, {
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: null,
+      operations: api,
+    });
+    await screen.findByText("Connected");
+    await fireEvent.click(screen.getByRole("button", { name: "Disconnect tokens" }));
+    const confirm = screen.getByRole("button", { name: "Disconnect tokens" });
+    confirm.focus();
+    expect(document.activeElement).toBe(confirm);
+
+    await mounted.rerender({
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: "success:oauth-1",
+      operations: api,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(2));
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "provider-oauth" }));
+
+    refreshed.resolve(success(connectionList([summary()])));
+    expect(await screen.findByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    await waitFor(() => focusedCancel());
+  });
+
+  it("restores Cancel after a refresh removes focused delete confirmation", async () => {
+    const refreshed = deferred<OAuthOperationResult<OAuthConnectionList>>();
+    const api = operations();
+    api.load
+      .mockResolvedValueOnce(success(connectionList([summary()])))
+      .mockImplementationOnce(() => refreshed.promise);
+    const mounted = render(OAuthConnectionPanel, {
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: null,
+      operations: api,
+    });
+    await screen.findByText("Connected");
+    await fireEvent.click(screen.getByRole("button", { name: "Delete configuration" }));
+    const confirm = screen.getByRole("button", { name: "Delete" });
+    confirm.focus();
+    expect(document.activeElement).toBe(confirm);
+
+    await mounted.rerender({
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: "success:oauth-1",
+      operations: api,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(2));
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "provider-oauth" }));
+
+    refreshed.resolve(success(connectionList([summary()])));
     expect(
-      screen.getByRole<HTMLButtonElement>("button", { name: "Disconnect tokens" }).disabled,
-    ).toBe(true);
+      await screen.findByRole("dialog", { name: "Delete this OAuth configuration?" }),
+    ).toBeDefined();
+    await waitFor(() => focusedCancel());
+  });
+
+  it("does not restore confirmation focus after the operator moves elsewhere", async () => {
+    const refreshed = deferred<OAuthOperationResult<OAuthConnectionList>>();
+    const api = operations();
+    api.load
+      .mockResolvedValueOnce(success(connectionList([summary()])))
+      .mockImplementationOnce(() => refreshed.promise);
+    const mounted = render(OAuthConnectionPanel, {
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: null,
+      operations: api,
+    });
+    await screen.findByText("Connected");
+    await fireEvent.click(screen.getByRole("button", { name: "Disconnect tokens" }));
+    screen.getByRole("button", { name: "Disconnect tokens" }).focus();
+
+    await mounted.rerender({
+      sourceId: "source-1",
+      credentialKey: "provider-oauth",
+      callbackRefreshKey: "success:oauth-1",
+      operations: api,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(2));
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "provider-oauth" }));
+    const elsewhere = document.createElement("button");
+    elsewhere.textContent = "Elsewhere";
+    mounted.container.append(elsewhere);
+    elsewhere.focus();
+    expect(document.activeElement).toBe(elsewhere);
+
+    refreshed.resolve(success(connectionList([summary()])));
+    expect(await screen.findByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDefined();
+    await tick();
+    expect(document.activeElement).toBe(elsewhere);
   });
 
   it("confirms destructive actions and manages keyboard focus", async () => {
@@ -473,16 +622,28 @@ describe("managed OAuth connection panel", () => {
 
     const disconnectOpener = screen.getByRole("button", { name: "Disconnect tokens" });
     await fireEvent.click(disconnectOpener);
-    const disconnectDialog = screen.getByRole("dialog", { name: "Disconnect OAuth tokens?" });
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Disconnect tokens" }));
-    await fireEvent.keyDown(disconnectDialog, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    await fireEvent.click(focusedCancel());
     await waitFor(() =>
       expect(document.activeElement).toBe(
         screen.getByRole("button", { name: "Disconnect tokens" }),
       ),
     );
+    expect(api.disconnect).not.toHaveBeenCalled();
 
     await fireEvent.click(screen.getByRole("button", { name: "Disconnect tokens" }));
+    expect(screen.getByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    await fireEvent.keyDown(focusedCancel(), { key: "Escape" });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Disconnect tokens" }),
+      ),
+    );
+    expect(api.disconnect).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Disconnect tokens" }));
+    expect(screen.getByRole("dialog", { name: "Disconnect OAuth tokens?" })).toBeDefined();
+    focusedCancel();
     await fireEvent.click(screen.getByRole("button", { name: "Disconnect tokens" }));
     await waitFor(() => expect(api.disconnect).toHaveBeenCalledOnce());
     expect(api.disconnect).toHaveBeenCalledWith(
@@ -500,18 +661,28 @@ describe("managed OAuth connection panel", () => {
     const deleteOpener = screen.getByRole("button", { name: "Delete configuration" });
     await fireEvent.click(deleteOpener);
     expect(screen.getByText("Delete this OAuth configuration?")).toBeDefined();
-    const deleteDialog = screen.getByRole("dialog", {
-      name: "Delete this OAuth configuration?",
-    });
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Delete" }));
-    await fireEvent.keyDown(deleteDialog, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Delete this OAuth configuration?" })).toBeDefined();
+    await fireEvent.click(focusedCancel());
     await waitFor(() =>
       expect(document.activeElement).toBe(
         screen.getByRole("button", { name: "Delete configuration" }),
       ),
     );
+    expect(api.remove).not.toHaveBeenCalled();
 
     await fireEvent.click(screen.getByRole("button", { name: "Delete configuration" }));
+    expect(screen.getByRole("dialog", { name: "Delete this OAuth configuration?" })).toBeDefined();
+    await fireEvent.keyDown(focusedCancel(), { key: "Escape" });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Delete configuration" }),
+      ),
+    );
+    expect(api.remove).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete configuration" }));
+    expect(screen.getByRole("dialog", { name: "Delete this OAuth configuration?" })).toBeDefined();
+    focusedCancel();
     await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(api.remove).toHaveBeenCalledOnce());
     expect(screen.queryByDisplayValue(summary().callbackUrl)).toBeNull();

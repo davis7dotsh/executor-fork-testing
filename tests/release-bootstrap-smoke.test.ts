@@ -14,7 +14,7 @@ type CommandResult = {
 };
 
 const repoRoot = resolve(dirnameOf(import.meta.url), "..");
-const cliRoot = join(repoRoot, "apps/cli");
+const cliRoot = join(repoRoot, "legacy/cli");
 const distDir = join(cliRoot, "dist");
 
 function dirnameOf(url: string): string {

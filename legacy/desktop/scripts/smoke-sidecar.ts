@@ -26,7 +26,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const ROOT = resolve(import.meta.dir, "..");
-const APPS_LOCAL_DRIZZLE = resolve(ROOT, "../../apps/local/drizzle-legacy-v1");
+const LEGACY_LOCAL_DRIZZLE = resolve(ROOT, "../local/drizzle-legacy-v1");
 const BINARY = resolve(
   ROOT,
   "resources/executor",
@@ -56,13 +56,13 @@ const makeScopeId = (cwd: string): string => {
 };
 
 const readLegacyMigrations = async (): Promise<readonly { sql: string; hash: string }[]> => {
-  const journal = (await Bun.file(join(APPS_LOCAL_DRIZZLE, "meta/_journal.json")).json()) as {
+  const journal = (await Bun.file(join(LEGACY_LOCAL_DRIZZLE, "meta/_journal.json")).json()) as {
     readonly entries: readonly { readonly idx: number; readonly tag: string }[];
   };
 
   const migrations: { sql: string; hash: string }[] = [];
   for (const entry of [...journal.entries].sort((left, right) => left.idx - right.idx)) {
-    const query = await Bun.file(join(APPS_LOCAL_DRIZZLE, `${entry.tag}.sql`)).text();
+    const query = await Bun.file(join(LEGACY_LOCAL_DRIZZLE, `${entry.tag}.sql`)).text();
     migrations.push({
       sql: query,
       hash: createHash("sha256").update(query).digest("hex"),

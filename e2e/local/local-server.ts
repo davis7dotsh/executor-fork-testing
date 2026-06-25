@@ -55,7 +55,7 @@ export const withLocalServer = (
     yield* Effect.all(
       [
         cli.session(
-          ["bun", "run", "dev:cli", "web", "--foreground", "--port", "0"],
+          ["bun", "run", "legacy:dev:cli", "web", "--foreground", "--port", "0"],
           async (term) => {
             markRecordingStart(runDir, "terminal");
             markFocus(runDir, "terminal");

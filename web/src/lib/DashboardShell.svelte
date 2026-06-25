@@ -6,8 +6,19 @@
   import type { ApiError } from "$lib/api";
   import type { Snippet } from "svelte";
 
-  let { title, description, children }: { title: string; description: string; children: Snippet } =
-    $props();
+  let {
+    title,
+    description,
+    children,
+    beforeSignOut,
+    onSignOutFailed,
+  }: {
+    title: string;
+    description: string;
+    children: Snippet;
+    beforeSignOut?: () => boolean;
+    onSignOutFailed?: (error: ApiError) => void;
+  } = $props();
 
   const auth = useAuthState();
   const navigation = [
@@ -26,11 +37,14 @@
   }
 
   async function logout() {
+    if (beforeSignOut !== undefined && !beforeSignOut()) return;
+
     logoutBusy = true;
     logoutError = null;
     const result = await auth.signOut();
     if (!result.ok) {
       logoutError = result.error;
+      onSignOutFailed?.(result.error);
     } else {
       void goto("/login", { replaceState: true });
     }

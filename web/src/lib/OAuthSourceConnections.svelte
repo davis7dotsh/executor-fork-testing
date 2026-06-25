@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import OAuthConnectionPanel from "$lib/OAuthConnectionPanel.svelte";
   import { useAuthState } from "$lib/auth.svelte";
   import {
@@ -17,17 +18,21 @@
 
   let {
     source,
+    sourceIdentity,
     operations,
     callbackRefreshKey = null,
     disabled = false,
     onbusychange,
+    onmutationchange,
     oncallbackchecked,
   }: {
     source: Source;
+    sourceIdentity?: string;
     operations: OAuthConnectionOperations;
     callbackRefreshKey?: string | null;
     disabled?: boolean;
     onbusychange?: (busy: boolean) => void;
+    onmutationchange?: (busy: boolean) => void;
     oncallbackchecked?: (matched: boolean) => void;
   } = $props();
 
@@ -36,22 +41,52 @@
   let loading = $state(false);
   let error = $state<OAuthOperationError | null>(null);
   let panelBusyKeys = $state<string[]>([]);
+  let panelMutationKeys = $state<string[]>([]);
+  let refreshNonce = $state(0);
   let controller: AbortController | null = null;
   let generation = 0;
   let reportedBusy = false;
+  let reportedMutation = false;
   let callbackNotice = $state<{
     key: string;
     tone: "success" | "error";
     message: string;
   } | null>(null);
   let latestCallbackKey: string | null = null;
-  let entries = $derived(connectionEntries(list, source.kind));
+  let stableSourceId = $state(untrack(() => sourceIdentity ?? source.id));
+  let stableSourceKind = $state(untrack(() => source.kind));
+  let stableSourceDisplayName = $state(untrack(() => source.displayName));
+  let stableOperations = $state.raw(untrack(() => operations));
+  let stableCallbackRefreshKey = $state<string | null>(untrack(() => callbackRefreshKey));
+  let stableDisabled = $state(untrack(() => disabled));
+  let entries = $derived(connectionEntries(list, stableSourceKind));
 
   $effect(() => {
-    const currentSourceId = source.id;
-    const currentCallbackKey = callbackRefreshKey;
-    const currentOperations = operations;
-    const currentDisabled = disabled;
+    const nextSourceId = sourceIdentity ?? source.id;
+    const nextSourceKind = source.kind;
+    const nextSourceDisplayName = source.displayName;
+    const nextOperations = operations;
+    const nextCallbackRefreshKey = callbackRefreshKey;
+    const nextDisabled = disabled;
+    if (stableSourceId !== nextSourceId) stableSourceId = nextSourceId;
+    if (stableSourceKind !== nextSourceKind) stableSourceKind = nextSourceKind;
+    if (stableSourceDisplayName !== nextSourceDisplayName) {
+      stableSourceDisplayName = nextSourceDisplayName;
+    }
+    if (stableOperations !== nextOperations) stableOperations = nextOperations;
+    if (stableCallbackRefreshKey !== nextCallbackRefreshKey) {
+      stableCallbackRefreshKey = nextCallbackRefreshKey;
+    }
+    if (stableDisabled !== nextDisabled) stableDisabled = nextDisabled;
+  });
+
+  $effect(() => {
+    const currentSourceId = stableSourceId;
+    const currentCallbackKey = stableCallbackRefreshKey;
+    const currentOperations = stableOperations;
+    const currentDisabled = stableDisabled;
+    const currentRefreshNonce = refreshNonce;
+    void currentRefreshNonce;
     if (currentCallbackKey !== null && currentCallbackKey !== latestCallbackKey) {
       latestCallbackKey = currentCallbackKey;
       callbackNotice = null;
@@ -76,7 +111,7 @@
         loading = false;
         if (!result.ok) {
           const apiError = new ApiError(result.error);
-          if (!auth.recoverFromApiError(apiError)) error = result.error;
+          if (!auth?.recoverFromApiError(apiError)) error = result.error;
           return;
         }
         list = result.value;
@@ -112,15 +147,33 @@
     onbusychange?.(busy);
   });
 
+  $effect(() => {
+    const busy = panelMutationKeys.length > 0;
+    if (busy === reportedMutation) return;
+    reportedMutation = busy;
+    onmutationchange?.(busy);
+  });
+
   $effect(() => () => {
     controller?.abort();
     if (reportedBusy) onbusychange?.(false);
+    if (reportedMutation) onmutationchange?.(false);
   });
 
   function setPanelBusy(credentialKey: string, busy: boolean) {
     panelBusyKeys = busy
       ? [...new Set([...panelBusyKeys, credentialKey])]
       : panelBusyKeys.filter((candidate) => candidate !== credentialKey);
+  }
+
+  function setPanelMutation(credentialKey: string, busy: boolean) {
+    panelMutationKeys = busy
+      ? [...new Set([...panelMutationKeys, credentialKey])]
+      : panelMutationKeys.filter((candidate) => candidate !== credentialKey);
+  }
+
+  function retryLoad() {
+    refreshNonce += 1;
   }
 
   function localLoadError(): OAuthOperationError {
@@ -167,9 +220,22 @@
     <strong>{error.displayMessage}</strong>
     {#if error.requestId !== null}<small>Request reference: <code>{error.requestId}</code></small
       >{/if}
+    <button type="button" onclick={retryLoad}>Retry managed OAuth</button>
   </div>
-{:else if entries.length > 0}
-  <section class="oauth-connections" aria-label={`Managed OAuth for ${source.displayName}`}>
+{:else if list !== null}
+  <section class="oauth-connections" aria-label={`Managed OAuth for ${stableSourceDisplayName}`}>
+    {#if error !== null}
+      <div class="notice error" role="alert">
+        <strong>{error.displayMessage}</strong>
+        <span>Showing the last loaded managed OAuth options.</span>
+        {#if error.requestId !== null}<small
+            >Request reference: <code>{error.requestId}</code></small
+          >{/if}
+        <button type="button" onclick={retryLoad}>Retry managed OAuth</button>
+      </div>
+    {:else if loading}
+      <p class="oauth-loading" aria-live="polite">Refreshing managed OAuth options...</p>
+    {/if}
     {#if callbackNotice !== null}
       <p
         class:error={callbackNotice.tone === "error"}
@@ -179,29 +245,32 @@
         {callbackNotice.message}
       </p>
     {/if}
-    <div class="oauth-intro">
-      <div>
-        <p class="eyebrow">Managed OAuth</p>
-        <h3>Provider connections</h3>
+    {#if entries.length > 0}
+      <div class="oauth-intro">
+        <div>
+          <p class="eyebrow">Managed OAuth</p>
+          <h3>Provider connections</h3>
+        </div>
+        <p>
+          Executor stores refreshable tokens locally. Manual access tokens remain available under
+          advanced credential settings.
+        </p>
       </div>
-      <p>
-        Executor stores refreshable tokens locally. Manual access tokens remain available under
-        advanced credential settings.
-      </p>
-    </div>
-    {#each entries as entry (entry.credentialKey)}
-      <OAuthConnectionPanel
-        sourceId={source.id}
-        credentialKey={entry.credentialKey}
-        defaultRequestedScopes={entry.requestedScopes}
-        discoveryType={entry.protocol === "mcp_http" ? "mcp" : "issuer"}
-        configurationDisabled={!entry.managedOAuthEligible}
-        {operations}
-        {callbackRefreshKey}
-        {disabled}
-        onbusychange={(busy) => setPanelBusy(entry.credentialKey, busy)}
-      />
-    {/each}
+      {#each entries as entry (entry.credentialKey)}
+        <OAuthConnectionPanel
+          sourceId={stableSourceId}
+          credentialKey={entry.credentialKey}
+          defaultRequestedScopes={entry.requestedScopes}
+          discoveryType={entry.protocol === "mcp_http" ? "mcp" : "issuer"}
+          configurationDisabled={!entry.managedOAuthEligible}
+          operations={stableOperations}
+          callbackRefreshKey={stableCallbackRefreshKey}
+          disabled={stableDisabled}
+          onbusychange={(busy) => setPanelBusy(entry.credentialKey, busy)}
+          onmutationchange={(busy) => setPanelMutation(entry.credentialKey, busy)}
+        />
+      {/each}
+    {/if}
   </section>
 {/if}
 

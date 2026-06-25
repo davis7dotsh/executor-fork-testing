@@ -239,7 +239,7 @@ pub enum GraphqlInvocationError {
     #[error("GraphQL mutation outcome is unknown")]
     Indeterminate,
     #[error("GraphQL OAuth authorization is unavailable")]
-    OAuth,
+    OAuth(#[source] OAuthError),
 }
 
 impl GraphqlInvocationError {
@@ -249,7 +249,7 @@ impl GraphqlInvocationError {
                 outcome_unknown, ..
             } => *outcome_unknown,
             Self::Indeterminate => true,
-            Self::OAuth => false,
+            Self::OAuth(_) => false,
         }
     }
 }
@@ -257,11 +257,39 @@ impl GraphqlInvocationError {
 #[derive(Clone, Default)]
 pub struct GraphqlAdapter {
     oauth: Option<OAuthService>,
+    #[cfg(test)]
+    test_dns_resolution: Option<(String, Vec<std::net::IpAddr>)>,
 }
 
 impl GraphqlAdapter {
     pub(crate) fn with_oauth(oauth: OAuthService) -> Self {
-        Self { oauth: Some(oauth) }
+        Self {
+            oauth: Some(oauth),
+            #[cfg(test)]
+            test_dns_resolution: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_dns_resolution(
+        mut self,
+        hostname: impl Into<String>,
+        addresses: Vec<std::net::IpAddr>,
+    ) -> Self {
+        self.test_dns_resolution = Some((hostname.into(), addresses));
+        self
+    }
+
+    fn http_client(&self, policy: OutboundPolicy) -> HardenedHttpClient {
+        let client = HardenedHttpClient::new(policy);
+        #[cfg(test)]
+        let client = match &self.test_dns_resolution {
+            Some((hostname, addresses)) => {
+                client.with_test_dns_resolution(hostname.clone(), addresses.clone())
+            }
+            None => client,
+        };
+        client
     }
 
     pub(crate) async fn oauth_binding_observation(
@@ -346,10 +374,7 @@ impl GraphqlAdapter {
             "variables": arguments,
         }))
         .map_err(internal_encoding_error)?;
-        let policy = OutboundPolicy {
-            allow_private_networks: configuration.allow_private_network,
-            ..OutboundPolicy::default()
-        };
+        let policy = graphql_outbound_policy(configuration.allow_private_network);
         let url = parse_url(&credential.endpoint, &policy).map_err(protocol_outbound_error)?;
         let mut request = OutboundRequest::new(Method::POST, url);
         request.headers.insert(
@@ -389,18 +414,22 @@ impl GraphqlAdapter {
             oauth_binding,
         } = prepared;
         if let Some(binding) = oauth_binding {
-            let oauth = self.oauth.as_ref().ok_or(GraphqlInvocationError::OAuth)?;
+            let oauth = self
+                .oauth
+                .as_ref()
+                .ok_or(GraphqlInvocationError::OAuth(OAuthError::Internal))?;
             let access_token = oauth
                 .access_token_for_binding(&binding)
                 .await
-                .map_err(|_| GraphqlInvocationError::OAuth)?;
+                .map_err(GraphqlInvocationError::OAuth)?;
             let mut authorization =
                 HeaderValue::from_str(&format!("Bearer {}", access_token.expose()))
-                    .map_err(|_| GraphqlInvocationError::OAuth)?;
+                    .map_err(|_| GraphqlInvocationError::OAuth(OAuthError::Internal))?;
             authorization.set_sensitive(true);
             request.headers.insert(header::AUTHORIZATION, authorization);
         }
-        let response = HardenedHttpClient::new(policy)
+        let response = self
+            .http_client(policy)
             .execute(request)
             .await
             .map_err(|source| {
@@ -486,7 +515,15 @@ impl GraphqlAdapter {
             endpoint: input.endpoint,
             credential: input.credential,
         };
-        let discovery = fetch_and_compile(&configuration, &stored, None).await;
+        let policy = graphql_introspection_policy(input.allow_private_network);
+        let discovery = fetch_and_compile(
+            &configuration,
+            &stored,
+            None,
+            &policy,
+            self.http_client(policy.clone()),
+        )
+        .await;
         let authorization_required = stored.credential.is_none()
             && discovery
                 .as_ref()
@@ -579,7 +616,15 @@ impl GraphqlAdapter {
         } else {
             None
         };
-        let compiled = fetch_and_compile(&configuration, &stored, access_token).await?;
+        let policy = graphql_introspection_policy(configuration.allow_private_network);
+        let compiled = fetch_and_compile(
+            &configuration,
+            &stored,
+            access_token,
+            &policy,
+            self.http_client(policy.clone()),
+        )
+        .await?;
         let snapshot = CatalogSnapshot {
             expected_source_revision: source.revision,
             expected_credential_revision: Some(stored_record.revision),
@@ -696,17 +741,9 @@ async fn fetch_and_compile(
     configuration: &GraphqlSourceConfigurationV1,
     stored: &StoredGraphqlCredentialV1,
     oauth_access_token: Option<crate::oauth::OAuthAccessToken>,
+    policy: &OutboundPolicy,
+    client: HardenedHttpClient,
 ) -> Result<CompiledGraphql, ProtocolError> {
-    let permit = try_compile_permit(
-        GRAPHQL_COMPILE_PERMITS
-            .get_or_init(|| Arc::new(Semaphore::new(GRAPHQL_COMPILE_CONCURRENCY)))
-            .clone(),
-    )?;
-    let policy = OutboundPolicy {
-        allow_private_networks: configuration.allow_private_network,
-        max_response_bytes: MAX_INTROSPECTION_BYTES,
-        ..OutboundPolicy::default()
-    };
     if public_endpoint(&stored.endpoint).map_err(protocol_outbound_error)?
         != configuration.endpoint.as_str()
     {
@@ -715,7 +752,7 @@ async fn fetch_and_compile(
             "The stored GraphQL endpoint does not match its source configuration.",
         ));
     }
-    let url = parse_url(&stored.endpoint, &policy).map_err(protocol_outbound_error)?;
+    let url = parse_url(&stored.endpoint, policy).map_err(protocol_outbound_error)?;
     let mut request = OutboundRequest::new(Method::POST, url);
     request.headers.insert(
         header::CONTENT_TYPE,
@@ -739,7 +776,7 @@ async fn fetch_and_compile(
         "variables": {},
     }))
     .map_err(internal_encoding_error)?;
-    let response = HardenedHttpClient::new(policy)
+    let response = client
         .execute(request)
         .await
         .map_err(protocol_outbound_error)?;
@@ -758,7 +795,27 @@ async fn fetch_and_compile(
             "The GraphQL introspection request failed.",
         ));
     }
+    let permit = try_compile_permit(
+        GRAPHQL_COMPILE_PERMITS
+            .get_or_init(|| Arc::new(Semaphore::new(GRAPHQL_COMPILE_CONCURRENCY)))
+            .clone(),
+    )?;
     compile_introspection_bounded(response.body, permit).await
+}
+
+fn graphql_outbound_policy(allow_private_networks: bool) -> OutboundPolicy {
+    OutboundPolicy {
+        allow_private_networks,
+        require_https_or_loopback: true,
+        ..OutboundPolicy::default()
+    }
+}
+
+fn graphql_introspection_policy(allow_private_networks: bool) -> OutboundPolicy {
+    OutboundPolicy {
+        max_response_bytes: MAX_INTROSPECTION_BYTES,
+        ..graphql_outbound_policy(allow_private_networks)
+    }
 }
 
 enum GraphqlCompileTaskError {
@@ -1127,20 +1184,31 @@ fn graphql_error(error: GraphqlError) -> ProtocolError {
 }
 
 fn protocol_oauth_error(error: OAuthError) -> ProtocolError {
-    let code = match error {
-        OAuthError::Conflict { code, .. } => code,
-        OAuthError::NotFound => "oauth_connection_not_found",
-        OAuthError::Validation { .. }
-        | OAuthError::UnauthorizedTransaction
+    match error {
+        OAuthError::Validation { code, message } => {
+            ProtocolError::new(ProtocolErrorCategory::InvalidInput, code, message)
+        }
+        OAuthError::NotFound => ProtocolError::new(
+            ProtocolErrorCategory::Conflict,
+            "oauth_connection_required",
+            "The OAuth connection must be configured before this operation can run.",
+        ),
+        OAuthError::Conflict { code, message } => {
+            ProtocolError::new(ProtocolErrorCategory::Conflict, code, message)
+        }
+        OAuthError::Upstream { code } => ProtocolError::new(
+            ProtocolErrorCategory::Upstream,
+            code,
+            "The OAuth provider request failed.",
+        ),
+        OAuthError::UnauthorizedTransaction
         | OAuthError::AuthorizationDenied { .. }
-        | OAuthError::Upstream { .. }
-        | OAuthError::Internal => "oauth_unavailable",
-    };
-    ProtocolError::new(
-        ProtocolErrorCategory::Conflict,
-        code,
-        "Managed OAuth is not ready for this GraphQL source.",
-    )
+        | OAuthError::Internal => ProtocolError::new(
+            ProtocolErrorCategory::Internal,
+            "oauth_internal_error",
+            "Managed OAuth could not be resolved safely.",
+        ),
+    }
 }
 
 fn authorization_required_error() -> ProtocolError {
@@ -1196,7 +1264,11 @@ fn internal_encoding_error(_error: serde_json::Error) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
 
     use reqwest::header::HeaderName;
     use serde_json::{Map, Value, json};
@@ -1214,11 +1286,15 @@ mod tests {
     use crate::{
         AppConfig, ExecutorApp,
         catalog::{
-            AuditContext, CreateSource, CredentialPayload, InitialCatalogSnapshot, SourceHealth,
-            SourceKind, StoredCredential,
+            AuditContext, CreateSource, CredentialPayload, InitialCatalogSnapshot, ListToolsFilter,
+            SourceHealth, SourceKind, StagedTool, StagedToolBinding, StoredCredential, ToolBinding,
+            ToolMode,
         },
         crypto::Keyring,
-        graphql::{GraphqlBindingV1, GraphqlOperation, GraphqlTypeRef, GraphqlVariableBinding},
+        graphql::{
+            GraphqlBindingV1, GraphqlOperation, GraphqlTypeRef, GraphqlVariableBinding,
+            MAX_INPUT_OBJECT_DEPTH,
+        },
         oauth::{
             OAuthBinding, OAuthService,
             model::{OAuthClientAuthentication, OAuthConnectionConfig, OAuthSecretSet},
@@ -1283,6 +1359,13 @@ mod tests {
         }
     }
 
+    fn with_poisoned_localhost(adapter: GraphqlAdapter) -> GraphqlAdapter {
+        adapter.with_test_dns_resolution(
+            "poison.localhost",
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+        )
+    }
+
     async fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         loop {
@@ -1336,6 +1419,49 @@ mod tests {
                 ]
             } }
         })
+    }
+
+    fn overdeep_input_introspection() -> Value {
+        let mut document = minimal_introspection();
+        let definitions = (0..=MAX_INPUT_OBJECT_DEPTH).map(|index| {
+            let field_type = if index == MAX_INPUT_OBJECT_DEPTH {
+                json!({ "kind": "SCALAR", "name": "String", "ofType": null })
+            } else {
+                json!({
+                    "kind": "INPUT_OBJECT",
+                    "name": format!("Input{}", index + 1),
+                    "ofType": null
+                })
+            };
+            json!({
+                "kind": "INPUT_OBJECT",
+                "name": format!("Input{index}"),
+                "description": null,
+                "fields": null,
+                "inputFields": [{
+                    "name": "next",
+                    "description": null,
+                    "defaultValue": null,
+                    "type": field_type
+                }],
+                "enumValues": null
+            })
+        });
+        let types = document["data"]["__schema"]["types"]
+            .as_array_mut()
+            .expect("schema types are an array");
+        types.extend(definitions);
+        let query = types
+            .iter_mut()
+            .find(|definition| definition["name"] == "Query")
+            .expect("query type exists");
+        query["fields"][0]["args"] = json!([{
+            "name": "input",
+            "description": null,
+            "defaultValue": null,
+            "type": { "kind": "INPUT_OBJECT", "name": "Input0", "ofType": null }
+        }]);
+        document
     }
 
     async fn execute_with_response(
@@ -1460,6 +1586,149 @@ mod tests {
         assert_eq!(error.code, "graphql_compiler_busy");
         assert_eq!(error.category, ProtocolErrorCategory::Conflict);
         assert!(!error.message.contains("hostile"));
+    }
+
+    #[tokio::test]
+    async fn poisoned_plaintext_introspection_rejects_static_credentials_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .unwrap();
+        let adapter = with_poisoned_localhost(GraphqlAdapter::default());
+        let credentials = [
+            GraphqlCredential::Bearer {
+                token: "bearer-secret".to_owned(),
+            },
+            GraphqlCredential::Basic {
+                username: "admin".to_owned(),
+                password: "basic-secret".to_owned(),
+            },
+            GraphqlCredential::ApiKeyHeader {
+                name: "x-api-key".to_owned(),
+                value: "api-key-secret".to_owned(),
+            },
+            GraphqlCredential::OAuthAccessToken {
+                access_token: "static-oauth-secret".to_owned(),
+            },
+        ];
+        for (index, credential) in credentials.into_iter().enumerate() {
+            let error = adapter
+                .create_source(
+                    app.catalog(),
+                    CreateGraphqlSource {
+                        display_name: format!("Poisoned GraphQL {index}"),
+                        preferred_slug: None,
+                        description: None,
+                        endpoint: "http://poison.localhost:8080/graphql".to_owned(),
+                        allow_private_network: true,
+                        credential: Some(credential),
+                    },
+                    AuditContext::system(Some("graphql-poisoned-introspection")),
+                )
+                .await
+                .expect_err("poisoned plaintext resolution is rejected");
+            assert_eq!(error.code, "insecure_outbound_transport");
+            assert_eq!(error.category, ProtocolErrorCategory::InvalidInput);
+        }
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn introspection_redirects_are_not_followed_or_reauthorized() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let redirect_target = format!("http://{}/stolen", redirected.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .unwrap();
+        let catalog = app.catalog().clone();
+        let create = tokio::spawn(async move {
+            GraphqlAdapter::default()
+                .create_source(
+                    &catalog,
+                    CreateGraphqlSource {
+                        display_name: "Redirecting GraphQL".to_owned(),
+                        preferred_slug: None,
+                        description: None,
+                        endpoint,
+                        allow_private_network: true,
+                        credential: Some(GraphqlCredential::Bearer {
+                            token: "introspection-redirect-secret".to_owned(),
+                        }),
+                    },
+                    AuditContext::system(Some("graphql-redirect-introspection")),
+                )
+                .await
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = String::from_utf8_lossy(&read_request(&mut stream).await).into_owned();
+        assert!(request.contains("authorization: Bearer introspection-redirect-secret\r\n"));
+        stream
+            .write_all(&response(
+                "302 Found",
+                "{}",
+                &format!("Location: {redirect_target}\r\n"),
+            ))
+            .await
+            .unwrap();
+        let error = create
+            .await
+            .unwrap()
+            .expect_err("introspection redirect is returned without being followed");
+        assert_eq!(error.code, "upstream_http_error");
+        assert!(
+            timeout(Duration::from_millis(100), redirected.accept())
+                .await
+                .is_err(),
+            "the credential is never redelivered to the redirect target"
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poisoned_plaintext_invocation_rejects_static_credentials_before_dispatch() {
+        let endpoint = "http://poison.localhost:8080/graphql".to_owned();
+        let adapter = with_poisoned_localhost(GraphqlAdapter::default());
+        let credentials = [
+            GraphqlCredential::Bearer {
+                token: "bearer-secret".to_owned(),
+            },
+            GraphqlCredential::Basic {
+                username: "admin".to_owned(),
+                password: "basic-secret".to_owned(),
+            },
+            GraphqlCredential::ApiKeyHeader {
+                name: "x-api-key".to_owned(),
+                value: "api-key-secret".to_owned(),
+            },
+            GraphqlCredential::OAuthAccessToken {
+                access_token: "static-oauth-secret".to_owned(),
+            },
+        ];
+        for credential in credentials {
+            let prepared = adapter
+                .prepare_invocation(
+                    &query_binding(),
+                    &source_configuration(endpoint.clone(), true),
+                    Some(&stored_credential(endpoint.clone(), Some(credential))),
+                    &json!({ "id": "user-1" }),
+                    None,
+                )
+                .unwrap();
+            let error = adapter
+                .execute_invocation(prepared)
+                .await
+                .expect_err("poisoned plaintext resolution is rejected");
+            assert!(matches!(
+                error,
+                super::GraphqlInvocationError::Outbound {
+                    source: OutboundError::InsecureTransport,
+                    outcome_unknown: false,
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1629,6 +1898,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overdeep_refresh_retains_the_last_good_graphql_catalog() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .unwrap();
+        let catalog = app.catalog().clone();
+        let create_catalog = catalog.clone();
+        let create_endpoint = endpoint.clone();
+        let create = tokio::spawn(async move {
+            GraphqlAdapter::default()
+                .create_source(
+                    &create_catalog,
+                    CreateGraphqlSource {
+                        display_name: "GraphQL depth".to_owned(),
+                        preferred_slug: None,
+                        description: None,
+                        endpoint: create_endpoint,
+                        allow_private_network: true,
+                        credential: None,
+                    },
+                    AuditContext::system(Some("graphql-depth-create")),
+                )
+                .await
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        let body = serde_json::to_string(&minimal_introspection()).unwrap();
+        stream
+            .write_all(&response("200 OK", &body, ""))
+            .await
+            .unwrap();
+        let source = create.await.unwrap().unwrap();
+        let original_tools = catalog
+            .list_tools(ListToolsFilter {
+                source_id: Some(source.id.clone()),
+                limit: 10,
+                ..ListToolsFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(original_tools.items.len(), 1);
+        let original_tool = original_tools.items[0].clone();
+
+        let refresh_catalog = catalog.clone();
+        let refresh_source = source.clone();
+        let refresh = tokio::spawn(async move {
+            GraphqlAdapter::default()
+                .refresh_source(
+                    &refresh_catalog,
+                    refresh_source,
+                    AuditContext::system(Some("graphql-depth-refresh")),
+                )
+                .await
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        let body = serde_json::to_string(&overdeep_input_introspection()).unwrap();
+        stream
+            .write_all(&response("200 OK", &body, ""))
+            .await
+            .unwrap();
+        let error = refresh
+            .await
+            .unwrap()
+            .expect_err("overdeep refresh is rejected");
+        assert_eq!(error.code, "graphql_schema_limit_exceeded");
+
+        let current = catalog.source(&source.id).await.unwrap();
+        assert_eq!(current.catalog_revision, source.catalog_revision);
+        let retained = catalog.tool(&original_tool.id).await.unwrap();
+        assert!(retained.present);
+        assert_eq!(retained.stable_key, original_tool.stable_key);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn unauthenticated_denials_can_stage_an_authorization_required_source() {
         for (status, body) in [
             ("401 Unauthorized", "{}"),
@@ -1693,6 +2040,7 @@ mod tests {
                         connection_id: "ignored-connection".to_owned(),
                         credential_key: "default".to_owned(),
                         config_revision: 1,
+                        granted_scopes: Vec::new(),
                     }]),
                 )
                 .await
@@ -1708,6 +2056,7 @@ mod tests {
                 connection_id: "connection-id".to_owned(),
                 credential_key: "default".to_owned(),
                 config_revision: 1,
+                granted_scopes: Vec::new(),
             }),
         ) {
             Ok(_) => panic!("static and managed credentials must not both apply"),
@@ -1725,6 +2074,13 @@ mod tests {
         let master_key = [73_u8; 32];
         let master_key_file = directory.path().join("fixture-master.key");
         std::fs::write(&master_key_file, master_key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&master_key_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         let app = ExecutorApp::open(
             AppConfig::new(directory.path().join("data"))
                 .with_master_key_file(Some(master_key_file)),
@@ -1883,6 +2239,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poisoned_plaintext_managed_oauth_never_dispatches_and_refresh_keeps_last_good() {
+        let directory = tempfile::tempdir().unwrap();
+        let master_key = [74_u8; 32];
+        let master_key_file = directory.path().join("fixture-master.key");
+        std::fs::write(&master_key_file, master_key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&master_key_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let app = ExecutorApp::open(
+            AppConfig::new(directory.path().join("data"))
+                .with_master_key_file(Some(master_key_file)),
+        )
+        .await
+        .unwrap();
+        let endpoint = "http://poison.localhost:8080/graphql".to_owned();
+        let stored = StoredGraphqlCredentialV1 {
+            endpoint: endpoint.clone(),
+            credential: None,
+        };
+        let binding = query_binding();
+        let stable_key = binding.stable_key().unwrap();
+        let (source, _) = app
+            .catalog()
+            .create_source_with_catalog_health(
+                CreateSource {
+                    kind: SourceKind::Graphql,
+                    preferred_slug: "poisoned_oauth_graphql".to_owned(),
+                    display_name: "Poisoned OAuth GraphQL".to_owned(),
+                    description: None,
+                    configuration: source_configuration(endpoint, true),
+                },
+                &stored.payload().unwrap(),
+                InitialCatalogSnapshot {
+                    artifacts: Vec::new(),
+                    tools: vec![StagedTool {
+                        stable_key: stable_key.clone(),
+                        preferred_name: "hello".to_owned(),
+                        display_name: "hello".to_owned(),
+                        description: None,
+                        input_schema: json!({ "type": "object" }),
+                        output_schema: None,
+                        input_typescript: None,
+                        output_typescript: None,
+                        typescript_definitions: BTreeMap::new(),
+                        intrinsic_mode: ToolMode::Enabled,
+                    }],
+                },
+                vec![StagedToolBinding {
+                    stable_key,
+                    binding: ToolBinding::GraphqlV1(binding.clone()),
+                }],
+                SourceHealth::Healthy,
+                AuditContext::system(Some("graphql-poisoned-oauth-fixture")),
+            )
+            .await
+            .unwrap();
+        let original_tool = app
+            .catalog()
+            .list_tools(ListToolsFilter {
+                source_id: Some(source.id.clone()),
+                limit: 10,
+                ..ListToolsFilter::default()
+            })
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let keyring = Keyring::from_master_key(master_key).unwrap();
+        OAuthStore::new(app.pool().clone(), keyring.clone())
+            .create_connection(
+                &source.id,
+                "default",
+                &OAuthConnectionConfig {
+                    issuer: "https://auth.example.test".to_owned(),
+                    authorization_endpoint: "https://auth.example.test/authorize".to_owned(),
+                    token_endpoint: "https://auth.example.test/token".to_owned(),
+                    client_id: "fixture-client".to_owned(),
+                    client_authentication: OAuthClientAuthentication::None,
+                    token_endpoint_auth_methods_supported: vec!["none".to_owned()],
+                    scopes: vec!["graphql".to_owned()],
+                    allow_private_network: false,
+                    resource: None,
+                },
+                Some(&OAuthSecretSet {
+                    access_token: Some("managed-secret-token".to_owned()),
+                    granted_scopes: vec!["graphql".to_owned()],
+                    ..OAuthSecretSet::default()
+                }),
+                1,
+            )
+            .await
+            .unwrap();
+        let adapter = with_poisoned_localhost(GraphqlAdapter::with_oauth(OAuthService::new(
+            app.pool().clone(),
+            keyring,
+            "http://127.0.0.1:4788".to_owned(),
+            OutboundPolicy::default(),
+        )));
+        let stored_record = app.catalog().credential(&source.id).await.unwrap().unwrap();
+        let oauth_binding = adapter
+            .oauth_binding_observation(&source.id, Some(&stored_record), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared = adapter
+            .prepare_invocation(
+                &binding,
+                &source.configuration,
+                Some(&stored_record),
+                &json!({ "id": "user-1" }),
+                Some(oauth_binding),
+            )
+            .unwrap();
+        let error = adapter
+            .execute_invocation(prepared)
+            .await
+            .expect_err("managed token is not sent over poisoned plaintext");
+        assert!(matches!(
+            error,
+            super::GraphqlInvocationError::Outbound {
+                source: OutboundError::InsecureTransport,
+                outcome_unknown: false,
+            }
+        ));
+
+        let refresh_error = adapter
+            .refresh_source(
+                app.catalog(),
+                source.clone(),
+                AuditContext::system(Some("graphql-poisoned-oauth-refresh")),
+            )
+            .await
+            .expect_err("managed introspection token is not sent over poisoned plaintext");
+        assert_eq!(refresh_error.code, "insecure_outbound_transport");
+        assert_eq!(refresh_error.category, ProtocolErrorCategory::InvalidInput);
+        let current = app.catalog().source(&source.id).await.unwrap();
+        assert_eq!(current.catalog_revision, source.catalog_revision);
+        let retained = app.catalog().tool(&original_tool.id).await.unwrap();
+        assert!(retained.present);
+        assert_eq!(retained.stable_key, original_tool.stable_key);
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn upstream_errors_are_sanitized_and_redirects_are_not_followed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
@@ -1890,7 +2396,12 @@ mod tests {
             .prepare_invocation(
                 &query_binding(),
                 &source_configuration(endpoint.clone(), true),
-                Some(&stored_credential(endpoint, None)),
+                Some(&stored_credential(
+                    endpoint,
+                    Some(GraphqlCredential::Bearer {
+                        token: "redirect-secret".to_owned(),
+                    }),
+                )),
                 &json!({ "id": "user-1" }),
                 None,
             )
@@ -1900,7 +2411,8 @@ mod tests {
                 async move { GraphqlAdapter::default().execute_invocation(prepared).await },
             );
         let (mut stream, _) = listener.accept().await.unwrap();
-        read_request(&mut stream).await;
+        let request = String::from_utf8_lossy(&read_request(&mut stream).await).into_owned();
+        assert!(request.contains("authorization: Bearer redirect-secret\r\n"));
         stream
             .write_all(&response(
                 "200 OK",
@@ -1919,7 +2431,12 @@ mod tests {
             .prepare_invocation(
                 &query_binding(),
                 &source_configuration(endpoint.clone(), true),
-                Some(&stored_credential(endpoint, None)),
+                Some(&stored_credential(
+                    endpoint,
+                    Some(GraphqlCredential::Bearer {
+                        token: "redirect-secret".to_owned(),
+                    }),
+                )),
                 &json!({ "id": "user-1" }),
                 None,
             )
@@ -1929,7 +2446,8 @@ mod tests {
                 async move { GraphqlAdapter::default().execute_invocation(prepared).await },
             );
         let (mut stream, _) = listener.accept().await.unwrap();
-        read_request(&mut stream).await;
+        let request = String::from_utf8_lossy(&read_request(&mut stream).await).into_owned();
+        assert!(request.contains("authorization: Bearer redirect-secret\r\n"));
         stream
             .write_all(&response("302 Found", "{}", "Location: /redirected\r\n"))
             .await

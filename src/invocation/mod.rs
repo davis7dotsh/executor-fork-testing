@@ -21,7 +21,7 @@ use crate::{
     },
     catalog::{
         CatalogError, CatalogStore, InvocationLease, ListToolsFilter, NewRequestLog,
-        RequestOutcome, RequestSurface, ToolMode,
+        RequestOutcome, RequestSurface, ToolBinding, ToolMode,
     },
     crypto::Keyring,
     oauth::{OAuthBinding, OAuthError, OAuthService},
@@ -88,6 +88,111 @@ pub struct ToolHttpMetadata {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallAdapterErrorCode {
+    ApprovalPersistenceUnavailable,
+    ApprovalPersistenceInterrupted,
+    IdempotencyMetadataInvalid,
+    IdempotencyFailed,
+    InvocationOutcomeUnknown,
+    OAuthConnectionFailed,
+    OAuthBindingChanged,
+    OpenApiOutcomeUnknown,
+    GraphqlOutcomeUnknown,
+    McpOutcomeUnknown,
+    McpProtocolUnavailable,
+    McpUpstreamUnauthorized,
+    McpUpstreamForbidden,
+    McpSessionConflict,
+    McpShuttingDown,
+    McpCapacity,
+    McpMessageTooLarge,
+}
+
+impl ToolCallAdapterErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApprovalPersistenceUnavailable => "approval_persistence_unavailable",
+            Self::ApprovalPersistenceInterrupted => "approval_persistence_interrupted",
+            Self::IdempotencyMetadataInvalid => "idempotency_metadata_invalid",
+            Self::IdempotencyFailed => "idempotency_failed",
+            Self::InvocationOutcomeUnknown => "invocation_outcome_unknown",
+            Self::OAuthConnectionFailed => "oauth_connection_failed",
+            Self::OAuthBindingChanged => "oauth_binding_changed",
+            Self::OpenApiOutcomeUnknown => "openapi_outcome_unknown",
+            Self::GraphqlOutcomeUnknown => "graphql_outcome_unknown",
+            Self::McpOutcomeUnknown => "mcp_outcome_unknown",
+            Self::McpProtocolUnavailable => "mcp_protocol_unavailable",
+            Self::McpUpstreamUnauthorized => "mcp_upstream_unauthorized",
+            Self::McpUpstreamForbidden => "mcp_upstream_forbidden",
+            Self::McpSessionConflict => "mcp_session_conflict",
+            Self::McpShuttingDown => "mcp_shutting_down",
+            Self::McpCapacity => "mcp_capacity",
+            Self::McpMessageTooLarge => "mcp_message_too_large",
+        }
+    }
+
+    const fn outcome_unknown(self) -> bool {
+        matches!(
+            self,
+            Self::InvocationOutcomeUnknown
+                | Self::OpenApiOutcomeUnknown
+                | Self::GraphqlOutcomeUnknown
+                | Self::McpOutcomeUnknown
+        )
+    }
+}
+
+impl From<ToolCallAdapterErrorCode> for String {
+    fn from(code: ToolCallAdapterErrorCode) -> Self {
+        code.as_str().to_owned()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ToolCallOAuthError {
+    #[error("managed OAuth configuration is invalid")]
+    Validation { code: &'static str },
+    #[error("a managed OAuth connection is required")]
+    ConnectionRequired,
+    #[error("the managed OAuth connection changed")]
+    Conflict { code: &'static str },
+    #[error("the managed OAuth transaction is unauthorized")]
+    UnauthorizedTransaction,
+    #[error("managed OAuth authorization was denied")]
+    AuthorizationDenied,
+    #[error("the OAuth provider is unavailable")]
+    Upstream { code: &'static str },
+    #[error("managed OAuth failed internally")]
+    Internal,
+}
+
+impl ToolCallOAuthError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Validation { code } | Self::Conflict { code } | Self::Upstream { code } => code,
+            Self::ConnectionRequired => "oauth_connection_required",
+            Self::UnauthorizedTransaction => "oauth_transaction_unauthorized",
+            Self::AuthorizationDenied => "oauth_authorization_denied",
+            Self::Internal => "oauth_internal_error",
+        }
+    }
+}
+
+impl From<OAuthError> for ToolCallOAuthError {
+    fn from(error: OAuthError) -> Self {
+        match error {
+            OAuthError::Validation { code, .. } => Self::Validation { code },
+            OAuthError::NotFound => Self::ConnectionRequired,
+            OAuthError::Conflict { code, .. } => Self::Conflict { code },
+            OAuthError::UnauthorizedTransaction => Self::UnauthorizedTransaction,
+            OAuthError::AuthorizationDenied { .. } => Self::AuthorizationDenied,
+            OAuthError::Upstream { code } => Self::Upstream { code },
+            OAuthError::Internal => Self::Internal,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolCallError {
     #[error(transparent)]
@@ -95,7 +200,12 @@ pub enum ToolCallError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error("{message}")]
-    Adapter { code: &'static str, message: String },
+    Adapter {
+        code: ToolCallAdapterErrorCode,
+        message: String,
+    },
+    #[error(transparent)]
+    OAuth(#[from] ToolCallOAuthError),
     #[error("tool arguments exceed the allowed size")]
     ArgumentsTooLarge,
     #[error("tool arguments do not match the input schema")]
@@ -108,6 +218,96 @@ pub enum ToolCallError {
     Protocol(#[from] ProtocolError),
     #[error("the tool result exceeds the allowed size")]
     ResultTooLarge,
+}
+
+impl ToolCallError {
+    fn outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Adapter { code, .. } if code.outcome_unknown()
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InvocationEffect {
+    ReadOnly,
+    MayHaveSideEffects,
+}
+
+impl InvocationEffect {
+    fn from_lease(lease: &InvocationLease) -> Self {
+        match lease.binding() {
+            ToolBinding::OpenapiV1(binding)
+                if matches!(binding.method.as_str(), "GET" | "HEAD" | "OPTIONS") =>
+            {
+                Self::ReadOnly
+            }
+            ToolBinding::GraphqlV1(binding) if !binding.operation.is_mutation() => Self::ReadOnly,
+            ToolBinding::OpenapiV1(_)
+            | ToolBinding::GraphqlV1(_)
+            | ToolBinding::McpHttpV1(_)
+            | ToolBinding::McpStdioV1(_) => Self::MayHaveSideEffects,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionFailurePhase {
+    PreDispatch,
+    ProtocolClassified,
+    PostDispatch,
+}
+
+#[derive(Debug)]
+struct InvocationExecutionError {
+    error: ToolCallError,
+    phase: ExecutionFailurePhase,
+    effect: InvocationEffect,
+}
+
+impl InvocationExecutionError {
+    fn new(error: ToolCallError, phase: ExecutionFailurePhase, effect: InvocationEffect) -> Self {
+        Self {
+            error,
+            phase,
+            effect,
+        }
+    }
+
+    fn outcome_unknown(&self) -> bool {
+        self.error.outcome_unknown()
+            || matches!(
+                (self.phase, self.effect),
+                (
+                    ExecutionFailurePhase::PostDispatch,
+                    InvocationEffect::MayHaveSideEffects
+                )
+            )
+    }
+
+    fn error(&self) -> &ToolCallError {
+        &self.error
+    }
+
+    fn stable_error_code(&self) -> &'static str {
+        if self.outcome_unknown() && !self.error.outcome_unknown() {
+            ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str()
+        } else {
+            error_code(&self.error)
+        }
+    }
+
+    fn into_error(self) -> ToolCallError {
+        if self.outcome_unknown() && !self.error.outcome_unknown() {
+            protocol_adapter_error(
+                ToolCallAdapterErrorCode::InvocationOutcomeUnknown,
+                "The upstream operation may have completed, so it cannot be retried safely.",
+            )
+        } else {
+            self.error
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -129,6 +329,7 @@ pub struct ToolCallService {
     execution_slots: Arc<Semaphore>,
     in_flight_approvals: Arc<Mutex<HashSet<String>>>,
     in_flight_mcp_settlements: Arc<Mutex<HashSet<String>>>,
+    in_flight_execution_cancellations: Arc<Mutex<HashSet<String>>>,
     deferred_execution_cancellations: Arc<RwLock<HashSet<String>>>,
     execution_stopping_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     #[cfg(test)]
@@ -137,7 +338,13 @@ pub struct ToolCallService {
     approved_execution_hook: Arc<Mutex<Option<Arc<ApprovedExecutionHook>>>>,
     #[cfg(test)]
     cancel_execution_hook: Arc<Mutex<Option<Arc<CancelExecutionHook>>>>,
+    #[cfg(test)]
+    execution_cancellation_recovery_race_hook:
+        Arc<Mutex<Option<Arc<ExecutionCancellationRecoveryRaceHook>>>>,
+    #[cfg(test)]
+    retryable_release_race_hook: Arc<Mutex<Option<Arc<RetryableReleaseRaceHook>>>>,
     background_tasks: TaskTracker,
+    durable_tasks: TaskTracker,
 }
 
 #[cfg(test)]
@@ -164,6 +371,139 @@ struct CancelExecutionHook {
     retry_waiters: std::sync::atomic::AtomicUsize,
     retry_waiting: Notify,
     release_retries: Notify,
+}
+
+#[cfg(test)]
+struct ExecutionCancellationRecoveryRaceHook {
+    old_finish_write_acquired: std::sync::Barrier,
+    release_old_finish: std::sync::Barrier,
+    new_mark_write_queued: Notify,
+}
+
+#[cfg(test)]
+impl Default for ExecutionCancellationRecoveryRaceHook {
+    fn default() -> Self {
+        Self {
+            old_finish_write_acquired: std::sync::Barrier::new(2),
+            release_old_finish: std::sync::Barrier::new(2),
+            new_mark_write_queued: Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RetryableReleaseRaceHook {
+    released: Notify,
+    continue_settlement: Notify,
+    cleanup_started: Notify,
+    cleanup_completed: Notify,
+}
+
+#[derive(Clone)]
+struct InvocationLogContext {
+    request_id: String,
+    actor_api_token_id: Option<String>,
+    surface: RequestSurface,
+    source_id: String,
+    tool_id: String,
+    path_snapshot: String,
+    started: Instant,
+}
+
+impl InvocationLogContext {
+    fn new(call: &ToolCall, source_id: String, tool_id: String, started: Instant) -> Self {
+        Self {
+            request_id: call.request_id.clone(),
+            actor_api_token_id: call.actor.api_token_id().map(str::to_owned),
+            surface: call.surface,
+            source_id,
+            tool_id,
+            path_snapshot: normalized_path_snapshot(&call.path),
+            started,
+        }
+    }
+
+    fn failed(&self, error_code: &str) -> NewRequestLog {
+        NewRequestLog {
+            request_id: self.request_id.clone(),
+            actor_api_token_id: self.actor_api_token_id.clone(),
+            surface: self.surface,
+            source_id: Some(self.source_id.clone()),
+            tool_id: Some(self.tool_id.clone()),
+            path_snapshot: Some(self.path_snapshot.clone()),
+            outcome: RequestOutcome::Failed,
+            error_code: Some(error_code.to_owned()),
+            duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            approval_id: None,
+            created_at: crate::unix_timestamp(),
+        }
+    }
+}
+
+struct DurableInvocationLogGuard {
+    context: Option<InvocationLogContext>,
+    request_logs: RequestLogSink,
+    tasks: TaskTracker,
+}
+
+impl DurableInvocationLogGuard {
+    fn new(
+        context: InvocationLogContext,
+        request_logs: RequestLogSink,
+        tasks: TaskTracker,
+    ) -> Self {
+        Self {
+            context: Some(context),
+            request_logs,
+            tasks,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.context = None;
+    }
+
+    async fn persist(&mut self, error_code: &str) {
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        persist_durable_request_log(&self.request_logs, context.failed(error_code)).await;
+        self.disarm();
+    }
+}
+
+impl Drop for DurableInvocationLogGuard {
+    fn drop(&mut self) {
+        let Some(context) = self.context.take() else {
+            return;
+        };
+        let log = context.failed(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str());
+        let request_logs = self.request_logs.clone();
+        let fallback_logs = request_logs.clone();
+        let fallback_log = log.clone();
+        if !self.tasks.spawn_supervised(move |_shutdown| async move {
+            persist_durable_request_log(&request_logs, log).await;
+        }) && !fallback_logs.try_record(fallback_log)
+        {
+            tracing::error!(
+                request_id = context.request_id,
+                "uncertain invocation request log could not be queued during shutdown"
+            );
+        }
+    }
+}
+
+async fn persist_durable_request_log(request_logs: &RequestLogSink, log: NewRequestLog) {
+    let mut delay = Duration::from_millis(25);
+    while !request_logs.record_durable(log.clone()).await {
+        tracing::warn!(
+            request_id = log.request_id,
+            "uncertain invocation request log persistence will retry"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
 }
 
 #[derive(Clone)]
@@ -498,6 +838,8 @@ struct IdempotencyExecutionGuard {
     store: GatewayIdempotencyStore,
     tasks: TaskTracker,
     armed: bool,
+    #[cfg(test)]
+    cleanup_hook: Option<Arc<RetryableReleaseRaceHook>>,
 }
 
 impl IdempotencyExecutionGuard {
@@ -507,11 +849,18 @@ impl IdempotencyExecutionGuard {
             store,
             tasks,
             armed: true,
+            #[cfg(test)]
+            cleanup_hook: None,
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    #[cfg(test)]
+    fn set_cleanup_hook(&mut self, hook: Option<Arc<RetryableReleaseRaceHook>>) {
+        self.cleanup_hook = hook;
     }
 }
 
@@ -522,20 +871,31 @@ impl Drop for IdempotencyExecutionGuard {
         }
         let id = self.id.clone();
         let store = self.store.clone();
+        #[cfg(test)]
+        let cleanup_hook = self.cleanup_hook.clone();
         self.tasks.spawn(async move {
+            #[cfg(test)]
+            if let Some(hook) = cleanup_hook.as_ref() {
+                hook.cleanup_started.notify_one();
+            }
             let mut delay = Duration::from_millis(25);
             loop {
                 match store.mark_indeterminate(&id).await {
                     Ok(_)
                     | Err(IdempotencyError::InvalidTransition(
                         "completed" | "indeterminate",
-                    )) => break,
+                    ))
+                    | Err(IdempotencyError::NotFound) => break,
                     Err(error) => {
                         tracing::error!(idempotency_id = id, error = %error, "uncertain invocation terminalization will retry");
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_secs(5));
                     }
                 }
+            }
+            #[cfg(test)]
+            if let Some(hook) = cleanup_hook {
+                hook.cleanup_completed.notify_one();
             }
         });
     }
@@ -580,10 +940,18 @@ impl McpIdempotencyExecution {
             GatewayInvokeError::Idempotency("idempotency execution was already consumed".to_owned())
         })?;
         let response = mcp_blob_response(response);
-        guard
+        if let Err(error) = guard
             .store
             .complete(&guard.id, IdempotencyResponseKind::Tool, &response, None)
-            .await?;
+            .await
+        {
+            tracing::error!(
+                idempotency_id = guard.id,
+                error = %error,
+                "post-dispatch MCP response persistence will recover as indeterminate"
+            );
+            return Err(GatewayInvokeError::OutcomeUnknown);
+        }
         guard.disarm();
         Ok(())
     }
@@ -744,6 +1112,7 @@ impl ToolCallService {
             execution_slots: Arc::new(Semaphore::new(APPROVAL_EXECUTION_CONCURRENCY)),
             in_flight_approvals: Arc::new(Mutex::new(HashSet::new())),
             in_flight_mcp_settlements: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_execution_cancellations: Arc::new(Mutex::new(HashSet::new())),
             deferred_execution_cancellations: Arc::new(RwLock::new(HashSet::new())),
             execution_stopping_flags: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -752,7 +1121,12 @@ impl ToolCallService {
             approved_execution_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             cancel_execution_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            execution_cancellation_recovery_race_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            retryable_release_race_hook: Arc::new(Mutex::new(None)),
             background_tasks: TaskTracker::default(),
+            durable_tasks: TaskTracker::default(),
         }
     }
 
@@ -854,6 +1228,8 @@ impl ToolCallService {
 
     pub(crate) async fn shutdown(&self) {
         self.background_tasks.shutdown().await;
+        self.durable_tasks.shutdown().await;
+        self.request_logs.shutdown().await;
         self.settle_idempotency_shutdown().await;
         let mut delay = Duration::from_millis(25);
         loop {
@@ -867,7 +1243,6 @@ impl ToolCallService {
             }
         }
         self.global_approval_notify.notify_waiters();
-        self.request_logs.shutdown().await;
     }
 
     async fn settle_idempotency_shutdown(&self) {
@@ -899,7 +1274,6 @@ impl ToolCallService {
 
     pub(crate) fn abort_background_tasks(&self) {
         self.background_tasks.abort_all();
-        self.request_logs.abort();
     }
 
     pub(crate) async fn recover_startup(&self) -> Result<(), ApprovalError> {
@@ -1133,13 +1507,13 @@ impl ToolCallService {
             });
             if !spawned {
                 return Err(ToolCallError::Adapter {
-                    code: "approval_persistence_unavailable",
+                    code: ToolCallAdapterErrorCode::ApprovalPersistenceUnavailable,
                     message: "approval persistence is shutting down".to_owned(),
                 });
             }
             return result.await.unwrap_or_else(|_| {
                 Err(ToolCallError::Adapter {
-                    code: "approval_persistence_interrupted",
+                    code: ToolCallAdapterErrorCode::ApprovalPersistenceInterrupted,
                     message: "approval persistence was interrupted".to_owned(),
                 })
             });
@@ -1150,9 +1524,43 @@ impl ToolCallService {
             .revalidate_invocation(&token)
             .await?
             .ok_or(ToolCallError::Stale)?;
-        let result = execute_with_lease(&self.protocols, lease, &call.arguments, None).await;
+        let effect = InvocationEffect::from_lease(&lease);
+        let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments, None).await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.record_attempt(
+                    &call,
+                    Some(lookup.source_id),
+                    Some(lookup.tool_id),
+                    RequestOutcome::Failed,
+                    Some(error_code(&error)),
+                    None,
+                    started,
+                );
+                return Err(error);
+            }
+        };
+        let log_context = InvocationLogContext::new(
+            &call,
+            lookup.source_id.clone(),
+            lookup.tool_id.clone(),
+            started,
+        );
+        let mut durable_log_guard =
+            matches!(effect, InvocationEffect::MayHaveSideEffects).then(|| {
+                DurableInvocationLogGuard::new(
+                    log_context.clone(),
+                    self.request_logs.clone(),
+                    self.durable_tasks.clone(),
+                )
+            });
+        let result = execute_prepared(&self.protocols, prepared, effect).await;
         match result {
             Ok(result) => {
+                if let Some(guard) = durable_log_guard.as_mut() {
+                    guard.disarm();
+                }
                 self.record_attempt(
                     &call,
                     Some(lookup.source_id),
@@ -1168,16 +1576,34 @@ impl ToolCallService {
                 );
                 Ok(ToolCallSubmission::Completed(result))
             }
-            Err(error) => {
-                self.record_attempt(
-                    &call,
-                    Some(lookup.source_id),
-                    Some(lookup.tool_id),
-                    RequestOutcome::Failed,
-                    Some(error_code(&error)),
-                    None,
-                    started,
-                );
+            Err(failure) => {
+                let outcome_unknown = failure.outcome_unknown();
+                let stable_error_code = failure.stable_error_code();
+                if outcome_unknown {
+                    if let Some(guard) = durable_log_guard.as_mut() {
+                        guard.persist(stable_error_code).await;
+                    } else {
+                        persist_durable_request_log(
+                            &self.request_logs,
+                            log_context.failed(stable_error_code),
+                        )
+                        .await;
+                    }
+                } else if let Some(guard) = durable_log_guard.as_mut() {
+                    guard.disarm();
+                }
+                let error = failure.into_error();
+                if !outcome_unknown {
+                    self.record_attempt(
+                        &call,
+                        Some(lookup.source_id),
+                        Some(lookup.tool_id),
+                        RequestOutcome::Failed,
+                        Some(error_code(&error)),
+                        None,
+                        started,
+                    );
+                }
                 Err(error)
             }
         }
@@ -1354,6 +1780,7 @@ impl ToolCallService {
                 return Err(ToolCallError::Stale.into());
             }
         };
+        let effect = InvocationEffect::from_lease(&lease);
         let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments, None).await
         {
             Ok(prepared) => prepared,
@@ -1374,7 +1801,14 @@ impl ToolCallService {
             self.idempotency.clone(),
             self.background_tasks.clone(),
         );
-        let execution = execute_prepared(&self.protocols, prepared);
+        #[cfg(test)]
+        execution_guard.set_cleanup_hook(
+            self.retryable_release_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        let execution = execute_prepared(&self.protocols, prepared, effect);
         tokio::pin!(execution);
         let execution_result = tokio::select! {
             result = &mut execution => result,
@@ -1388,23 +1822,47 @@ impl ToolCallService {
         };
         let result = match execution_result {
             Ok(result) => result,
-            Err(error) => {
-                self.idempotency
-                    .mark_indeterminate(&reservation.record.id)
-                    .await?;
-                execution_guard.disarm();
+            Err(failure) => {
+                self.settle_idempotent_execution_error(
+                    &reservation.record,
+                    &mut execution_guard,
+                    &failure,
+                )
+                .await?;
+                let error = failure.into_error();
                 return Err(error.into());
             }
         };
         let response = tool_result_response(&result)?;
-        self.idempotency
+        if let Err(error) = self
+            .idempotency
             .complete(
                 &reservation.record.id,
                 IdempotencyResponseKind::Tool,
                 &response,
                 None,
             )
-            .await?;
+            .await
+        {
+            match self
+                .idempotency
+                .mark_indeterminate(&reservation.record.id)
+                .await
+            {
+                Ok(_) | Err(IdempotencyError::InvalidTransition("completed" | "indeterminate")) => {
+                    execution_guard.disarm();
+                }
+                Err(mark_error) => {
+                    tracing::error!(
+                        idempotency_id = reservation.record.id,
+                        error = %mark_error,
+                        completion_error = %error,
+                        "post-dispatch MCP idempotency recovery will continue in the background"
+                    );
+                }
+            }
+            return Err(GatewayInvokeError::OutcomeUnknown);
+        }
         execution_guard.disarm();
         Ok(McpIdempotentResponse {
             result,
@@ -1723,6 +2181,7 @@ impl ToolCallService {
                 return Err(ToolCallError::Catalog(error).into());
             }
         };
+        let effect = InvocationEffect::from_lease(&lease);
         let prepared = match prepare_with_lease(&self.protocols, lease, &call.arguments, None).await
         {
             Ok(prepared) => prepared,
@@ -1743,35 +2202,43 @@ impl ToolCallService {
             self.idempotency.clone(),
             self.background_tasks.clone(),
         );
-        let result = match execute_prepared(&self.protocols, prepared).await {
+        #[cfg(test)]
+        execution_guard.set_cleanup_hook(
+            self.retryable_release_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        let result = match execute_prepared(&self.protocols, prepared, effect).await {
             Ok(result) => result,
-            Err(error) => {
-                match self
-                    .idempotency
-                    .mark_indeterminate(&reservation.record.id)
-                    .await
-                {
-                    Ok(_) | Err(IdempotencyError::InvalidTransition("indeterminate")) => {
-                        execution_guard.disarm();
-                    }
-                    Err(idempotency_error) => {
-                        tracing::error!(
-                            idempotency_id = reservation.record.id,
-                            error = %idempotency_error,
-                            "failed to mark an uncertain gateway invocation indeterminate"
-                        );
-                        return Err(idempotency_error.into());
-                    }
+            Err(failure) => {
+                let outcome_unknown = failure.outcome_unknown();
+                let stable_error_code = failure.stable_error_code();
+                self.settle_idempotent_execution_error(
+                    &reservation.record,
+                    &mut execution_guard,
+                    &failure,
+                )
+                .await?;
+                let error = failure.into_error();
+                if outcome_unknown {
+                    persist_durable_request_log(
+                        &self.request_logs,
+                        InvocationLogContext::new(&call, lookup.source_id, lookup.tool_id, started)
+                            .failed(stable_error_code),
+                    )
+                    .await;
+                } else {
+                    self.record_attempt(
+                        &call,
+                        Some(lookup.source_id),
+                        Some(lookup.tool_id),
+                        RequestOutcome::Failed,
+                        Some(error_code(&error)),
+                        None,
+                        started,
+                    );
                 }
-                self.record_attempt(
-                    &call,
-                    Some(lookup.source_id),
-                    Some(lookup.tool_id),
-                    RequestOutcome::Failed,
-                    Some(error_code(&error)),
-                    None,
-                    started,
-                );
                 return Err(error.into());
             }
         };
@@ -1794,9 +2261,22 @@ impl ToolCallService {
                 Ok(_) | Err(IdempotencyError::InvalidTransition("completed" | "indeterminate")) => {
                     execution_guard.disarm();
                 }
-                Err(mark_error) => return Err(mark_error.into()),
+                Err(mark_error) => {
+                    tracing::error!(
+                        idempotency_id = reservation.record.id,
+                        error = %mark_error,
+                        completion_error = %error,
+                        "post-dispatch idempotency recovery will continue in the background"
+                    );
+                }
             }
-            return Err(error.into());
+            persist_durable_request_log(
+                &self.request_logs,
+                InvocationLogContext::new(&call, lookup.source_id, lookup.tool_id, started)
+                    .failed(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str()),
+            )
+            .await;
+            return Err(GatewayInvokeError::OutcomeUnknown);
         }
         execution_guard.disarm();
         self.record_attempt(
@@ -1816,6 +2296,43 @@ impl ToolCallService {
             response,
             replayed: false,
         })
+    }
+
+    async fn settle_idempotent_execution_error(
+        &self,
+        record: &IdempotencyRecord,
+        execution_guard: &mut IdempotencyExecutionGuard,
+        failure: &InvocationExecutionError,
+    ) -> Result<(), GatewayInvokeError> {
+        if failure.outcome_unknown() {
+            match self.idempotency.mark_indeterminate(&record.id).await {
+                Ok(_) | Err(IdempotencyError::InvalidTransition("indeterminate")) => {
+                    execution_guard.disarm();
+                }
+                Err(idempotency_error) => {
+                    tracing::error!(
+                        idempotency_id = record.id,
+                        error = %idempotency_error,
+                        "uncertain invocation terminalization will continue in the background"
+                    );
+                }
+            }
+        } else {
+            self.idempotency.release_retryable_execution(record).await?;
+            #[cfg(test)]
+            let retryable_release_race_hook = self
+                .retryable_release_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            #[cfg(test)]
+            if let Some(hook) = retryable_release_race_hook {
+                hook.released.notify_one();
+                hook.continue_settlement.notified().await;
+            }
+            execution_guard.disarm();
+        }
+        Ok(())
     }
 
     async fn resolve_mcp_idempotency_claim<'a, C, F>(
@@ -2024,7 +2541,14 @@ impl ToolCallService {
             Err(IdempotencyError::InvalidTransition("indeterminate")) => {
                 Err(GatewayInvokeError::OutcomeUnknown)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                tracing::error!(
+                    idempotency_id = record.id,
+                    error = %error,
+                    "post-dispatch approval response persistence is indeterminate"
+                );
+                Err(GatewayInvokeError::OutcomeUnknown)
+            }
         }
     }
 
@@ -2444,25 +2968,39 @@ impl ToolCallService {
     }
 
     pub(crate) async fn mark_execution_lost(&self, execution_id: &str) {
+        #[cfg(test)]
+        let recovery_race_hook = {
+            self.execution_cancellation_recovery_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(hook) = recovery_race_hook {
+            hook.new_mark_write_queued.notify_one();
+        }
+        let mut fence = self.deferred_execution_cancellations.write().await;
         self.execution_stopping_flag(execution_id)
             .store(true, Ordering::Release);
-        self.deferred_execution_cancellations
-            .write()
-            .await
-            .insert(execution_id.to_owned());
+        fence.insert(execution_id.to_owned());
     }
 
     pub(crate) async fn cancel_lost_execution(&self, execution_id: &str) {
         self.mark_execution_lost(execution_id).await;
+        if !self
+            .in_flight_execution_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.to_owned())
+        {
+            return;
+        }
         let mut retry_delay = Duration::from_millis(50);
         for attempt in 0..3 {
             match self.cancel_execution(execution_id).await {
                 Ok(_) => {
-                    self.deferred_execution_cancellations
-                        .write()
-                        .await
-                        .remove(execution_id);
-                    self.clear_execution_stopping_flag(execution_id);
+                    self.finish_execution_cancellation_recovery(execution_id)
+                        .await;
                     return;
                 }
                 Err(error) => {
@@ -2478,23 +3016,38 @@ impl ToolCallService {
                 }
             }
         }
-        self.defer_execution_cancellation(execution_id);
+        self.spawn_deferred_execution_cancellation(execution_id.to_owned());
     }
 
     fn defer_execution_cancellation(&self, execution_id: &str) {
+        if !self
+            .in_flight_execution_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.to_owned())
+        {
+            return;
+        }
+        self.spawn_deferred_execution_cancellation(execution_id.to_owned());
+    }
+
+    fn spawn_deferred_execution_cancellation(&self, deferred_execution_id: String) {
         let service = self.clone();
-        let deferred_execution_id = execution_id.to_owned();
+        let recovery_execution_id = deferred_execution_id.clone();
         if !self.background_tasks.spawn(async move {
             let mut retry_delay = Duration::from_millis(100);
             loop {
+                if !service
+                    .execution_cancellation_is_deferred(&deferred_execution_id)
+                    .await
+                {
+                    return;
+                }
                 match service.cancel_execution(&deferred_execution_id).await {
                     Ok(_) => {
                         service
-                            .deferred_execution_cancellations
-                            .write()
-                            .await
-                            .remove(&deferred_execution_id);
-                        service.clear_execution_stopping_flag(&deferred_execution_id);
+                            .finish_execution_cancellation_recovery(&deferred_execution_id)
+                            .await;
                         return;
                     }
                     Err(error) => {
@@ -2509,11 +3062,50 @@ impl ToolCallService {
                 }
             }
         }) {
+            self.in_flight_execution_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&recovery_execution_id);
             tracing::warn!(
-                execution_id,
+                execution_id = recovery_execution_id,
                 "execution cleanup deferred until startup recovery"
             );
         }
+    }
+
+    async fn execution_cancellation_is_deferred(&self, execution_id: &str) -> bool {
+        let deferred = self.deferred_execution_cancellations.write().await;
+        if deferred.contains(execution_id) {
+            true
+        } else {
+            self.in_flight_execution_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(execution_id);
+            false
+        }
+    }
+
+    async fn finish_execution_cancellation_recovery(&self, execution_id: &str) {
+        let mut deferred = self.deferred_execution_cancellations.write().await;
+        #[cfg(test)]
+        let recovery_race_hook = {
+            self.execution_cancellation_recovery_race_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(hook) = recovery_race_hook {
+            hook.old_finish_write_acquired.wait();
+            hook.release_old_finish.wait();
+        }
+        deferred.remove(execution_id);
+        self.clear_execution_stopping_flag(execution_id);
+        self.in_flight_execution_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(execution_id);
     }
 
     pub(crate) fn execution_stopping_flag(&self, execution_id: &str) -> Arc<AtomicBool> {
@@ -2897,7 +3489,7 @@ impl ToolCallService {
                 .strip_prefix("gateway-idempotency:")
                 .filter(|id| !id.is_empty() && record.call_id == "gateway")
                 .ok_or_else(|| ToolCallError::Adapter {
-                    code: "idempotency_metadata_invalid",
+                    code: ToolCallAdapterErrorCode::IdempotencyMetadataInvalid,
                     message: "The MCP approval idempotency metadata is invalid.".to_owned(),
                 })?
                 .to_owned();
@@ -2949,7 +3541,9 @@ impl ToolCallService {
             Some(&expected_oauth_bindings),
         )
         .await;
-        if result.is_err()
+        if result
+            .as_ref()
+            .is_err_and(InvocationExecutionError::outcome_unknown)
             && let Some(execution) = mcp_idempotency_execution.as_mut()
         {
             self.idempotency
@@ -2969,10 +3563,15 @@ impl ToolCallService {
                 ExecutionOutcome::Failed,
                 completed_failure_code.as_deref(),
             ),
-            Err(error) => (
-                error_result(&error),
+            Err(failure) if failure.outcome_unknown() => (
+                outcome_unknown_result(&failure),
+                ExecutionOutcome::Interrupted,
+                Some(failure.stable_error_code()),
+            ),
+            Err(failure) => (
+                error_result(failure.error()),
                 ExecutionOutcome::Failed,
-                Some(error_code(&error)),
+                Some(error_code(failure.error())),
             ),
         };
         let result_json = serde_json::to_value(&tool_result).map_err(ApprovalError::Json)?;
@@ -3176,21 +3775,23 @@ fn notify_registry(registry: &ApprovalNotificationRegistry, approval_id: &str) {
     }
 }
 
-fn oauth_tool_error(_error: OAuthError) -> ToolCallError {
-    ToolCallError::Adapter {
-        code: "oauth_connection_failed",
-        message: "The managed OAuth connection could not be resolved safely.".to_owned(),
-    }
+fn oauth_tool_error(error: OAuthError) -> ToolCallError {
+    ToolCallOAuthError::from(error).into()
 }
 
-pub(crate) async fn execute_with_lease(
+async fn execute_with_lease(
     protocols: &ProtocolRegistry,
     lease: InvocationLease,
     arguments: &Value,
     expected_oauth_bindings: Option<&[OAuthBinding]>,
-) -> Result<ToolResult, ToolCallError> {
-    let prepared = prepare_with_lease(protocols, lease, arguments, expected_oauth_bindings).await?;
-    execute_prepared(protocols, prepared).await
+) -> Result<ToolResult, InvocationExecutionError> {
+    let effect = InvocationEffect::from_lease(&lease);
+    let prepared = prepare_with_lease(protocols, lease, arguments, expected_oauth_bindings)
+        .await
+        .map_err(|error| {
+            InvocationExecutionError::new(error, ExecutionFailurePhase::PreDispatch, effect)
+        })?;
+    execute_prepared(protocols, prepared, effect).await
 }
 
 async fn prepare_with_lease(
@@ -3208,35 +3809,14 @@ async fn prepare_with_lease(
 async fn execute_prepared(
     protocols: &ProtocolRegistry,
     prepared: PreparedProtocolInvocation,
-) -> Result<ToolResult, ToolCallError> {
+    effect: InvocationEffect,
+) -> Result<ToolResult, InvocationExecutionError> {
     let response = protocols
         .execute_invocation(prepared)
         .await
-        .map_err(|error| match error {
-            ProtocolInvocationError::OpenApi(error) => ToolCallError::Adapter {
-                code: if error.outcome_unknown() {
-                    "openapi_outcome_unknown"
-                } else {
-                    error.code()
-                },
-                message: "The upstream OpenAPI operation could not be completed safely.".to_owned(),
-            },
-            ProtocolInvocationError::Graphql(error) => ToolCallError::Adapter {
-                code: if error.outcome_unknown() {
-                    "graphql_outcome_unknown"
-                } else {
-                    "graphql_invocation_failed"
-                },
-                message: "The upstream GraphQL operation could not be completed safely.".to_owned(),
-            },
-            ProtocolInvocationError::Mcp(error) => ToolCallError::Adapter {
-                code: if error.outcome_unknown() {
-                    "mcp_outcome_unknown"
-                } else {
-                    "mcp_invocation_failed"
-                },
-                message: "The upstream MCP tool call could not be completed safely.".to_owned(),
-            },
+        .map_err(protocol_invocation_error)
+        .map_err(|error| {
+            InvocationExecutionError::new(error, ExecutionFailurePhase::ProtocolClassified, effect)
         })?;
     let result = ToolResult {
         ok: response.ok,
@@ -3252,9 +3832,198 @@ async fn execute_prepared(
         }),
     };
     if serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() > MAX_RESULT_BYTES) {
-        return Err(ToolCallError::ResultTooLarge);
+        return Err(InvocationExecutionError::new(
+            ToolCallError::ResultTooLarge,
+            ExecutionFailurePhase::PostDispatch,
+            effect,
+        ));
     }
     Ok(result)
+}
+
+fn protocol_invocation_error(error: ProtocolInvocationError) -> ToolCallError {
+    match error {
+        ProtocolInvocationError::OpenApi(error) => {
+            let outcome_unknown = error.outcome_unknown();
+            let _stable_protocol_code = error.code();
+            let mapped = match error {
+                crate::protocols::openapi::OpenApiExecutionError::Outbound {
+                    outcome_unknown: true,
+                    ..
+                }
+                | crate::protocols::openapi::OpenApiExecutionError::Indeterminate => {
+                    protocol_adapter_error(
+                        ToolCallAdapterErrorCode::OpenApiOutcomeUnknown,
+                        "The upstream OpenAPI operation may have completed, so it cannot be retried safely.",
+                    )
+                }
+                crate::protocols::openapi::OpenApiExecutionError::InsecureTransport
+                | crate::protocols::openapi::OpenApiExecutionError::Outbound {
+                    source: OutboundError::InsecureTransport,
+                    ..
+                } => ToolCallError::Protocol(ProtocolError::new(
+                    crate::protocols::ProtocolErrorCategory::Conflict,
+                    "insecure_openapi_transport",
+                    "OpenAPI requests must use HTTPS, except for loopback HTTP.",
+                )),
+                crate::protocols::openapi::OpenApiExecutionError::Outbound { source, .. } => {
+                    ToolCallError::Outbound(source)
+                }
+                crate::protocols::openapi::OpenApiExecutionError::OAuth(error) => {
+                    ToolCallOAuthError::from(error).into()
+                }
+            };
+            debug_assert_eq!(mapped.outcome_unknown(), outcome_unknown);
+            mapped
+        }
+        ProtocolInvocationError::Graphql(error) => {
+            let outcome_unknown = error.outcome_unknown();
+            let mapped = match error {
+                crate::protocols::graphql::GraphqlInvocationError::Outbound {
+                    outcome_unknown: true,
+                    ..
+                }
+                | crate::protocols::graphql::GraphqlInvocationError::Indeterminate => {
+                    protocol_adapter_error(
+                        ToolCallAdapterErrorCode::GraphqlOutcomeUnknown,
+                        "The upstream GraphQL mutation may have completed, so it cannot be retried safely.",
+                    )
+                }
+                crate::protocols::graphql::GraphqlInvocationError::Outbound { source, .. } => {
+                    ToolCallError::Outbound(source)
+                }
+                crate::protocols::graphql::GraphqlInvocationError::OAuth(error) => {
+                    ToolCallOAuthError::from(error).into()
+                }
+            };
+            debug_assert_eq!(mapped.outcome_unknown(), outcome_unknown);
+            mapped
+        }
+        ProtocolInvocationError::Mcp(error) => {
+            let outcome_unknown = error.outcome_unknown();
+            let mapped = match error {
+                crate::protocols::mcp::McpInvocationError::AuthorizationSetup(error) => {
+                    ToolCallError::Protocol(error)
+                }
+                crate::protocols::mcp::McpInvocationError::HttpSetup(error) => {
+                    mcp_http_setup_error(error)
+                }
+                crate::protocols::mcp::McpInvocationError::HttpCall(_)
+                | crate::protocols::mcp::McpInvocationError::StdioCall(_) => {
+                    protocol_adapter_error(
+                        ToolCallAdapterErrorCode::McpOutcomeUnknown,
+                        "The upstream MCP tool call may have completed, so it cannot be retried safely.",
+                    )
+                }
+                crate::protocols::mcp::McpInvocationError::StdioSetup(error) => {
+                    mcp_stdio_setup_error(error)
+                }
+                crate::protocols::mcp::McpInvocationError::ShuttingDown => protocol_adapter_error(
+                    ToolCallAdapterErrorCode::McpShuttingDown,
+                    "MCP connections are shutting down. Retry after the service is available.",
+                ),
+            };
+            debug_assert_eq!(mapped.outcome_unknown(), outcome_unknown);
+            mapped
+        }
+    }
+}
+
+fn mcp_http_setup_error(error: crate::mcp::upstream::http::StreamableHttpError) -> ToolCallError {
+    use crate::mcp::upstream::http::StreamableHttpError;
+
+    match error {
+        StreamableHttpError::Outbound(error) => ToolCallError::Outbound(error),
+        StreamableHttpError::InsecureEndpoint => ToolCallError::Protocol(ProtocolError::new(
+            crate::protocols::ProtocolErrorCategory::InvalidInput,
+            "invalid_mcp_endpoint",
+            "MCP HTTP endpoints must use HTTPS, except for loopback HTTP.",
+        )),
+        StreamableHttpError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED) => {
+            protocol_adapter_error(
+                ToolCallAdapterErrorCode::McpUpstreamUnauthorized,
+                "The upstream MCP server rejected its configured authorization.",
+            )
+        }
+        StreamableHttpError::HttpStatus(reqwest::StatusCode::FORBIDDEN) => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpUpstreamForbidden,
+            "The upstream MCP server denied its configured authorization.",
+        ),
+        StreamableHttpError::HttpStatus(
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ) => ToolCallError::Outbound(OutboundError::Timeout),
+        StreamableHttpError::SessionExpired
+        | StreamableHttpError::SessionInvalidated
+        | StreamableHttpError::SessionChanged
+        | StreamableHttpError::NotInitialized
+        | StreamableHttpError::AlreadyInitialized => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpSessionConflict,
+            "The MCP session changed before the tool call was dispatched.",
+        ),
+        StreamableHttpError::ReservedHeader
+        | StreamableHttpError::InvalidProtocolVersion
+        | StreamableHttpError::InvalidClientInfo
+        | StreamableHttpError::InvalidRequest
+        | StreamableHttpError::InvalidUtf8
+        | StreamableHttpError::UnsupportedContentType
+        | StreamableHttpError::InvalidResponse
+        | StreamableHttpError::HttpStatus(_)
+        | StreamableHttpError::InvalidSessionId
+        | StreamableHttpError::ProtocolVersionMismatch
+        | StreamableHttpError::JsonRpc { .. }
+        | StreamableHttpError::Json(_) => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpProtocolUnavailable,
+            "The upstream MCP server was unavailable or returned an invalid setup response.",
+        ),
+    }
+}
+
+fn mcp_stdio_setup_error(error: crate::mcp::upstream::stdio::StdioTransportError) -> ToolCallError {
+    use crate::mcp::upstream::stdio::StdioTransportError;
+
+    match error {
+        StdioTransportError::Timeout => ToolCallError::Outbound(OutboundError::Timeout),
+        StdioTransportError::TooManyInFlight => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpCapacity,
+            "MCP execution capacity has been reached. Retry later.",
+        ),
+        StdioTransportError::RequestTooLarge | StdioTransportError::ResponseTooLarge => {
+            protocol_adapter_error(
+                ToolCallAdapterErrorCode::McpMessageTooLarge,
+                "The MCP request or response exceeds the allowed size.",
+            )
+        }
+        StdioTransportError::RestartRequiresInitialization
+        | StdioTransportError::NotInitialized
+        | StdioTransportError::AlreadyInitialized => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpSessionConflict,
+            "The MCP session changed before the tool call was dispatched.",
+        ),
+        StdioTransportError::Template(_)
+        | StdioTransportError::InvalidLimits
+        | StdioTransportError::Spawn
+        | StdioTransportError::Closed
+        | StdioTransportError::InvalidResponse
+        | StdioTransportError::JsonRpc { .. }
+        | StdioTransportError::ProcessExited { .. }
+        | StdioTransportError::AmbiguousToolCall
+        | StdioTransportError::DuplicateRequestId
+        | StdioTransportError::UnexpectedResponseId
+        | StdioTransportError::Encode
+        | StdioTransportError::Decode
+        | StdioTransportError::InvalidRequest
+        | StdioTransportError::ProtocolVersionMismatch => protocol_adapter_error(
+            ToolCallAdapterErrorCode::McpProtocolUnavailable,
+            "The upstream MCP server was unavailable or returned an invalid setup response.",
+        ),
+    }
+}
+
+fn protocol_adapter_error(code: ToolCallAdapterErrorCode, message: &'static str) -> ToolCallError {
+    ToolCallError::Adapter {
+        code,
+        message: message.to_owned(),
+    }
 }
 
 fn completed_failure_code(result: &ToolResult) -> Option<&str> {
@@ -3427,7 +4196,7 @@ fn idempotency_startup_error(error: IdempotencyError) -> ApprovalError {
 
 fn idempotency_tool_call_error(_error: IdempotencyError) -> ToolCallError {
     ToolCallError::Adapter {
-        code: "idempotency_failed",
+        code: ToolCallAdapterErrorCode::IdempotencyFailed,
         message: "The idempotent tool call could not be completed safely.".to_owned(),
     }
 }
@@ -3442,7 +4211,8 @@ fn error_code(error: &ToolCallError) -> &'static str {
         ToolCallError::Catalog(CatalogError::ToolDisabled { .. }) => "tool_disabled",
         ToolCallError::Catalog(CatalogError::RevisionConflict { .. }) => "revision_conflict",
         ToolCallError::Catalog(_) => "catalog_error",
-        ToolCallError::Adapter { code, .. } => code,
+        ToolCallError::Adapter { code, .. } => code.as_str(),
+        ToolCallError::OAuth(error) => error.code(),
         ToolCallError::ArgumentsTooLarge => "arguments_too_large",
         ToolCallError::InvalidArguments => "invalid_tool_arguments",
         ToolCallError::Stale => "invocation_stale",
@@ -3478,6 +4248,19 @@ fn error_result(error: &ToolCallError) -> ToolResult {
     }
 }
 
+fn outcome_unknown_result(failure: &InvocationExecutionError) -> ToolResult {
+    ToolResult {
+        ok: false,
+        data: None,
+        error: Some(PublicToolError {
+            code: failure.stable_error_code().to_owned(),
+            message: "The upstream operation may have completed, so it cannot be retried safely."
+                .to_owned(),
+        }),
+        http: None,
+    }
+}
+
 #[cfg(test)]
 mod idempotency_guard_tests {
     use std::{collections::BTreeMap, future::pending, time::Duration};
@@ -3497,6 +4280,10 @@ mod idempotency_guard_tests {
             SourceKind, StagedArtifact, StagedTool, StagedToolBinding, ToolBinding, ToolMode,
         },
         openapi::{OpenApiBinding, OpenApiSecurityAlternative},
+        runtime::{
+            ExecutionCancellation, HostToolDispatcher, InvocationContext, InvocationToolDispatcher,
+            ToolCall as RuntimeToolCall, ToolResult as RuntimeToolResult,
+        },
     };
 
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -3515,7 +4302,493 @@ mod idempotency_guard_tests {
         assert_eq!(completed_failure_code(&result), Some("graphql_error"));
     }
 
-    async fn app_with_mcp_ask_tool_at(server_url: &str) -> (tempfile::TempDir, ExecutorApp) {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ExpectedExecutionError {
+        Adapter(ToolCallAdapterErrorCode),
+        OAuth(&'static str),
+        Outbound(&'static str),
+        Protocol(&'static str),
+    }
+
+    fn assert_execution_error(error: ToolCallError, expected: ExpectedExecutionError) {
+        match (error, expected) {
+            (
+                ToolCallError::Adapter { code, message },
+                ExpectedExecutionError::Adapter(expected),
+            ) => {
+                assert_eq!(code, expected);
+                assert!(!message.contains("secret upstream detail"));
+            }
+            (ToolCallError::Outbound(error), ExpectedExecutionError::Outbound(expected)) => {
+                assert_eq!(error.code(), expected);
+            }
+            (ToolCallError::OAuth(error), ExpectedExecutionError::OAuth(expected)) => {
+                assert_eq!(error.code(), expected);
+            }
+            (ToolCallError::Protocol(error), ExpectedExecutionError::Protocol(expected)) => {
+                assert_eq!(error.code, expected);
+            }
+            (error, expected) => panic!("unexpected mapped error {error:?}, expected {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_execution_errors_preserve_retry_safety_and_stable_codes() {
+        use crate::protocols::{graphql, mcp, openapi};
+
+        let safe_openapi = protocol_invocation_error(ProtocolInvocationError::OpenApi(
+            openapi::OpenApiExecutionError::Outbound {
+                source: OutboundError::Timeout,
+                outcome_unknown: false,
+            },
+        ));
+        assert!(!safe_openapi.outcome_unknown());
+        assert_execution_error(
+            safe_openapi,
+            ExpectedExecutionError::Outbound("upstream_timeout"),
+        );
+        let ambiguous_openapi = protocol_invocation_error(ProtocolInvocationError::OpenApi(
+            openapi::OpenApiExecutionError::Outbound {
+                source: OutboundError::Request,
+                outcome_unknown: true,
+            },
+        ));
+        assert!(ambiguous_openapi.outcome_unknown());
+        assert_execution_error(
+            ambiguous_openapi,
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::OpenApiOutcomeUnknown),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::OpenApi(
+                openapi::OpenApiExecutionError::Indeterminate,
+            )),
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::OpenApiOutcomeUnknown),
+        );
+        let insecure_openapi = protocol_invocation_error(ProtocolInvocationError::OpenApi(
+            openapi::OpenApiExecutionError::InsecureTransport,
+        ));
+        assert!(!insecure_openapi.outcome_unknown());
+        assert_execution_error(
+            insecure_openapi,
+            ExpectedExecutionError::Protocol("insecure_openapi_transport"),
+        );
+        let insecure_openapi_hop = protocol_invocation_error(ProtocolInvocationError::OpenApi(
+            openapi::OpenApiExecutionError::Outbound {
+                source: OutboundError::InsecureTransport,
+                outcome_unknown: false,
+            },
+        ));
+        assert!(!insecure_openapi_hop.outcome_unknown());
+        assert_execution_error(
+            insecure_openapi_hop,
+            ExpectedExecutionError::Protocol("insecure_openapi_transport"),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::OpenApi(
+                openapi::OpenApiExecutionError::OAuth(OAuthError::Conflict {
+                    code: "oauth_binding_changed",
+                    message: "secret upstream detail",
+                }),
+            )),
+            ExpectedExecutionError::OAuth("oauth_binding_changed"),
+        );
+
+        let safe_graphql = protocol_invocation_error(ProtocolInvocationError::Graphql(
+            graphql::GraphqlInvocationError::Outbound {
+                source: OutboundError::DnsResolution,
+                outcome_unknown: false,
+            },
+        ));
+        assert!(!safe_graphql.outcome_unknown());
+        assert_execution_error(
+            safe_graphql,
+            ExpectedExecutionError::Outbound("dns_resolution_failed"),
+        );
+        let ambiguous_graphql = protocol_invocation_error(ProtocolInvocationError::Graphql(
+            graphql::GraphqlInvocationError::Outbound {
+                source: OutboundError::Request,
+                outcome_unknown: true,
+            },
+        ));
+        assert!(ambiguous_graphql.outcome_unknown());
+        assert_execution_error(
+            ambiguous_graphql,
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::GraphqlOutcomeUnknown),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::Graphql(
+                graphql::GraphqlInvocationError::Indeterminate,
+            )),
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::GraphqlOutcomeUnknown),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::Graphql(
+                graphql::GraphqlInvocationError::OAuth(OAuthError::Upstream {
+                    code: "oauth_provider_timeout",
+                }),
+            )),
+            ExpectedExecutionError::OAuth("oauth_provider_timeout"),
+        );
+
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::Mcp(
+                mcp::McpInvocationError::AuthorizationSetup(ProtocolError::new(
+                    crate::protocols::ProtocolErrorCategory::Conflict,
+                    "oauth_binding_changed",
+                    "safe",
+                )),
+            )),
+            ExpectedExecutionError::Protocol("oauth_binding_changed"),
+        );
+        let insecure_mcp = protocol_invocation_error(ProtocolInvocationError::Mcp(
+            mcp::McpInvocationError::HttpSetup(
+                crate::mcp::upstream::http::StreamableHttpError::InsecureEndpoint,
+            ),
+        ));
+        assert!(!insecure_mcp.outcome_unknown());
+        assert_execution_error(
+            insecure_mcp,
+            ExpectedExecutionError::Protocol("invalid_mcp_endpoint"),
+        );
+        let ambiguous_mcp = protocol_invocation_error(ProtocolInvocationError::Mcp(
+            mcp::McpInvocationError::HttpCall(
+                crate::mcp::upstream::http::StreamableHttpError::InvalidResponse,
+            ),
+        ));
+        assert!(ambiguous_mcp.outcome_unknown());
+        assert_execution_error(
+            ambiguous_mcp,
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpOutcomeUnknown),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::Mcp(
+                mcp::McpInvocationError::StdioCall(
+                    crate::mcp::upstream::stdio::StdioTransportError::Decode,
+                ),
+            )),
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpOutcomeUnknown),
+        );
+        assert_execution_error(
+            protocol_invocation_error(ProtocolInvocationError::Mcp(
+                mcp::McpInvocationError::ShuttingDown,
+            )),
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpShuttingDown),
+        );
+    }
+
+    #[test]
+    fn oauth_errors_preserve_sanitized_typed_reasons() {
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Validation,
+            Required,
+            Conflict,
+            Unauthorized,
+            Denied,
+            Upstream,
+            Internal,
+        }
+
+        let cases = [
+            (
+                OAuthError::Validation {
+                    code: "oauth_scope_invalid",
+                    message: "secret upstream detail",
+                },
+                Expected::Validation,
+                "oauth_scope_invalid",
+            ),
+            (
+                OAuthError::NotFound,
+                Expected::Required,
+                "oauth_connection_required",
+            ),
+            (
+                OAuthError::Conflict {
+                    code: "oauth_binding_changed",
+                    message: "secret upstream detail",
+                },
+                Expected::Conflict,
+                "oauth_binding_changed",
+            ),
+            (
+                OAuthError::UnauthorizedTransaction,
+                Expected::Unauthorized,
+                "oauth_transaction_unauthorized",
+            ),
+            (
+                OAuthError::AuthorizationDenied {
+                    connection_id: "secret-connection-id".to_owned(),
+                },
+                Expected::Denied,
+                "oauth_authorization_denied",
+            ),
+            (
+                OAuthError::Upstream {
+                    code: "oauth_provider_timeout",
+                },
+                Expected::Upstream,
+                "oauth_provider_timeout",
+            ),
+            (
+                OAuthError::Internal,
+                Expected::Internal,
+                "oauth_internal_error",
+            ),
+        ];
+
+        for (source, expected, code) in cases {
+            let ToolCallError::OAuth(mapped) = oauth_tool_error(source) else {
+                panic!("OAuth errors must remain typed");
+            };
+            assert_eq!(mapped.code(), code);
+            assert!(matches!(
+                (mapped, expected),
+                (ToolCallOAuthError::Validation { .. }, Expected::Validation)
+                    | (ToolCallOAuthError::ConnectionRequired, Expected::Required)
+                    | (ToolCallOAuthError::Conflict { .. }, Expected::Conflict)
+                    | (
+                        ToolCallOAuthError::UnauthorizedTransaction,
+                        Expected::Unauthorized
+                    )
+                    | (ToolCallOAuthError::AuthorizationDenied, Expected::Denied)
+                    | (ToolCallOAuthError::Upstream { .. }, Expected::Upstream)
+                    | (ToolCallOAuthError::Internal, Expected::Internal)
+            ));
+        }
+    }
+
+    #[test]
+    fn mcp_http_setup_error_mapping_is_typed_and_exhaustive() {
+        use crate::mcp::upstream::http::StreamableHttpError;
+
+        assert_execution_error(
+            mcp_http_setup_error(StreamableHttpError::InsecureEndpoint),
+            ExpectedExecutionError::Protocol("invalid_mcp_endpoint"),
+        );
+        let protocol_unavailable = [
+            StreamableHttpError::ReservedHeader,
+            StreamableHttpError::InvalidProtocolVersion,
+            StreamableHttpError::InvalidClientInfo,
+            StreamableHttpError::InvalidRequest,
+            StreamableHttpError::InvalidUtf8,
+            StreamableHttpError::UnsupportedContentType,
+            StreamableHttpError::InvalidResponse,
+            StreamableHttpError::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            StreamableHttpError::InvalidSessionId,
+            StreamableHttpError::ProtocolVersionMismatch,
+            StreamableHttpError::JsonRpc {
+                code: -32_603,
+                message: "secret upstream detail".to_owned(),
+                data: Some(json!({ "secret": "secret upstream detail" })),
+            },
+            StreamableHttpError::Json(
+                serde_json::from_str::<Value>("{").expect_err("invalid JSON fixture"),
+            ),
+        ];
+        for error in protocol_unavailable {
+            assert_execution_error(
+                mcp_http_setup_error(error),
+                ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpProtocolUnavailable),
+            );
+        }
+        for error in [
+            StreamableHttpError::SessionExpired,
+            StreamableHttpError::SessionInvalidated,
+            StreamableHttpError::SessionChanged,
+            StreamableHttpError::NotInitialized,
+            StreamableHttpError::AlreadyInitialized,
+        ] {
+            assert_execution_error(
+                mcp_http_setup_error(error),
+                ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpSessionConflict),
+            );
+        }
+        for (status, expected) in [
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                ToolCallAdapterErrorCode::McpUpstreamUnauthorized,
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                ToolCallAdapterErrorCode::McpUpstreamForbidden,
+            ),
+        ] {
+            assert_execution_error(
+                mcp_http_setup_error(StreamableHttpError::HttpStatus(status)),
+                ExpectedExecutionError::Adapter(expected),
+            );
+        }
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_execution_error(
+                mcp_http_setup_error(StreamableHttpError::HttpStatus(status)),
+                ExpectedExecutionError::Outbound("upstream_timeout"),
+            );
+        }
+        assert_execution_error(
+            mcp_http_setup_error(StreamableHttpError::Outbound(OutboundError::Connection)),
+            ExpectedExecutionError::Outbound("upstream_connection_failed"),
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_static_and_managed_auth_rejections_are_not_binding_conflicts() {
+        use crate::mcp::upstream::http::{StreamableHttpConfig, StreamableHttpTransport};
+
+        async fn rejected_setup(
+            token: &'static str,
+            status: reqwest::StatusCode,
+        ) -> Result<ToolCallError, String> {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|error| format!("MCP fixture bind failed: {error}"))?;
+            let mut config = StreamableHttpConfig::new(format!(
+                "http://{}/mcp",
+                listener
+                    .local_addr()
+                    .map_err(|error| format!("MCP fixture address failed: {error}"))?
+            ));
+            config.allow_private_networks = true;
+            config.headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|error| format!("MCP fixture authorization failed: {error}"))?,
+            );
+            let server = async move {
+                let (mut connection, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|error| format!("MCP fixture accept failed: {error}"))?;
+                let mut request = vec![0_u8; 4096];
+                let read = connection
+                    .read(&mut request)
+                    .await
+                    .map_err(|error| format!("MCP fixture read failed: {error}"))?;
+                let request = String::from_utf8_lossy(&request[..read]);
+                if !request.contains(&format!("authorization: Bearer {token}")) {
+                    return Err(
+                        "MCP fixture did not receive its configured authorization".to_owned()
+                    );
+                }
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Rejected")
+                );
+                connection
+                    .write_all(response.as_bytes())
+                    .await
+                    .map_err(|error| format!("MCP fixture response failed: {error}"))?;
+                Ok::<(), String>(())
+            };
+            let client = async move {
+                let transport = StreamableHttpTransport::new(config)
+                    .map_err(|error| format!("MCP transport setup failed early: {error}"))?;
+                match transport.initialize().await {
+                    Ok(_) => Err("MCP setup unexpectedly succeeded".to_owned()),
+                    Err(error) => Ok(error),
+                }
+            };
+            let (server_result, client_result) = tokio::join!(server, client);
+            server_result?;
+            let setup_error = client_result?;
+            Ok(mcp_http_setup_error(setup_error))
+        }
+
+        let static_auth = rejected_setup("static-token", reqwest::StatusCode::UNAUTHORIZED)
+            .await
+            .expect("static MCP authorization rejection should be observed");
+        assert_execution_error(
+            static_auth,
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpUpstreamUnauthorized),
+        );
+
+        let managed_oauth = rejected_setup("managed-oauth-token", reqwest::StatusCode::FORBIDDEN)
+            .await
+            .expect("managed OAuth MCP rejection should be observed");
+        assert_execution_error(
+            managed_oauth,
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpUpstreamForbidden),
+        );
+
+        let binding_race = protocol_invocation_error(ProtocolInvocationError::Mcp(
+            crate::protocols::mcp::McpInvocationError::AuthorizationSetup(ProtocolError::new(
+                crate::protocols::ProtocolErrorCategory::Conflict,
+                "oauth_binding_changed",
+                "The managed OAuth connection changed.",
+            )),
+        ));
+        assert_execution_error(
+            binding_race,
+            ExpectedExecutionError::Protocol("oauth_binding_changed"),
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_setup_error_mapping_is_typed_and_exhaustive() {
+        use crate::mcp::upstream::stdio::{StdioTemplateError, StdioTransportError};
+
+        for error in [
+            StdioTransportError::Template(StdioTemplateError::UnknownTemplate),
+            StdioTransportError::InvalidLimits,
+            StdioTransportError::Spawn,
+            StdioTransportError::Closed,
+            StdioTransportError::InvalidResponse,
+            StdioTransportError::JsonRpc { code: -32_603 },
+            StdioTransportError::ProcessExited {
+                code: Some(1),
+                stderr_truncated: true,
+            },
+            StdioTransportError::AmbiguousToolCall,
+            StdioTransportError::DuplicateRequestId,
+            StdioTransportError::UnexpectedResponseId,
+            StdioTransportError::Encode,
+            StdioTransportError::Decode,
+            StdioTransportError::InvalidRequest,
+            StdioTransportError::ProtocolVersionMismatch,
+        ] {
+            assert_execution_error(
+                mcp_stdio_setup_error(error),
+                ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpProtocolUnavailable),
+            );
+        }
+        for error in [
+            StdioTransportError::RestartRequiresInitialization,
+            StdioTransportError::NotInitialized,
+            StdioTransportError::AlreadyInitialized,
+        ] {
+            assert_execution_error(
+                mcp_stdio_setup_error(error),
+                ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpSessionConflict),
+            );
+        }
+        assert_execution_error(
+            mcp_stdio_setup_error(StdioTransportError::Timeout),
+            ExpectedExecutionError::Outbound("upstream_timeout"),
+        );
+        assert_execution_error(
+            mcp_stdio_setup_error(StdioTransportError::TooManyInFlight),
+            ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpCapacity),
+        );
+        for error in [
+            StdioTransportError::RequestTooLarge,
+            StdioTransportError::ResponseTooLarge,
+        ] {
+            assert_execution_error(
+                mcp_stdio_setup_error(error),
+                ExpectedExecutionError::Adapter(ToolCallAdapterErrorCode::McpMessageTooLarge),
+            );
+        }
+    }
+
+    async fn app_with_openapi_tool_at(
+        server_url: &str,
+        method: &str,
+        mode: ToolMode,
+    ) -> (tempfile::TempDir, ExecutorApp) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
             .await
@@ -3568,24 +4841,31 @@ mod idempotency_guard_tests {
                         preferred_name: "write".to_owned(),
                         display_name: "Write".to_owned(),
                         description: None,
-                        input_schema: json!({
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["value"],
-                            "properties": { "value": { "type": "string" } }
-                        }),
+                        input_schema: if mode == ToolMode::Ask {
+                            json!({
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["value"],
+                                "properties": { "value": { "type": "string" } }
+                            })
+                        } else {
+                            json!({
+                                "type": "object",
+                                "additionalProperties": false
+                            })
+                        },
                         output_schema: None,
                         input_typescript: None,
                         output_typescript: None,
                         typescript_definitions: BTreeMap::new(),
-                        intrinsic_mode: ToolMode::Ask,
+                        intrinsic_mode: mode,
                     }],
                 },
                 vec![StagedToolBinding {
                     stable_key: "write".to_owned(),
                     binding: ToolBinding::OpenapiV1(OpenApiBinding {
                         version: 1,
-                        method: "POST".to_owned(),
+                        method: method.to_owned(),
                         path_template: "/write".to_owned(),
                         server_url: server_url.to_owned(),
                         parameters: Vec::new(),
@@ -3600,6 +4880,1057 @@ mod idempotency_guard_tests {
             .await
             .expect("Ask tool should import");
         (directory, app)
+    }
+
+    async fn app_with_mcp_ask_tool_at(server_url: &str) -> (tempfile::TempDir, ExecutorApp) {
+        app_with_openapi_tool_at(server_url, "POST", ToolMode::Ask).await
+    }
+
+    fn gateway_tool_call(request_id: &str) -> ToolCall {
+        ToolCall {
+            request_id: request_id.to_owned(),
+            actor: ToolActor::api_token("mcp-owner", Some("Gateway owner".to_owned())),
+            surface: RequestSurface::Gateway,
+            execution_id: request_id.to_owned(),
+            call_id: "gateway".to_owned(),
+            worker_generation: 0,
+            path: "mcp_approval.write".to_owned(),
+            arguments: json!({}),
+        }
+    }
+
+    async fn accept_requests_and_close(
+        listener: TcpListener,
+        method: &'static str,
+        count: usize,
+    ) -> Result<(), String> {
+        for _ in 0..count {
+            let (mut connection, _) = listener
+                .accept()
+                .await
+                .map_err(|error| format!("upstream accept failed: {error}"))?;
+            let mut request = vec![0_u8; 4096];
+            let read = connection
+                .read(&mut request)
+                .await
+                .map_err(|error| format!("upstream request read failed: {error}"))?;
+            let expected = format!("{method} /write HTTP/1.1");
+            if !String::from_utf8_lossy(&request[..read]).starts_with(&expected) {
+                return Err(format!("unexpected upstream request, expected {expected}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn serve_large_json_responses(
+        listener: TcpListener,
+        method: &'static str,
+        count: usize,
+    ) -> Result<(), String> {
+        let body = format!(r#"{{"value":"{}"}}"#, "x".repeat(MAX_RESULT_BYTES));
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        for _ in 0..count {
+            let (mut connection, _) = listener
+                .accept()
+                .await
+                .map_err(|error| format!("upstream accept failed: {error}"))?;
+            let mut request = vec![0_u8; 4096];
+            let read = connection
+                .read(&mut request)
+                .await
+                .map_err(|error| format!("upstream request read failed: {error}"))?;
+            let expected = format!("{method} /write HTTP/1.1");
+            if !String::from_utf8_lossy(&request[..read]).starts_with(&expected) {
+                return Err(format!("unexpected upstream request, expected {expected}"));
+            }
+            connection
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|error| format!("upstream response headers failed: {error}"))?;
+            connection
+                .write_all(body.as_bytes())
+                .await
+                .map_err(|error| format!("upstream response body failed: {error}"))?;
+        }
+        Ok(())
+    }
+
+    async fn serve_success_json_responses(
+        listener: TcpListener,
+        method: &'static str,
+        count: usize,
+    ) -> Result<(), String> {
+        let body = r#"{"ok":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for _ in 0..count {
+            let (mut connection, _) = listener
+                .accept()
+                .await
+                .map_err(|error| format!("upstream accept failed: {error}"))?;
+            let mut request = vec![0_u8; 4096];
+            let read = connection
+                .read(&mut request)
+                .await
+                .map_err(|error| format!("upstream request read failed: {error}"))?;
+            let expected = format!("{method} /write HTTP/1.1");
+            if !String::from_utf8_lossy(&request[..read]).starts_with(&expected) {
+                return Err(format!("unexpected upstream request, expected {expected}"));
+            }
+            connection
+                .write_all(response.as_bytes())
+                .await
+                .map_err(|error| format!("upstream response failed: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn safe_query_transport_failures_release_the_key_for_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test port should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "GET", ToolMode::Enabled).await;
+        let scenario = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(accept_requests_and_close(listener, "GET", 2), async {
+                for attempt in 1..=2 {
+                    let error = match app
+                        .tool_calls()
+                        .submit_gateway_idempotent(
+                            gateway_tool_call(&format!("safe-query-{attempt}")),
+                            "safe-query-retry",
+                        )
+                        .await
+                    {
+                        Ok(_) => return Err(format!("safe query attempt {attempt} succeeded")),
+                        Err(error) => error,
+                    };
+                    if !matches!(
+                        &error,
+                        GatewayInvokeError::ToolCall(ToolCallError::Outbound(
+                            OutboundError::Connection | OutboundError::Request
+                        ))
+                    ) {
+                        return Err(format!("unexpected safe query failure: {error:?}"));
+                    }
+                    let retained = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM gateway_invocation_idempotency \
+                         WHERE owner_api_token_id = 'mcp-owner'",
+                    )
+                    .fetch_one(app.pool())
+                    .await
+                    .map_err(|error| format!("idempotency row count failed: {error}"))?;
+                    if retained != 0 {
+                        return Err(format!(
+                            "attempt {attempt} retained {retained} idempotency rows"
+                        ));
+                    }
+                }
+                Ok::<(), String>(())
+            })
+        })
+        .await;
+        let shutdown = tokio::time::timeout(Duration::from_secs(5), app.shutdown()).await;
+        shutdown.expect("safe query application shutdown should be bounded");
+        scenario
+            .expect("safe query scenario should settle every future")
+            .expect("safe query retries should both release their claims");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_retryable_release_finishes_cleanup_before_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "GET", ToolMode::Enabled).await;
+        let hook = Arc::new(RetryableReleaseRaceHook::default());
+        *app.tool_calls()
+            .retryable_release_race_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook.clone());
+
+        let service = app.tool_calls().clone();
+        let invocation = tokio::spawn(async move {
+            service
+                .submit_gateway_idempotent(
+                    gateway_tool_call("cancel-after-retryable-release"),
+                    "cancel-after-retryable-release",
+                )
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            accept_requests_and_close(listener, "GET", 1),
+        )
+        .await
+        .expect("the query should reach its upstream")
+        .expect("the query request should be valid");
+        tokio::time::timeout(Duration::from_secs(2), hook.released.notified())
+            .await
+            .expect("the retryable idempotency row should be released");
+        let retained = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency row count should read");
+        assert_eq!(retained, 0);
+
+        invocation.abort();
+        assert!(
+            invocation
+                .await
+                .expect_err("the paused invocation should be canceled")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(2), hook.cleanup_started.notified())
+            .await
+            .expect("the canceled execution guard should start cleanup");
+        tokio::time::timeout(Duration::from_secs(2), hook.cleanup_completed.notified())
+            .await
+            .expect("cleanup should accept an already released row as terminal");
+
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("shutdown after retryable-release cancellation should be bounded");
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_a_paused_request_log_before_recovery() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("Executor should open");
+        let pause = app.tool_calls().request_logs.pause_next_write();
+        app.tool_calls().record_rejected_request(
+            "paused-request-log-shutdown",
+            "missing-token",
+            RequestSurface::Gateway,
+            "tools.paused",
+            "paused_failure",
+        );
+        tokio::time::timeout(Duration::from_secs(2), pause.reached())
+            .await
+            .expect("request-log consumer should reach the pause");
+
+        app.begin_shutdown();
+        let shutdown = tokio::spawn(app.shutdown());
+        pause.release();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pause.finished())
+                .await
+                .expect("graceful shutdown should let the paused write finish")
+        );
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown after a paused request log should be bounded")
+            .expect("shutdown task should not panic");
+    }
+
+    #[tokio::test]
+    async fn plain_runtime_post_oversized_result_is_durably_outcome_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+        let dispatcher = InvocationToolDispatcher::new(
+            app.tool_calls().clone(),
+            InvocationContext {
+                request_id: "plain-ts-post".to_owned(),
+                actor: ToolActor::api_token("mcp-owner", Some("Runtime owner".to_owned())),
+                surface: RequestSurface::Cli,
+                execution_id: "plain-ts-execution".to_owned(),
+            },
+        );
+        let (upstream, result) = tokio::join!(
+            serve_large_json_responses(listener, "POST", 1),
+            dispatcher.dispatch(
+                RuntimeToolCall {
+                    execution_id: "plain-ts-execution".to_owned(),
+                    worker_generation: 1,
+                    call_id: 1,
+                    path: "mcp_approval.write".to_owned(),
+                    arguments: json!({}),
+                },
+                ExecutionCancellation::default(),
+            )
+        );
+        upstream.expect("one POST should reach the upstream");
+        assert!(
+            matches!(
+                &result,
+            RuntimeToolResult::Failure { code, .. }
+                if code == ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str()
+            ),
+            "unexpected plain runtime result: {result:?}"
+        );
+        let log = app
+            .catalog()
+            .request_log("plain-ts-post:call:1")
+            .await
+            .expect("uncertain plain runtime call should be durably logged");
+        assert_eq!(log.outcome, RequestOutcome::Failed);
+        assert_eq!(
+            log.error_code.as_deref(),
+            Some(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str())
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("plain runtime outcome-unknown shutdown should be bounded");
+    }
+
+    #[tokio::test]
+    async fn runtime_cancellation_after_post_receipt_durably_records_outcome_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+        let upstream_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_calls = upstream_calls.clone();
+        let (received, receipt) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.expect("POST should connect");
+            counted_calls.fetch_add(1, Ordering::SeqCst);
+            let mut request = vec![0_u8; 4096];
+            let read = connection
+                .read(&mut request)
+                .await
+                .expect("POST should be readable");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /write HTTP/1.1"));
+            let _ = received.send(());
+            let _ = released.await;
+            let _ = connection
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .await;
+        });
+        let dispatcher = Arc::new(InvocationToolDispatcher::new(
+            app.tool_calls().clone(),
+            InvocationContext {
+                request_id: "cancel-after-receipt".to_owned(),
+                actor: ToolActor::api_token("mcp-owner", Some("Runtime owner".to_owned())),
+                surface: RequestSurface::Cli,
+                execution_id: "cancel-after-receipt-execution".to_owned(),
+            },
+        ));
+        let cancellation = ExecutionCancellation::default();
+        let dispatched = {
+            let dispatcher = dispatcher.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                dispatcher
+                    .dispatch(
+                        RuntimeToolCall {
+                            execution_id: "cancel-after-receipt-execution".to_owned(),
+                            worker_generation: 1,
+                            call_id: 1,
+                            path: "mcp_approval.write".to_owned(),
+                            arguments: json!({}),
+                        },
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .expect("POST should reach the upstream before cancellation")
+            .expect("receipt signal should send");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), dispatched)
+            .await
+            .expect("runtime cancellation should return promptly")
+            .expect("dispatch task should not panic");
+        assert!(matches!(
+            result,
+            RuntimeToolResult::InternalFailure { code } if code == "execution_cancelled"
+        ));
+        let log = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(log) = app
+                    .catalog()
+                    .request_log("cancel-after-receipt:call:1")
+                    .await
+                {
+                    break log;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation recovery should durably persist its request log");
+        assert_eq!(
+            log.error_code.as_deref(),
+            Some(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str())
+        );
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+        let _ = release.send(());
+        upstream.await.expect("upstream task should not panic");
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("cancel-after-receipt shutdown should be bounded");
+    }
+
+    #[tokio::test]
+    async fn approved_non_mcp_oversized_mutation_is_durably_outcome_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+        let tool = app
+            .catalog()
+            .list_tools(ListToolsFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("test tool should list")
+            .items
+            .into_iter()
+            .next()
+            .expect("test tool should exist");
+        app.catalog()
+            .set_tool_mode(
+                &tool.id,
+                Some(ToolMode::Ask),
+                tool.revision,
+                AuditContext::system(Some("ask-oversized-mode")),
+            )
+            .await
+            .expect("test tool should switch to Ask mode");
+        let upstream = tokio::spawn(serve_large_json_responses(listener, "POST", 1));
+        let dispatcher = Arc::new(InvocationToolDispatcher::new(
+            app.tool_calls().clone(),
+            InvocationContext {
+                request_id: "ask-oversized-post".to_owned(),
+                actor: ToolActor::api_token("mcp-owner", Some("Runtime owner".to_owned())),
+                surface: RequestSurface::Cli,
+                execution_id: "ask-oversized-execution".to_owned(),
+            },
+        ));
+        let dispatched = {
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                dispatcher
+                    .dispatch(
+                        RuntimeToolCall {
+                            execution_id: "ask-oversized-execution".to_owned(),
+                            worker_generation: 1,
+                            call_id: 1,
+                            path: "mcp_approval.write".to_owned(),
+                            arguments: json!({}),
+                        },
+                        ExecutionCancellation::default(),
+                    )
+                    .await
+            })
+        };
+        let approval = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(approval) = app
+                    .tool_calls()
+                    .approvals()
+                    .list_admin(crate::approval::ApprovalListQuery {
+                        before_sequence: None,
+                        limit: 1,
+                        status: None,
+                    })
+                    .await
+                    .expect("approvals should list")
+                    .items
+                    .into_iter()
+                    .next()
+                {
+                    break approval;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Ask approval should appear");
+        app.tool_calls()
+            .decide(
+                &approval.id,
+                "approve-oversized-post",
+                approval.revision,
+                ApprovalDecision::Approve,
+                1,
+            )
+            .await
+            .expect("Ask approval should persist");
+        let result = tokio::time::timeout(Duration::from_secs(15), dispatched)
+            .await
+            .expect("approved POST should settle")
+            .expect("dispatch task should not panic");
+        upstream.abort();
+        let _ = upstream.await;
+        assert!(
+            matches!(
+                &result,
+                RuntimeToolResult::Failure { code, .. }
+                    if code == ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str()
+            ),
+            "unexpected approved runtime result: {result:?}"
+        );
+        let terminal = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval.id)
+            .await
+            .expect("approval should read")
+            .expect("approval should remain stored");
+        assert_eq!(terminal.record.status, ApprovalStatus::Interrupted);
+        assert_eq!(
+            terminal.record.failure_code.as_deref(),
+            Some(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str())
+        );
+        let logged_code = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(code) = sqlx::query_scalar::<_, String>(
+                    "SELECT error_code FROM request_logs \
+                     WHERE approval_id = ? AND error_code = ?",
+                )
+                .bind(&approval.id)
+                .bind(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str())
+                .fetch_optional(app.pool())
+                .await
+                .expect("approval request log should read")
+                {
+                    break code;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval outbox should durably flush");
+        assert_eq!(
+            logged_code,
+            ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str()
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("approved outcome-unknown shutdown should be bounded");
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_response_capacity_returns_stable_outcome_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+        let upstream = tokio::spawn(serve_success_json_responses(listener, "POST", 1));
+        let mut capacity_service = app.tool_calls().clone();
+        capacity_service.idempotency = capacity_service
+            .idempotency
+            .clone()
+            .with_response_ciphertext_capacity(0);
+        let first = capacity_service
+            .submit_gateway_idempotent(
+                gateway_tool_call("response-capacity-first"),
+                "response-capacity",
+            )
+            .await
+            .expect_err("post-dispatch response capacity must be indeterminate");
+        assert!(matches!(first, GatewayInvokeError::OutcomeUnknown));
+        upstream
+            .await
+            .expect("upstream task should not panic")
+            .expect("exactly one POST should reach upstream");
+        let retry = capacity_service
+            .submit_gateway_idempotent(
+                gateway_tool_call("response-capacity-retry"),
+                "response-capacity",
+            )
+            .await
+            .expect_err("same-key retry must remain indeterminate");
+        assert!(matches!(retry, GatewayInvokeError::OutcomeUnknown));
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency state should read");
+        assert_eq!(state, "indeterminate");
+        let log = app
+            .catalog()
+            .request_log("response-capacity-first")
+            .await
+            .expect("post-dispatch capacity should be durably logged");
+        assert_eq!(
+            log.error_code.as_deref(),
+            Some(ToolCallAdapterErrorCode::InvocationOutcomeUnknown.as_str())
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("response-capacity shutdown should be bounded");
+    }
+
+    #[tokio::test]
+    async fn repeated_cancellation_recovery_coalesces_to_one_worker() {
+        let (_directory, app) = app_with_mcp_ask_tool_at("http://127.0.0.1:9").await;
+        let hook = Arc::new(CancelExecutionHook::default());
+        hook.block_retries.store(true, Ordering::SeqCst);
+        *app.tool_calls()
+            .cancel_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook.clone());
+        let execution_id = "repeated-cancellation-recovery";
+        app.tool_calls().mark_execution_lost(execution_id).await;
+        for _ in 0..64 {
+            app.tool_calls().defer_execution_cancellation(execution_id);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hook.retry_waiters.load(Ordering::SeqCst) < 1 {
+                hook.retry_waiting.notified().await;
+            }
+        })
+        .await
+        .expect("the keyed cancellation worker should start");
+        assert_eq!(hook.retry_waiters.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.tool_calls()
+                .in_flight_execution_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        for _ in 0..64 {
+            app.tool_calls().defer_execution_cancellation(execution_id);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(hook.retry_waiters.load(Ordering::SeqCst), 1);
+        hook.block_retries.store(false, Ordering::SeqCst);
+        hook.release_retries.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let in_flight = app
+                    .tool_calls()
+                    .in_flight_execution_cancellations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(execution_id);
+                if !in_flight {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the keyed cancellation worker should finish");
+        assert!(
+            !app.tool_calls()
+                .deferred_execution_cancellations
+                .read()
+                .await
+                .contains(execution_id)
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("coalesced cancellation shutdown should be bounded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn newer_lost_signal_stays_fenced_while_older_recovery_finishes() {
+        let (_directory, app) = app_with_mcp_ask_tool_at("http://127.0.0.1:9").await;
+        let execution_id = "old-finish-new-mark-approve";
+        let submission = app
+            .tool_calls()
+            .submit(ToolCall {
+                request_id: "old-finish-new-mark-approve-request".to_owned(),
+                actor: ToolActor::api_token("mcp-owner", Some("Runtime owner".to_owned())),
+                surface: RequestSurface::Cli,
+                execution_id: execution_id.to_owned(),
+                call_id: "1".to_owned(),
+                worker_generation: 1,
+                path: "mcp_approval.write".to_owned(),
+                arguments: json!({ "value": "write once" }),
+            })
+            .await
+            .expect("Ask submission should persist");
+        let ToolCallSubmission::ApprovalRequired(approval) = submission else {
+            panic!("Ask submission should require approval");
+        };
+        let approval_id = approval.id.clone();
+        let approval_revision = approval.revision;
+        drop(approval);
+
+        let execution_hook = Arc::new(ApprovedExecutionHook::default());
+        *app.tool_calls()
+            .approved_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(execution_hook.clone());
+        let cancel_hook = Arc::new(CancelExecutionHook::default());
+        cancel_hook.block_retries.store(true, Ordering::SeqCst);
+        *app.tool_calls()
+            .cancel_execution_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel_hook.clone());
+
+        app.tool_calls().mark_execution_lost(execution_id).await;
+        app.tool_calls()
+            .in_flight_execution_cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(execution_id.to_owned());
+        let race_hook = Arc::new(ExecutionCancellationRecoveryRaceHook::default());
+        *app.tool_calls()
+            .execution_cancellation_recovery_race_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(race_hook.clone());
+
+        let old_finish = {
+            let service = app.tool_calls().clone();
+            let execution_id = execution_id.to_owned();
+            tokio::spawn(async move {
+                service
+                    .finish_execution_cancellation_recovery(&execution_id)
+                    .await;
+            })
+        };
+        race_hook.old_finish_write_acquired.wait();
+
+        let new_recovery = {
+            let service = app.tool_calls().clone();
+            let execution_id = execution_id.to_owned();
+            tokio::spawn(async move {
+                service.cancel_lost_execution(&execution_id).await;
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            race_hook.new_mark_write_queued.notified(),
+        )
+        .await
+        .expect("the newer lost signal should queue behind the older recovery");
+
+        let decision = {
+            let service = app.tool_calls().clone();
+            let approval_id = approval_id.clone();
+            tokio::spawn(async move {
+                service
+                    .decide(
+                        &approval_id,
+                        "approve-after-new-lost-signal",
+                        approval_revision,
+                        ApprovalDecision::Approve,
+                        1,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!new_recovery.is_finished());
+        assert!(!decision.is_finished());
+
+        race_hook.release_old_finish.wait();
+        old_finish
+            .await
+            .expect("the older recovery should finish without panicking");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cancel_hook.retry_waiters.load(Ordering::SeqCst) < 2 {
+                cancel_hook.retry_waiting.notified().await;
+            }
+        })
+        .await
+        .expect("both recovery and approval should remain behind cancellation persistence");
+        assert_eq!(execution_hook.dispatches.load(Ordering::SeqCst), 0);
+        let pending = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval_id)
+            .await
+            .expect("approval should read while cancellation is blocked")
+            .expect("approval should remain stored");
+        assert_eq!(pending.record.status, ApprovalStatus::Pending);
+
+        *app.tool_calls()
+            .execution_cancellation_recovery_race_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        cancel_hook.block_retries.store(false, Ordering::SeqCst);
+        cancel_hook.release_retries.notify_waiters();
+        new_recovery
+            .await
+            .expect("the newer recovery should finish without panicking");
+        let decision = decision
+            .await
+            .expect("the racing approval task should not panic");
+        assert!(matches!(
+            decision,
+            Err(ApprovalError::InvalidTransition {
+                status: ApprovalStatus::Canceled
+            })
+        ));
+        let terminal = app
+            .tool_calls()
+            .approvals()
+            .get_admin(&approval_id)
+            .await
+            .expect("approval should read after recovery")
+            .expect("approval should remain stored after recovery");
+        assert_eq!(terminal.record.status, ApprovalStatus::Canceled);
+        assert_eq!(execution_hook.dispatches.load(Ordering::SeqCst), 0);
+        assert!(
+            !app.tool_calls()
+                .deferred_execution_cancellations
+                .read()
+                .await
+                .contains(execution_id)
+        );
+        assert!(
+            !app.tool_calls()
+                .in_flight_execution_cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(execution_id)
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.shutdown())
+            .await
+            .expect("interleaved cancellation shutdown should be bounded");
+    }
+
+    #[tokio::test]
+    async fn oversized_mutation_result_is_indeterminate_after_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+        let scenario = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::try_join!(serve_large_json_responses(listener, "POST", 1), async {
+                let first = match app
+                    .tool_calls()
+                    .submit_gateway_idempotent(
+                        gateway_tool_call("oversized-mutation-first"),
+                        "oversized-mutation",
+                    )
+                    .await
+                {
+                    Ok(_) => return Err("oversized mutation unexpectedly succeeded".to_owned()),
+                    Err(error) => error,
+                };
+                if !matches!(
+                    first,
+                    GatewayInvokeError::ToolCall(ToolCallError::Adapter {
+                        code: ToolCallAdapterErrorCode::InvocationOutcomeUnknown,
+                        ..
+                    })
+                ) {
+                    return Err(format!("unexpected oversized mutation failure: {first:?}"));
+                }
+                let state = sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM gateway_invocation_idempotency \
+                     WHERE owner_api_token_id = 'mcp-owner'",
+                )
+                .fetch_one(app.pool())
+                .await
+                .map_err(|error| format!("idempotency state failed: {error}"))?;
+                if state != "indeterminate" {
+                    return Err(format!("oversized mutation settled as {state}"));
+                }
+                let replay = match app
+                    .tool_calls()
+                    .submit_gateway_idempotent(
+                        gateway_tool_call("oversized-mutation-retry"),
+                        "oversized-mutation",
+                    )
+                    .await
+                {
+                    Ok(_) => return Err("oversized mutation retry succeeded".to_owned()),
+                    Err(error) => error,
+                };
+                if !matches!(replay, GatewayInvokeError::OutcomeUnknown) {
+                    return Err(format!("unexpected oversized mutation retry: {replay:?}"));
+                }
+                Ok::<(), String>(())
+            })
+        })
+        .await;
+        app.shutdown().await;
+        scenario
+            .expect("oversized mutation scenario should settle every future")
+            .expect("oversized mutation should remain indeterminate");
+    }
+
+    #[tokio::test]
+    async fn oversized_query_result_releases_the_key_for_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "GET", ToolMode::Enabled).await;
+        let scenario = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::try_join!(serve_large_json_responses(listener, "GET", 2), async {
+                for attempt in 1..=2 {
+                    let error = match app
+                        .tool_calls()
+                        .submit_gateway_idempotent(
+                            gateway_tool_call(&format!("oversized-query-{attempt}")),
+                            "oversized-query",
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            return Err(format!(
+                                "oversized query attempt {attempt} unexpectedly succeeded"
+                            ));
+                        }
+                        Err(error) => error,
+                    };
+                    if !matches!(
+                        error,
+                        GatewayInvokeError::ToolCall(ToolCallError::ResultTooLarge)
+                    ) {
+                        return Err(format!("unexpected oversized query failure: {error:?}"));
+                    }
+                    let retained = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM gateway_invocation_idempotency \
+                         WHERE owner_api_token_id = 'mcp-owner'",
+                    )
+                    .fetch_one(app.pool())
+                    .await
+                    .map_err(|error| format!("idempotency row count failed: {error}"))?;
+                    if retained != 0 {
+                        return Err(format!(
+                            "oversized query attempt {attempt} retained {retained} claims"
+                        ));
+                    }
+                }
+                Ok::<(), String>(())
+            })
+        })
+        .await;
+        app.shutdown().await;
+        scenario
+            .expect("oversized query scenario should settle every future")
+            .expect("oversized query retries should both release their claims");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mutation_transport_failures_remain_indeterminate() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test upstream should bind");
+        let server_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let upstream = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.expect("request should connect");
+            let mut request = vec![0_u8; 4096];
+            let read = connection
+                .read(&mut request)
+                .await
+                .expect("request should be readable");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /write HTTP/1.1"));
+        });
+        let (_directory, app) =
+            app_with_openapi_tool_at(&server_url, "POST", ToolMode::Enabled).await;
+
+        let first = app
+            .tool_calls()
+            .submit_gateway_idempotent(
+                gateway_tool_call("ambiguous-mutation-first"),
+                "ambiguous-mutation",
+            )
+            .await
+            .expect_err("post-dispatch disconnect should be uncertain");
+        assert!(
+            matches!(
+                &first,
+                GatewayInvokeError::ToolCall(ToolCallError::Adapter {
+                    code: ToolCallAdapterErrorCode::OpenApiOutcomeUnknown,
+                    ..
+                })
+            ),
+            "unexpected ambiguous mutation failure: {first:?}"
+        );
+        upstream.await.expect("upstream task should finish");
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM gateway_invocation_idempotency \
+             WHERE owner_api_token_id = 'mcp-owner'",
+        )
+        .fetch_one(app.pool())
+        .await
+        .expect("idempotency state should read");
+        assert_eq!(state, "indeterminate");
+
+        let replay = app
+            .tool_calls()
+            .submit_gateway_idempotent(
+                gateway_tool_call("ambiguous-mutation-retry"),
+                "ambiguous-mutation",
+            )
+            .await
+            .expect_err("same-key retry must preserve uncertainty");
+        assert!(matches!(replay, GatewayInvokeError::OutcomeUnknown));
+        app.shutdown().await;
     }
 
     #[tokio::test]

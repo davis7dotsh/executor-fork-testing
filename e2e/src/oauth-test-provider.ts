@@ -8,10 +8,13 @@ export interface OAuthTestProvider {
   readonly ledger: () => Promise<ReadonlyArray<LedgerEntry>>;
 }
 
-export const serveOAuthTestProvider = () =>
+export const serveOAuthTestProvider = (port?: number) =>
   Effect.acquireRelease(
     Effect.promise(async (): Promise<{ provider: OAuthTestProvider; emulator: Emulator }> => {
-      const emulator = await createEmulator({ service: "mcp" });
+      const emulator = await createEmulator({
+        service: "mcp",
+        ...(port === undefined ? {} : { port }),
+      });
       return {
         emulator,
         provider: {

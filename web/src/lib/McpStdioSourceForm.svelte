@@ -2,9 +2,10 @@
   import { tick, untrack } from "svelte";
   import ErrorNotice from "$lib/ErrorNotice.svelte";
   import {
-    createMcpStdioSource,
     listMcpStdioTemplates,
     type ApiError,
+    type ApiResult,
+    type McpStdioSourceInput,
     type McpStdioTemplate,
     type Source,
   } from "$lib/api";
@@ -23,8 +24,17 @@
     validateTemplateCatalog,
     validateTemplateDraft,
   } from "$lib/mcp-source-state";
-
-  let { oncreated }: { oncreated: (source: Source) => void } = $props();
+  let {
+    create,
+    oncreated,
+    onbusychange,
+    disabled = false,
+  }: {
+    create: (input: McpStdioSourceInput, signal: AbortSignal) => Promise<ApiResult<Source>>;
+    oncreated?: (source: Source) => void;
+    onbusychange?: (busy: boolean) => void;
+    disabled?: boolean;
+  } = $props();
 
   const auth = useAuthState();
   const latestTemplates = createLatestRequest();
@@ -38,6 +48,7 @@
   let error = $state<ApiError | null>(null);
   let activeController: AbortController | null = null;
   let lifetime = 0;
+  let reportedBusy = false;
   let currentTemplate = $derived(
     templates.data?.find((template) => template.name === selectedTemplate) ?? null,
   );
@@ -98,11 +109,19 @@
       lifetime += 1;
       activeController?.abort();
       activeController = null;
+      secretValues = {};
+      if (reportedBusy) onbusychange?.(false);
     };
   });
 
+  $effect(() => {
+    if (busy === reportedBusy) return;
+    reportedBusy = busy;
+    onbusychange?.(busy);
+  });
+
   function selectTemplate(name: string | null) {
-    if (name === selectedTemplate) return;
+    if (disabled || name === selectedTemplate) return;
     selectedTemplate = name;
     secretValues = {};
     error = null;
@@ -112,7 +131,7 @@
     event.preventDefault();
     const templateName = selectedTemplate;
     const secrets = validatedSecrets;
-    if (busy || templateName === null || secrets === null) return;
+    if (busy || disabled || templateName === null || secrets === null) return;
 
     activeController?.abort();
     const controller = new AbortController();
@@ -120,44 +139,36 @@
     activeController = controller;
     busy = true;
     error = null;
-    const settled = await createMcpStdioSource(
-      {
-        kind: "mcp_stdio",
-        displayName: displayName.trim(),
-        ...(description.trim() ? { description: description.trim() } : {}),
-        templateName,
-        secretValues: secrets,
-      },
-      undefined,
-      controller.signal,
-    ).then(
-      (result) => ({ ok: true, result }) as const,
-      () => ({ ok: false }) as const,
+    const input = {
+      kind: "mcp_stdio",
+      displayName: displayName.trim(),
+      ...(description.trim() ? { description: description.trim() } : {}),
+      templateName,
+      secretValues: secrets,
+    } satisfies McpStdioSourceInput;
+    secretValues = {};
+    const result = await create(input, controller.signal).then(
+      (response) => response,
+      () => ({ ok: false, error: unexpectedRequestError() }) as const,
     );
     if (owner !== lifetime || activeController !== controller || controller.signal.aborted) return;
+
     activeController = null;
     busy = false;
 
-    if (!settled.ok) {
-      secretValues = {};
-      error = unexpectedRequestError();
-      await focusError();
-      return;
-    }
-    if (!settled.result.ok) {
-      secretValues = {};
-      if (!auth?.recoverFromApiError(settled.result.error)) {
-        error = settled.result.error;
+    if (!result.ok) {
+      if (!auth?.recoverFromApiError(result.error)) {
+        error = result.error;
         await focusError();
       }
       return;
     }
 
-    const source = settled.result.value;
+    const source = result.value;
     displayName = "";
     description = "";
     secretValues = {};
-    oncreated(source);
+    oncreated?.(source);
   }
 
   async function focusError() {
@@ -175,7 +186,11 @@
     </p>
   </div>
   {#if templates.data !== null && templates.data.length > 0 && !templates.stale}
-    <button type="button" disabled={templates.loading} onclick={() => (refreshKey += 1)}>
+    <button
+      type="button"
+      disabled={disabled || templates.loading}
+      onclick={() => (refreshKey += 1)}
+    >
       {templates.loading ? "Refreshing templates..." : "Refresh templates"}
     </button>
   {/if}
@@ -184,7 +199,11 @@
     <div class="notice warning" role="status">
       Showing the last loaded template list while Executor reconnects.
       <ErrorNotice error={templates.error} />
-      <button type="button" disabled={templates.loading} onclick={() => (refreshKey += 1)}>
+      <button
+        type="button"
+        disabled={disabled || templates.loading}
+        onclick={() => (refreshKey += 1)}
+      >
         {templates.loading ? "Retrying..." : "Try again"}
       </button>
     </div>
@@ -206,12 +225,16 @@
         restart Executor, then try again.
       </small>
     </div>
-    <button type="button" disabled={templates.loading} onclick={() => (refreshKey += 1)}>
+    <button
+      type="button"
+      disabled={disabled || templates.loading}
+      onclick={() => (refreshKey += 1)}
+    >
       {templates.loading ? "Refreshing..." : "Refresh templates"}
     </button>
   {:else if templates.data !== null}
     <form onsubmit={connect}>
-      <fieldset disabled={busy || templates.loading || templates.stale}>
+      <fieldset disabled={busy || disabled || templates.loading || templates.stale}>
         <legend>Local process source</legend>
         <label>
           Trusted template
@@ -257,6 +280,7 @@
         class="primary"
         type="submit"
         disabled={busy ||
+          disabled ||
           templates.loading ||
           templates.stale ||
           selectedTemplate === null ||

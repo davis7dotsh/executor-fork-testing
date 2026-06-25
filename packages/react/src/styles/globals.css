@@ -3,7 +3,7 @@
 @custom-variant dark (&:is(.dark *));
 
 @source "../**/*.{ts,tsx}";
-@source "../../../../apps/local/src/**/*.{ts,tsx}";
+@source "../../../../legacy/local/src/**/*.{ts,tsx}";
 @source "../../../plugins/*/src/react/**/*.{ts,tsx}";
 
 @theme inline {

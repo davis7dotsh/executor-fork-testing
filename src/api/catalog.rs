@@ -119,7 +119,7 @@ async fn set_source_mode(
     let Json(payload) = parse_json(&request_id, payload)?;
     let mode = parse_mode(&request_id, payload.mode)?;
     state
-        .catalog
+        .sources
         .set_source_mode(
             &source_id,
             mode,
@@ -128,7 +128,7 @@ async fn set_source_mode(
         )
         .await
         .map(Json)
-        .map_err(|error| catalog_error(&request_id, error))
+        .map_err(|error| super::protocols::protocol_error(&request_id, error))
 }
 
 #[derive(Default, Deserialize)]
@@ -194,7 +194,7 @@ async fn set_tool_mode(
     let Json(payload) = parse_json(&request_id, payload)?;
     let mode = parse_mode(&request_id, payload.mode)?;
     state
-        .catalog
+        .sources
         .set_tool_mode(
             &tool_id,
             mode,
@@ -203,7 +203,7 @@ async fn set_tool_mode(
         )
         .await
         .map(Json)
-        .map_err(|error| catalog_error(&request_id, error))
+        .map_err(|error| super::protocols::protocol_error(&request_id, error))
 }
 
 #[derive(Deserialize)]
@@ -245,7 +245,7 @@ async fn bulk_set_tool_modes(
             expected_source_revision,
         } => {
             state
-                .catalog
+                .sources
                 .bulk_set_source_tool_modes(
                     &source_id,
                     mode,
@@ -259,7 +259,7 @@ async fn bulk_set_tool_modes(
             expected_catalog_revision,
         } => {
             state
-                .catalog
+                .sources
                 .bulk_set_tool_modes(
                     &tool_ids,
                     mode,
@@ -269,7 +269,7 @@ async fn bulk_set_tool_modes(
                 .await
         }
     }
-    .map_err(|error| catalog_error(&request_id, error))?;
+    .map_err(|error| super::protocols::protocol_error(&request_id, error))?;
     Ok(Json(result))
 }
 

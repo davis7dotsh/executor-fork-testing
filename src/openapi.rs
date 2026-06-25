@@ -222,7 +222,7 @@ impl OpenApiCredentialSet {
             return Err(OpenApiCredentialError::TooManySchemes);
         }
         for (name, credential) in &self.schemes {
-            if name.is_empty() || name.len() > 256 {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
                 return Err(OpenApiCredentialError::InvalidSchemeName);
             }
             credential.validate()?;
@@ -242,6 +242,16 @@ impl OpenApiCredential {
     }
 
     fn validate(&self) -> Result<(), OpenApiCredentialError> {
+        if let Self::Basic { username, .. } = self
+            && username.contains(':')
+        {
+            return Err(OpenApiCredentialError::InvalidBasicUsername);
+        }
+        if let Self::Basic { username, password } = self
+            && (username.chars().any(char::is_control) || password.chars().any(char::is_control))
+        {
+            return Err(OpenApiCredentialError::InvalidBasicValue);
+        }
         let valid = match self {
             Self::ApiKey { value } => !value.is_empty() && value.len() <= 16_384,
             Self::Bearer { token } => !token.is_empty() && token.len() <= 16_384,
@@ -268,6 +278,10 @@ pub enum OpenApiCredentialError {
     InvalidSchemeName,
     #[error("an OpenAPI credential value is invalid")]
     InvalidValue,
+    #[error("an HTTP Basic username must not contain a colon")]
+    InvalidBasicUsername,
+    #[error("an HTTP Basic username or password must not contain control characters")]
+    InvalidBasicValue,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -537,7 +551,7 @@ fn validate_method(method: &str) -> Result<String, OpenApiInvocationError> {
     let method = method.to_ascii_uppercase();
     if matches!(
         method.as_str(),
-        "GET" | "PUT" | "POST" | "DELETE" | "OPTIONS" | "HEAD" | "PATCH" | "TRACE"
+        "GET" | "PUT" | "POST" | "DELETE" | "OPTIONS" | "HEAD" | "PATCH"
     ) {
         Ok(method)
     } else {
@@ -1098,6 +1112,13 @@ pub fn compile_value(document: Value) -> Result<CompiledOpenApi, OpenApiError> {
             let Some(raw_operation) = path_item.get(method) else {
                 continue;
             };
+            if method == "trace" {
+                return Err(invalid_operation(
+                    method,
+                    path,
+                    "TRACE operations are not supported",
+                ));
+            }
             if tools.len() >= MAX_COMPILED_OPERATIONS {
                 return Err(limit("too_many_operations"));
             }

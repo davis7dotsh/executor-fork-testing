@@ -91,11 +91,11 @@ describe("MCP install command rendering", () => {
         mode: "stdio",
         isDev: true,
         origin: null,
-        scopeDir: "/Users/rhyssullivan/src/executor/apps/local",
-        devCliCwd: "/Users/rhyssullivan/src/executor",
+        scopeDir: "/Users/example/src/executor/legacy/local",
+        devCliCwd: "/Users/example/src/executor",
       }),
     ).toBe(
-      "npx add-mcp 'bun run --cwd /Users/rhyssullivan/src/executor dev:cli mcp --scope /Users/rhyssullivan/src/executor/apps/local' --name executor",
+      "npx add-mcp 'bun run --cwd /Users/example/src/executor legacy:dev:cli mcp --scope /Users/example/src/executor/legacy/local' --name executor",
     );
   });
 

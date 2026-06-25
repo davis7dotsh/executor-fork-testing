@@ -3,10 +3,12 @@ import type { KnipConfig } from "knip";
 const config: KnipConfig = {
   workspaces: {
     ".": {},
-    "apps/cli": {},
-    "apps/local": {
+    "legacy/cli": {},
+    "legacy/local": {
       entry: ["src/server.ts", "src/routes/**/*.tsx", "src/server/*.ts"],
     },
+    "legacy/host-cloudflare": {},
+    "legacy/host-selfhost": {},
     "legacy/cloud": {
       entry: ["src/server.ts", "src/routes/**/*.tsx", "src/server/*.ts"],
     },

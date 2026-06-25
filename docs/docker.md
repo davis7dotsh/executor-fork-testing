@@ -7,10 +7,42 @@ healthcheck client. Project and dependency license notices are installed under
 
 ## Start the local instance
 
+Published releases from the current repository use the root Rust image at
+`ghcr.io/davis7dotsh/executor`. A fork's workflow derives the image owner from
+that fork's repository. Stable releases publish `vX.Y.Z`, `X.Y.Z`, and
+`sha-<commit>` plus `latest`; prereleases publish their immutable release,
+version, and commit tags plus `beta`. Pin a version for repeatable deployments:
+
+```sh
+docker pull ghcr.io/davis7dotsh/executor:v0.1.0
+```
+
+The container package must be public in GHCR package settings. The release
+workflow performs an unauthenticated pull by exact digest and refuses to
+publish the GitHub release while anonymous access is unavailable.
+
+The included Compose file builds the same root `Dockerfile` locally:
+
 ```sh
 docker compose up --detach --build
 docker compose logs executor
 ```
+
+To run the already-built `runtime-prebuilt` image published by the release
+workflow, choose an immutable tag and tell Compose not to build locally:
+
+```sh
+export EXECUTOR_IMAGE=ghcr.io/davis7dotsh/executor:v0.1.0
+docker compose pull executor
+docker compose up --detach --no-build executor
+docker compose ps executor
+curl --fail --silent --show-error http://127.0.0.1:4788/healthz
+docker compose logs executor
+```
+
+Keep `EXECUTOR_IMAGE` set for later `docker compose` commands that operate on
+that deployment. Unset it to return to the default `executor:local` image and
+the local build flow.
 
 Open `http://127.0.0.1:4788`. On first boot, the logs contain the one-time setup
 URL. The compose configuration publishes the port only on host loopback. Keep
@@ -96,7 +128,12 @@ Release automation can build both supported architectures from the same file:
 docker buildx build --platform linux/amd64,linux/arm64 --file Dockerfile .
 ```
 
-The native artifact workflow currently builds release archives without
-publishing this root Rust image. A separate older workflow still publishes the
-previous TypeScript self-host image, so do not treat that tag as this rewrite
-until the release wiring is updated.
+The default root target remains self-contained and builds Svelte and Rust. The
+manual release workflow instead uses the `runtime-prebuilt` target: it copies
+the already-tested Linux binaries and license notices from the native release
+archives, pushes each architecture by digest, then assembles the multi-platform
+manifest. This keeps the embedded UI and notices identical between archives
+and release images. The release target pins its Debian runtime and apt snapshot
+and normalizes image timestamps to the release commit. Existing immutable
+release, version, or commit tags may be reused only when their digest already
+matches; only `latest` or `beta` may move.

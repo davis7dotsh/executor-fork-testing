@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { ApiError } from "$lib/api";
   import { useAuthState } from "$lib/auth.svelte";
   import { copyText } from "$lib/clipboard";
@@ -29,6 +29,7 @@
     operations,
     navigate,
     onbusychange,
+    onmutationchange,
   }: {
     sourceId: string;
     credentialKey: string;
@@ -41,6 +42,7 @@
     operations: OAuthConnectionOperations;
     navigate?: (url: string) => void;
     onbusychange?: (busy: boolean) => void;
+    onmutationchange?: (busy: boolean) => void;
   } = $props();
 
   const auth = useAuthState();
@@ -59,10 +61,12 @@
   let confirmingDelete = $state(false);
   let copyStatus = $state("");
   let callbackField = $state<HTMLInputElement>();
+  let disconnectDialog = $state<HTMLDialogElement>();
   let disconnectButton = $state<HTMLButtonElement>();
-  let disconnectConfirmButton = $state<HTMLButtonElement>();
+  let disconnectCancelButton = $state<HTMLButtonElement>();
+  let deleteDialog = $state<HTMLDialogElement>();
   let deleteButton = $state<HTMLButtonElement>();
-  let deleteConfirmButton = $state<HTMLButtonElement>();
+  let deleteCancelButton = $state<HTMLButtonElement>();
   let refreshNonce = $state(0);
   let loadGeneration = 0;
   let lifetime = 0;
@@ -70,7 +74,8 @@
   let mutationController: AbortController | null = null;
   let loadedIdentity = "";
   let reportedBusy = false;
-  let panelId = $derived(`oauth-${safeDomId(sourceId)}-${safeDomId(credentialKey)}`);
+  let reportedMutation = false;
+  let panelId = $derived(`oauth-${encodeDomId(sourceId)}-${encodeDomId(credentialKey)}`);
   let saveInput = $derived(buildOAuthConnectionInput(draft, revision, discoveryType));
   let statusTone = $derived(summary === null ? "neutral" : oauthStatusTone(summary.status));
   let configurationUnavailable = $derived(
@@ -85,6 +90,7 @@
       mutationController?.abort();
       draft = { ...draft, clientSecret: "" };
       if (reportedBusy) onbusychange?.(false);
+      if (reportedMutation) onmutationchange?.(false);
     };
   });
 
@@ -93,6 +99,13 @@
     if (active === reportedBusy) return;
     reportedBusy = active;
     onbusychange?.(active);
+  });
+
+  $effect(() => {
+    const active = busy !== null;
+    if (active === reportedMutation) return;
+    reportedMutation = active;
+    onmutationchange?.(active);
   });
 
   $effect(() => {
@@ -117,6 +130,8 @@
       loading = false;
       return;
     }
+
+    const confirmationFocus = moveConfirmationFocusToPanel();
 
     if (loadedIdentity !== identity) {
       loadedIdentity = identity;
@@ -149,6 +164,9 @@
           if (auth?.recoverFromApiError(new ApiError(result.error))) return;
           error = result.error;
           if (draftConflict) conflictRefreshFailed = true;
+          if (confirmationFocus !== null) {
+            void refocusConfirmation(confirmationFocus, generation);
+          }
           return;
         }
         const connection =
@@ -156,7 +174,8 @@
             (candidate) => candidate.credentialKey === currentCredentialKey,
           ) ?? null;
         summary = connection;
-        if (connection === null || !canDisconnectOAuth(connection.status)) {
+        const disconnectAvailable = connection !== null && canDisconnectOAuth(connection.status);
+        if (!disconnectAvailable) {
           confirmingDisconnect = false;
         }
         if (!dirty) {
@@ -179,6 +198,9 @@
           };
           void focusError();
         }
+        if (confirmationFocus !== null) {
+          void refocusConfirmation(confirmationFocus, generation);
+        }
       },
       () => {
         if (generation !== loadGeneration || controller.signal.aborted) return;
@@ -186,6 +208,9 @@
         loading = false;
         error = localOperationError();
         if (draftConflict) conflictRefreshFailed = true;
+        if (confirmationFocus !== null) {
+          void refocusConfirmation(confirmationFocus, generation);
+        }
       },
     );
 
@@ -420,7 +445,39 @@
     confirmingDelete = false;
     confirmingDisconnect = true;
     await tick();
-    disconnectConfirmButton?.focus();
+    disconnectCancelButton?.focus();
+  }
+
+  function moveConfirmationFocusToPanel() {
+    return untrack(() => {
+      const focused = document.activeElement;
+      const kind: "disconnect" | "delete" | null = disconnectDialog?.contains(focused)
+        ? "disconnect"
+        : deleteDialog?.contains(focused)
+          ? "delete"
+          : null;
+      if (kind === null) return null;
+      const fallback = document.getElementById(`${panelId}-title`);
+      if (!(fallback instanceof HTMLElement)) return null;
+      fallback.focus();
+      if (document.activeElement !== fallback) return null;
+      return { kind, fallback };
+    });
+  }
+
+  async function refocusConfirmation(
+    focus: NonNullable<ReturnType<typeof moveConfirmationFocusToPanel>>,
+    generation: number,
+  ) {
+    await tick();
+    if (generation !== loadGeneration || document.activeElement !== focus.fallback) return;
+    if (focus.kind === "disconnect") {
+      if (!confirmingDisconnect) return;
+      disconnectCancelButton?.focus();
+      return;
+    }
+    if (!confirmingDelete) return;
+    deleteCancelButton?.focus();
   }
 
   async function cancelDisconnectConfirmation() {
@@ -433,7 +490,7 @@
     confirmingDisconnect = false;
     confirmingDelete = true;
     await tick();
-    deleteConfirmButton?.focus();
+    deleteCancelButton?.focus();
   }
 
   async function cancelDeleteConfirmation() {
@@ -448,8 +505,11 @@
     void cancel();
   }
 
-  function safeDomId(value: string) {
-    return value.replace(/[^a-zA-Z0-9_-]/gu, "-");
+  function encodeDomId(value: string) {
+    return `u${Array.from(value, (character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint === undefined ? "" : codePoint.toString(16).padStart(6, "0");
+    }).join("")}`;
   }
 
   function localOperationError(): OAuthOperationError {
@@ -470,7 +530,7 @@
   <div class="oauth-heading">
     <div>
       <p class="eyebrow">Managed OAuth</p>
-      <h3 id={`${panelId}-title`}>{credentialKey}</h3>
+      <h3 id={`${panelId}-title`} tabindex="-1">{credentialKey}</h3>
     </div>
     {#if summary !== null}
       <span
@@ -668,6 +728,7 @@
       <div class="oauth-actions">
         {#if confirmingDisconnect}
           <dialog
+            bind:this={disconnectDialog}
             open
             class="inline-confirm-dialog"
             aria-labelledby={`${panelId}-disconnect-title`}
@@ -677,7 +738,6 @@
             <p>The saved client configuration will remain available.</p>
             <div class="button-row">
               <button
-                bind:this={disconnectConfirmButton}
                 type="button"
                 disabled={disabled || busy !== null || !canDisconnectOAuth(summary.status)}
                 onclick={disconnect}
@@ -685,6 +745,7 @@
                 {busy === "disconnect" ? "Disconnecting..." : "Disconnect tokens"}
               </button>
               <button
+                bind:this={disconnectCancelButton}
                 type="button"
                 disabled={disabled || busy !== null}
                 onclick={cancelDisconnectConfirmation}>Cancel</button
@@ -703,6 +764,7 @@
         {/if}
         {#if confirmingDelete}
           <dialog
+            bind:this={deleteDialog}
             open
             class="inline-confirm-dialog"
             aria-labelledby={`${panelId}-delete-title`}
@@ -712,7 +774,6 @@
             <p>This removes the client configuration and all stored OAuth tokens.</p>
             <div class="button-row">
               <button
-                bind:this={deleteConfirmButton}
                 class="danger-button"
                 type="button"
                 disabled={disabled || busy !== null}
@@ -721,6 +782,7 @@
                 {busy === "remove" ? "Deleting..." : "Delete"}
               </button>
               <button
+                bind:this={deleteCancelButton}
                 type="button"
                 disabled={disabled || busy !== null}
                 onclick={cancelDeleteConfirmation}>Cancel</button

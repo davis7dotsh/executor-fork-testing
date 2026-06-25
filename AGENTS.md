@@ -115,11 +115,16 @@ before using it.
 - `packages/plugins/*`: protocol and provider plugins. Plugin-specific
   runtime, React, API, and testing helpers should live with the owning plugin.
 - `packages/react`: shared React UI and atom/client integration.
+- `packages/app`: shared React application shell and Vite composition.
 - `packages/hosts/mcp`: MCP host surface for exposing Executor through MCP.
 - `packages/kernel/*`: execution runtimes and code execution substrate.
+- `packages/core/execution` and `packages/core/cli`: shared execution and
+  configuration tooling retained for package compatibility.
 - `src` and `web`: the active local/self-hosted Rust and Svelte product.
-- `apps/local` and `apps/cli`: retained TypeScript compatibility entry points.
-- `legacy/cloud` and `legacy/desktop`: archived deployment entry points.
+- `legacy/cli` and `legacy/local`: archived TypeScript compatibility entry
+  points.
+- `legacy/cloud`, `legacy/desktop`, `legacy/host-cloudflare`, and
+  `legacy/host-selfhost`: archived deployment entry points.
 
 ## Other
 

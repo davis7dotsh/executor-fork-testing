@@ -6,6 +6,7 @@ name: Preview sweep
 # open. A second pass (sweep-e2e) cleans up after the e2e harness on the same
 # account: crashed suite runs leak executor-e2e-* stacks, and synthetic OTP
 # logins permanently occupy Zero Trust seats.
+# The repository variable ENABLE_CLOUDFLARE_PREVIEWS must be exactly "true".
 
 on:
   schedule:
@@ -19,11 +20,14 @@ permissions:
 jobs:
   sweep:
     name: Destroy previews for closed PRs
+    if: vars.ENABLE_CLOUDFLARE_PREVIEWS == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
         with:
           bun-version: 1.3.11
 
@@ -34,13 +38,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for pr in $(bun apps/host-cloudflare/scripts/preview.ts list | jq -r '.[].pr'); do
+          for pr in $(bun legacy/host-cloudflare/scripts/preview.ts list | jq -r '.[].pr'); do
             state="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state -q .state 2>/dev/null || echo UNKNOWN)"
             if [ "$state" != "OPEN" ]; then
-              echo "PR #$pr is $state — destroying its preview"
-              bun apps/host-cloudflare/scripts/preview.ts destroy --pr "$pr"
+              echo "PR #$pr is $state, destroying its preview"
+              bun legacy/host-cloudflare/scripts/preview.ts destroy --pr "$pr"
             else
-              echo "PR #$pr is open — keeping its preview"
+              echo "PR #$pr is open, keeping its preview"
             fi
           done
 
@@ -48,4 +52,4 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
-        run: bun apps/host-cloudflare/scripts/preview.ts sweep-e2e
+        run: bun legacy/host-cloudflare/scripts/preview.ts sweep-e2e

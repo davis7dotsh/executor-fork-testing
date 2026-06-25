@@ -10,7 +10,7 @@ import { resolve, join } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "..");
 const REPO_ROOT = resolve(ROOT, "../..");
-const CLI_ROOT = resolve(REPO_ROOT, "apps/cli");
+const CLI_ROOT = resolve(REPO_ROOT, "legacy/cli");
 const EXECUTOR_OUT_DIR = resolve(ROOT, "resources/executor");
 
 const platformName = (platform: NodeJS.Platform): string =>

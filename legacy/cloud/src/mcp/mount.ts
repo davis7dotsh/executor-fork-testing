@@ -136,7 +136,7 @@ export const prepareMcpOrgScope = (request: Request): Request => {
 
 /**
  * Build the envelope web handler from the shared `McpServingRoutes` Layer,
- * provided cloud's two seams. Mirrors the self-host mount (apps/host-selfhost
+ * provided cloud's two seams. Mirrors the self-host mount (legacy/host-selfhost
  * api.ts): `HttpRouter.provideRequest` clears the route handlers' per-request
  * seam requirements, the build-time `Layer.provide(McpAuthProviderLive)`
  * satisfies the `HttpRouter.use` callback's read of `discoveryRoutes`, and

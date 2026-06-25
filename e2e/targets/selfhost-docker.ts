@@ -1,5 +1,5 @@
 // The PRODUCTION self-host artifact as a target: the Docker image from
-// apps/host-selfhost/Dockerfile (production Vite build, `bun src/serve.ts`,
+// legacy/host-selfhost/Dockerfile (production Vite build, `bun src/serve.ts`,
 // /data volume) instead of the dev server. Same surface as the selfhost
 // target — same bootstrap admin, same Better Auth sign-in, same MCP consent —
 // so the whole scenario suite runs against what users actually deploy. Boot

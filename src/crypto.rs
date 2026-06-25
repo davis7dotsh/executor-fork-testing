@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
+    fs::{self, File, OpenOptions},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -44,6 +44,8 @@ pub enum CryptoError {
     },
     #[error("the master key file at {path} must contain exactly 32 bytes, found {length}")]
     InvalidMasterKeyLength { path: PathBuf, length: usize },
+    #[error("the master key file at {path} has unsafe metadata: {reason}")]
+    UnsafeMasterKeyMetadata { path: PathBuf, reason: &'static str },
     #[error("could not create a master key file at {path}: {source}")]
     CreateMasterKey {
         path: PathBuf,
@@ -215,6 +217,12 @@ fn load_or_create_master_key_with_sync(
     if key_path.exists() {
         if configured_path.is_none() {
             let parent = key_path.parent().unwrap_or_else(|| Path::new("."));
+            recover_master_key_publication_alias(&key_path, parent, sync_parent).map_err(
+                |source| CryptoError::CreateMasterKey {
+                    path: key_path.clone(),
+                    source,
+                },
+            )?;
             sync_parent(parent).map_err(|source| CryptoError::CreateMasterKey {
                 path: key_path.clone(),
                 source,
@@ -245,16 +253,107 @@ fn append_length_prefixed(encoded: &mut Vec<u8>, value: &[u8]) {
 }
 
 fn read_master_key(path: &Path) -> Result<[u8; MASTER_KEY_LENGTH], CryptoError> {
-    let bytes = fs::read(path).map_err(|source| CryptoError::ReadMasterKey {
+    let file = open_master_key(path).map_err(|source| CryptoError::ReadMasterKey {
         path: path.to_path_buf(),
         source,
     })?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| CryptoError::InvalidMasterKeyLength {
+    let metadata = file
+        .metadata()
+        .map_err(|source| CryptoError::ReadMasterKey {
             path: path.to_path_buf(),
-            length: bytes.len(),
-        })
+            source,
+        })?;
+    validate_master_key_metadata(path, &metadata)?;
+    let mut contents = Vec::with_capacity(MASTER_KEY_LENGTH + 1);
+    file.take((MASTER_KEY_LENGTH + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(|source| CryptoError::ReadMasterKey {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if contents.len() != MASTER_KEY_LENGTH {
+        let observed_length = if contents.len() > MASTER_KEY_LENGTH {
+            usize::try_from(metadata.len())
+                .unwrap_or(usize::MAX)
+                .max(contents.len())
+        } else {
+            contents.len()
+        };
+        return Err(CryptoError::InvalidMasterKeyLength {
+            path: path.to_path_buf(),
+            length: observed_length,
+        });
+    }
+    let mut key = [0_u8; MASTER_KEY_LENGTH];
+    key.copy_from_slice(&contents);
+    Ok(key)
+}
+
+fn open_master_key(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn validate_master_key_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), CryptoError> {
+    if !metadata.is_file() {
+        return Err(CryptoError::UnsafeMasterKeyMetadata {
+            path: path.to_path_buf(),
+            reason: "it must be a regular file",
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(CryptoError::UnsafeMasterKeyMetadata {
+                path: path.to_path_buf(),
+                reason: "it must have exactly one hard link",
+            });
+        }
+        validate_master_key_unix_permissions(
+            path,
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            metadata.mode() & 0o7777,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_master_key_unix_permissions(
+    path: &Path,
+    owner_uid: u32,
+    effective_uid: u32,
+    mode: u32,
+) -> Result<(), CryptoError> {
+    if owner_uid == 0 {
+        if !matches!(mode, 0o400 | 0o440 | 0o600 | 0o640) {
+            return Err(CryptoError::UnsafeMasterKeyMetadata {
+                path: path.to_path_buf(),
+                reason: "a root-owned key must use mode 0400, 0440, 0600, or 0640",
+            });
+        }
+    } else if owner_uid == effective_uid {
+        if !matches!(mode, 0o400 | 0o600) {
+            return Err(CryptoError::UnsafeMasterKeyMetadata {
+                path: path.to_path_buf(),
+                reason: "a service-user-owned key must use mode 0400 or 0600",
+            });
+        }
+    } else {
+        return Err(CryptoError::UnsafeMasterKeyMetadata {
+            path: path.to_path_buf(),
+            reason: "it must be owned by the effective service user or root",
+        });
+    }
+    Ok(())
 }
 
 fn create_master_key_atomically(
@@ -313,13 +412,75 @@ fn publish_master_key(
         }
     }
 
-    if let Err(error) = sync_parent(parent) {
-        let _ = fs::remove_file(temporary_path);
-        return Err(error);
-    }
     fs::remove_file(temporary_path)?;
     sync_parent(parent)?;
     Ok(KeyPublishOutcome::Published)
+}
+
+#[cfg(unix)]
+fn recover_master_key_publication_alias(
+    path: &Path,
+    parent: &Path,
+    sync_parent: &impl Fn(&Path) -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let destination = fs::symlink_metadata(path)?;
+    if !destination.is_file() || destination.nlink() != 2 {
+        return Ok(());
+    }
+
+    let mut matching_alias = None;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(uuid) = name
+            .strip_prefix(".master-key-")
+            .and_then(|name| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if Uuid::parse_str(uuid).is_err() {
+            continue;
+        }
+        let alias_path = entry.path();
+        let alias = fs::symlink_metadata(&alias_path)?;
+        let is_matching = alias.is_file()
+            && alias.dev() == destination.dev()
+            && alias.ino() == destination.ino()
+            && alias.nlink() == 2
+            && alias.uid() == unsafe { libc::geteuid() }
+            && alias.uid() == destination.uid()
+            && alias.gid() == destination.gid()
+            && alias.mode() == destination.mode()
+            && alias.mode() & 0o7777 == 0o600
+            && alias.len() == MASTER_KEY_LENGTH as u64
+            && alias.len() == destination.len();
+        if !is_matching {
+            continue;
+        }
+        if matching_alias.replace(alias_path).is_some() {
+            return Ok(());
+        }
+    }
+
+    if let Some(alias) = matching_alias {
+        fs::remove_file(alias)?;
+        sync_parent(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recover_master_key_publication_alias(
+    _path: &Path,
+    _parent: &Path,
+    _sync_parent: &impl Fn(&Path) -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
@@ -354,6 +515,9 @@ mod tests {
         CryptoError, KeyPublishOutcome, load_or_create_master_key_with_sync, publish_master_key,
     };
     use std::{cell::Cell, fs, io::ErrorKind};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn parent_sync_failures_are_propagated_after_key_publication() {
@@ -425,5 +589,239 @@ mod tests {
                 .expect("the published key should be readable"),
             key
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_recovers_the_exact_master_key_publication_alias() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key_path = directory.path().join("master.key");
+        let alias_path = directory
+            .path()
+            .join(format!(".master-key-{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&key_path, [13_u8; 32]).expect("master key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).expect("key mode");
+        fs::hard_link(&key_path, &alias_path).expect("publication alias");
+
+        let loaded =
+            load_or_create_master_key_with_sync(directory.path(), false, None, &|_| Ok(()))
+                .expect("same-inode publication alias should recover");
+
+        assert_eq!(loaded, [13_u8; 32]);
+        assert!(!alias_path.exists());
+        assert_eq!(fs::metadata(&key_path).expect("key metadata").nlink(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_rejects_substituted_and_unknown_master_key_aliases() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key_path = directory.path().join("master.key");
+        let unknown_alias = directory.path().join("unknown-alias");
+        let substituted_alias = directory
+            .path()
+            .join(format!(".master-key-{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&key_path, [14_u8; 32]).expect("master key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).expect("key mode");
+        fs::hard_link(&key_path, &unknown_alias).expect("unknown key alias");
+        fs::write(&substituted_alias, [15_u8; 32]).expect("substituted alias");
+        fs::set_permissions(&substituted_alias, fs::Permissions::from_mode(0o600))
+            .expect("substituted alias mode");
+
+        let error = load_or_create_master_key_with_sync(directory.path(), false, None, &|_| Ok(()))
+            .expect_err("unknown hard link must remain rejected");
+
+        assert!(matches!(error, CryptoError::UnsafeMasterKeyMetadata { .. }));
+        assert_eq!(fs::read(&key_path).expect("key contents"), [14_u8; 32]);
+        assert_eq!(
+            fs::read(&substituted_alias).expect("substituted contents"),
+            [15_u8; 32]
+        );
+        assert_eq!(fs::metadata(&key_path).expect("key metadata").nlink(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_symbolic_links() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target.key");
+        let link = directory.path().join("master.key");
+        fs::write(&target, [7_u8; 32]).expect("target key");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+        std::os::unix::fs::symlink(&target, &link).expect("key symlink");
+
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&link),
+            &|_| Ok(()),
+        )
+        .expect_err("symbolic-link key must fail");
+        assert!(matches!(error, super::CryptoError::ReadMasterKey { .. }));
+        assert_eq!(fs::read(target).expect("target contents"), [7_u8; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_fifos_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        let key_name = CString::new(key.as_os_str().as_bytes()).expect("FIFO path");
+        let result = unsafe { libc::mkfifo(key_name.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "FIFO should be created");
+
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect_err("FIFO key must fail without blocking");
+        assert!(matches!(
+            error,
+            super::CryptoError::UnsafeMasterKeyMetadata { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_character_devices() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(std::path::Path::new("/dev/null")),
+            &|_| Ok(()),
+        )
+        .expect_err("device key must fail");
+        assert!(matches!(
+            error,
+            super::CryptoError::UnsafeMasterKeyMetadata { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_additional_hard_links() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        fs::write(&key, [8_u8; 32]).expect("master key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+        fs::hard_link(&key, directory.path().join("alias.key")).expect("key alias");
+
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect_err("hard-linked key must fail");
+        assert!(matches!(
+            error,
+            super::CryptoError::UnsafeMasterKeyMetadata { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_broad_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        fs::write(&key, [9_u8; 32]).expect("master key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).expect("key mode");
+
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect_err("group-readable key must fail");
+        assert!(matches!(
+            error,
+            super::CryptoError::UnsafeMasterKeyMetadata { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_rejects_oversized_files_after_one_extra_byte() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        fs::write(&key, [11_u8; 4096]).expect("oversized master key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+
+        let error = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect_err("oversized key must fail");
+        assert!(matches!(
+            error,
+            super::CryptoError::InvalidMasterKeyLength { length: 4096, .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_accepts_owner_read_only_mode() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        fs::write(&key, [10_u8; 32]).expect("master key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).expect("key mode");
+
+        let loaded = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect("owner-read-only key");
+        assert_eq!(loaded, [10_u8; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_master_key_accepts_exact_owner_read_write_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let key = directory.path().join("master.key");
+        fs::write(&key, [12_u8; 32]).expect("master key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+
+        let loaded = super::load_or_create_master_key_with_sync(
+            directory.path(),
+            false,
+            Some(&key),
+            &|_| Ok(()),
+        )
+        .expect("owner-read-write key");
+        assert_eq!(loaded, [12_u8; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_group_readable_secret_manager_modes_are_accepted() {
+        let path = std::path::Path::new("fixture-master.key");
+        for mode in [0o400, 0o440, 0o600, 0o640] {
+            super::validate_master_key_unix_permissions(path, 0, 10001, mode)
+                .expect("supported root-owned key mode");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_root_modes_and_unrelated_owners_are_rejected() {
+        let path = std::path::Path::new("fixture-master.key");
+        for mode in [0o444, 0o660, 0o700] {
+            assert!(
+                super::validate_master_key_unix_permissions(path, 0, 10001, mode).is_err(),
+                "root-owned mode {mode:o} must fail"
+            );
+        }
+        assert!(super::validate_master_key_unix_permissions(path, 10002, 10001, 0o400).is_err());
     }
 }

@@ -252,7 +252,7 @@ const resolveSidecarCommand = (input: {
 
 const resolveClientDir = (): string => {
   const repoRoot = resolve(import.meta.dirname, "..", "..", "..", "..");
-  return resolve(repoRoot, "apps/local/dist");
+  return resolve(repoRoot, "legacy/local/dist");
 };
 
 const delay = (ms: number): Promise<void> =>

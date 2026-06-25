@@ -18,6 +18,7 @@
     load,
     save,
     onbusychange,
+    onmutationchange,
     disabled = false,
   }: {
     source: Source;
@@ -29,6 +30,7 @@
       signal: AbortSignal,
     ) => Promise<ApiResult<OpenApiCredentialMetadata>>;
     onbusychange?: (busy: boolean) => void;
+    onmutationchange?: (busy: boolean) => void;
     disabled?: boolean;
   } = $props();
 
@@ -48,6 +50,7 @@
   let lifetime = 0;
   let observedSourceId: string | null = null;
   let reportedBusy = false;
+  let reportedMutation = false;
 
   $effect(() => {
     lifetime += 1;
@@ -57,6 +60,7 @@
       saveController?.abort();
       draft = clearGraphqlSecret(draft);
       if (reportedBusy) onbusychange?.(false);
+      if (reportedMutation) onmutationchange?.(false);
     };
   });
 
@@ -65,6 +69,12 @@
     if (busy === reportedBusy) return;
     reportedBusy = busy;
     onbusychange?.(busy);
+  });
+
+  $effect(() => {
+    if (saving === reportedMutation) return;
+    reportedMutation = saving;
+    onmutationchange?.(saving);
   });
 
   $effect(() => {

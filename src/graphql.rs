@@ -12,6 +12,7 @@ const MAX_TOTAL_FIELDS: usize = 100_000;
 const MAX_ROOT_FIELDS: usize = 2_048;
 const MAX_ARGUMENTS: usize = 128;
 const MAX_INPUT_FIELDS: usize = 1_024;
+pub(crate) const MAX_INPUT_OBJECT_DEPTH: usize = 64;
 const MAX_ENUM_VALUES: usize = 4_096;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
@@ -341,6 +342,7 @@ pub fn compile_introspection(document: Value) -> Result<CompiledGraphql, Graphql
         .ok_or_else(|| invalid("the schema has no query root"))?;
     let mutation_type = root_type_name(schema, "mutationType")?;
     let types = parse_types(schema)?;
+    let input_object_depths = InputObjectDepthIndex::new(&types);
     require_root(&types, &query_type)?;
     if let Some(name) = &mutation_type {
         require_root(&types, name)?;
@@ -351,6 +353,7 @@ pub fn compile_introspection(document: Value) -> Result<CompiledGraphql, Graphql
         &types,
         &query_type,
         GraphqlOperation::Query,
+        &input_object_depths,
         &mut generated_bytes,
         MAX_GENERATED_CATALOG_BYTES,
     )?;
@@ -359,6 +362,7 @@ pub fn compile_introspection(document: Value) -> Result<CompiledGraphql, Graphql
             &types,
             name,
             GraphqlOperation::Mutation,
+            &input_object_depths,
             &mut generated_bytes,
             MAX_GENERATED_CATALOG_BYTES,
         )?);
@@ -590,6 +594,7 @@ fn compile_root(
     types: &BTreeMap<String, TypeDefinition>,
     root_name: &str,
     operation: GraphqlOperation,
+    input_object_depths: &InputObjectDepthIndex,
     generated_bytes: &mut usize,
     max_generated_bytes: usize,
 ) -> Result<Vec<CompiledGraphqlTool>, GraphqlError> {
@@ -601,7 +606,7 @@ fn compile_root(
     }
     let mut tools = Vec::with_capacity(root.fields.len());
     for field in &root.fields {
-        let tool = compile_tool(types, field, operation)?;
+        let tool = compile_tool(types, field, operation, input_object_depths)?;
         *generated_bytes = generated_bytes
             .checked_add(generated_tool_bytes(&tool)?)
             .ok_or_else(|| limit("generated_catalog_bytes"))?;
@@ -634,6 +639,7 @@ fn compile_tool(
     types: &BTreeMap<String, TypeDefinition>,
     field: &FieldDefinition,
     operation: GraphqlOperation,
+    input_object_depths: &InputObjectDepthIndex,
 ) -> Result<CompiledGraphqlTool, GraphqlError> {
     for argument in &field.arguments {
         require_input_type(types, &argument.type_ref)?;
@@ -674,7 +680,7 @@ fn compile_tool(
         preferred_name: field.name.clone(),
         display_name: field.name.clone(),
         description: field.description.clone(),
-        input_schema: build_input_schema(types, &field.arguments)?,
+        input_schema: build_input_schema(types, &field.arguments, input_object_depths)?,
         output_schema: Some(build_output_schema(
             types,
             &field.type_ref,
@@ -694,7 +700,9 @@ fn compile_tool(
 fn build_input_schema(
     types: &BTreeMap<String, TypeDefinition>,
     arguments: &[InputValueDefinition],
+    input_object_depths: &InputObjectDepthIndex,
 ) -> Result<Value, GraphqlError> {
+    input_object_depths.validate(arguments)?;
     let mut definitions = BTreeMap::new();
     let mut active = BTreeSet::new();
     let mut properties = Map::new();
@@ -731,6 +739,152 @@ fn build_input_schema(
         );
     }
     Ok(Value::Object(schema))
+}
+
+struct InputObjectDepthIndex {
+    component_by_name: BTreeMap<String, usize>,
+    depth_by_component: Vec<usize>,
+}
+
+impl InputObjectDepthIndex {
+    fn new(types: &BTreeMap<String, TypeDefinition>) -> Self {
+        let names = types
+            .iter()
+            .filter_map(|(name, definition)| {
+                (definition.kind == TypeKind::InputObject).then_some(name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let indices = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut adjacency = vec![Vec::new(); names.len()];
+        for (index, name) in names.iter().enumerate() {
+            let definition = types
+                .get(*name)
+                .expect("input object names come from the type map");
+            for field in &definition.input_fields {
+                if let Some(target) = indices.get(field.type_ref.named_type()) {
+                    adjacency[index].push(*target);
+                }
+            }
+            adjacency[index].sort_unstable();
+            adjacency[index].dedup();
+        }
+
+        let mut visited = vec![false; names.len()];
+        let mut finish_order = Vec::with_capacity(names.len());
+        for root in 0..names.len() {
+            if visited[root] {
+                continue;
+            }
+            visited[root] = true;
+            let mut stack = vec![(root, 0_usize)];
+            while let Some((node, next_edge)) = stack.last_mut() {
+                if let Some(next) = adjacency[*node].get(*next_edge).copied() {
+                    *next_edge += 1;
+                    if !visited[next] {
+                        visited[next] = true;
+                        stack.push((next, 0));
+                    }
+                } else {
+                    finish_order.push(*node);
+                    stack.pop();
+                }
+            }
+        }
+
+        let mut reverse = vec![Vec::new(); names.len()];
+        for (source, targets) in adjacency.iter().enumerate() {
+            for target in targets {
+                reverse[*target].push(source);
+            }
+        }
+        let mut component_for = vec![usize::MAX; names.len()];
+        let mut component_sizes = Vec::new();
+        for root in finish_order.into_iter().rev() {
+            if component_for[root] != usize::MAX {
+                continue;
+            }
+            let component = component_sizes.len();
+            component_for[root] = component;
+            let mut size = 0_usize;
+            let mut stack = vec![root];
+            while let Some(node) = stack.pop() {
+                size = size.saturating_add(1);
+                for previous in &reverse[node] {
+                    if component_for[*previous] == usize::MAX {
+                        component_for[*previous] = component;
+                        stack.push(*previous);
+                    }
+                }
+            }
+            component_sizes.push(size.min(MAX_INPUT_OBJECT_DEPTH + 1));
+        }
+
+        let mut component_edges = vec![BTreeSet::new(); component_sizes.len()];
+        let mut indegree = vec![0_usize; component_sizes.len()];
+        for (source, targets) in adjacency.iter().enumerate() {
+            let source_component = component_for[source];
+            for target in targets {
+                let target_component = component_for[*target];
+                if source_component != target_component
+                    && component_edges[source_component].insert(target_component)
+                {
+                    indegree[target_component] += 1;
+                }
+            }
+        }
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(component, indegree)| (*indegree == 0).then_some(component))
+            .collect::<Vec<_>>();
+        let mut topological = Vec::with_capacity(component_sizes.len());
+        while let Some(component) = ready.pop() {
+            topological.push(component);
+            for target in &component_edges[component] {
+                indegree[*target] -= 1;
+                if indegree[*target] == 0 {
+                    ready.push(*target);
+                }
+            }
+        }
+        let mut depth_by_component = component_sizes.clone();
+        for component in topological.into_iter().rev() {
+            for target in &component_edges[component] {
+                let candidate = component_sizes[component]
+                    .saturating_add(depth_by_component[*target])
+                    .min(MAX_INPUT_OBJECT_DEPTH + 1);
+                depth_by_component[component] = depth_by_component[component].max(candidate);
+            }
+        }
+        let component_by_name = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name.to_owned(), component_for[index]))
+            .collect();
+        Self {
+            component_by_name,
+            depth_by_component,
+        }
+    }
+
+    fn validate(&self, arguments: &[InputValueDefinition]) -> Result<(), GraphqlError> {
+        let over_limit = arguments.iter().any(|argument| {
+            self.component_by_name
+                .get(argument.type_ref.named_type())
+                .is_some_and(|component| {
+                    self.depth_by_component[*component] > MAX_INPUT_OBJECT_DEPTH
+                })
+        });
+        if over_limit {
+            Err(limit("input_object_depth"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn input_schema_for_type(
@@ -1249,6 +1403,43 @@ mod tests {
         })
     }
 
+    fn input_object(name: &str, fields: Vec<Value>) -> Value {
+        json!({
+            "kind": "INPUT_OBJECT",
+            "name": name,
+            "description": null,
+            "fields": null,
+            "inputFields": fields,
+            "enumValues": null
+        })
+    }
+
+    fn input_field(name: &str, type_name: &str) -> Value {
+        json!({
+            "name": name,
+            "description": null,
+            "defaultValue": null,
+            "type": named("INPUT_OBJECT", type_name)
+        })
+    }
+
+    fn set_query_arguments(document: &mut Value, arguments: Vec<Value>) {
+        let query = document["data"]["__schema"]["types"]
+            .as_array_mut()
+            .expect("schema types are an array")
+            .iter_mut()
+            .find(|definition| definition["name"] == "Query")
+            .expect("query type exists");
+        query["fields"][0]["args"] = Value::Array(arguments);
+    }
+
+    fn push_schema_types(document: &mut Value, definitions: impl IntoIterator<Item = Value>) {
+        document["data"]["__schema"]["types"]
+            .as_array_mut()
+            .expect("schema types are an array")
+            .extend(definitions);
+    }
+
     #[test]
     fn compiles_root_fields_with_stable_modes_and_fixed_documents() {
         let compiled = compile_introspection(schema()).expect("schema compiles");
@@ -1349,11 +1540,13 @@ mod tests {
             .as_object()
             .expect("test schema is an object");
         let types = parse_types(schema).expect("test types parse");
+        let input_object_depths = super::InputObjectDepthIndex::new(&types);
         let mut generated_bytes = 0;
         let error = compile_root(
             &types,
             "Query",
             GraphqlOperation::Query,
+            &input_object_depths,
             &mut generated_bytes,
             1,
         )
@@ -1363,6 +1556,106 @@ mod tests {
             GraphqlError::LimitExceeded {
                 code: "generated_catalog_bytes"
             }
+        );
+    }
+
+    #[test]
+    fn input_object_dependency_depth_is_bounded_independent_of_root_order() {
+        let mut document = schema();
+        let definitions = (0..=super::MAX_INPUT_OBJECT_DEPTH)
+            .map(|index| {
+                let name = format!("Input{index}");
+                let fields = if index == super::MAX_INPUT_OBJECT_DEPTH {
+                    vec![json!({
+                        "name": "value",
+                        "description": null,
+                        "defaultValue": null,
+                        "type": named("SCALAR", "String")
+                    })]
+                } else {
+                    vec![input_field("next", &format!("Input{}", index + 1))]
+                };
+                input_object(&name, fields)
+            })
+            .collect::<Vec<_>>();
+        push_schema_types(&mut document, definitions);
+        set_query_arguments(
+            &mut document,
+            vec![
+                input_field("aTail", &format!("Input{}", super::MAX_INPUT_OBJECT_DEPTH)),
+                input_field("zHead", "Input0"),
+            ],
+        );
+
+        assert_eq!(
+            compile_introspection(document).expect_err("deep input graph is rejected"),
+            GraphqlError::LimitExceeded {
+                code: "input_object_depth"
+            }
+        );
+    }
+
+    #[test]
+    fn maximum_input_object_dependency_depth_is_supported() {
+        let mut document = schema();
+        let definitions = (0..super::MAX_INPUT_OBJECT_DEPTH)
+            .map(|index| {
+                let name = format!("Input{index}");
+                let fields = if index + 1 == super::MAX_INPUT_OBJECT_DEPTH {
+                    vec![json!({
+                        "name": "value",
+                        "description": null,
+                        "defaultValue": null,
+                        "type": named("SCALAR", "String")
+                    })]
+                } else {
+                    vec![input_field("next", &format!("Input{}", index + 1))]
+                };
+                input_object(&name, fields)
+            })
+            .collect::<Vec<_>>();
+        push_schema_types(&mut document, definitions);
+        set_query_arguments(&mut document, vec![input_field("input", "Input0")]);
+
+        compile_introspection(document).expect("the maximum input depth compiles");
+    }
+
+    #[test]
+    fn bounded_recursive_input_objects_are_supported() {
+        let mut document = schema();
+        push_schema_types(
+            &mut document,
+            [
+                input_object("RecursiveA", vec![input_field("b", "RecursiveB")]),
+                input_object("RecursiveB", vec![input_field("a", "RecursiveA")]),
+            ],
+        );
+        set_query_arguments(&mut document, vec![input_field("recursive", "RecursiveA")]);
+
+        let compiled = compile_introspection(document).expect("bounded cycle compiles");
+        assert!(compiled.tools[0].input_schema["$defs"]["RecursiveA"].is_object());
+        assert!(compiled.tools[0].input_schema["$defs"]["RecursiveB"].is_object());
+    }
+
+    #[test]
+    fn wide_shallow_input_object_graphs_do_not_consume_the_depth_budget() {
+        let mut document = schema();
+        let leaf_count = super::MAX_INPUT_OBJECT_DEPTH + 1;
+        let root_fields = (0..leaf_count)
+            .map(|index| input_field(&format!("field{index}"), &format!("Leaf{index}")))
+            .collect::<Vec<_>>();
+        let definitions = std::iter::once(input_object("WideInput", root_fields))
+            .chain((0..leaf_count).map(|index| input_object(&format!("Leaf{index}"), Vec::new())));
+        push_schema_types(&mut document, definitions);
+        set_query_arguments(&mut document, vec![input_field("wide", "WideInput")]);
+
+        let compiled = compile_introspection(document).expect("wide shallow graph compiles");
+        assert_eq!(
+            compiled.tools[0].input_schema["$defs"]
+                .as_object()
+                .expect("input definitions exist")
+                .len(),
+            leaf_count + 1
         );
     }
 

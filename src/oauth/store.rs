@@ -605,6 +605,11 @@ impl OAuthStore {
         if updated.rows_affected() != 1 {
             return Err(OAuthStoreError::Conflict);
         }
+        sqlx::query("DELETE FROM oauth_refresh_leases WHERE connection_id = ?")
+            .bind(&connection_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database)?;
         let inserted = sqlx::query(
             "INSERT INTO oauth_authorization_transactions (
                 id, connection_id, connection_revision, config_revision, base_secret_revision,
@@ -818,7 +823,7 @@ impl OAuthStore {
             self.crypto
                 .seal_secrets(&claim.connection_id, next_revision, &effective_secrets)?;
         let mut transaction = self.pool.begin().await.map_err(database)?;
-        let valid = exchange_claim_is_current(&mut transaction, claim, &claim_digest).await?;
+        let valid = exchange_claim_is_current(&mut transaction, claim, &claim_digest, now).await?;
         if !valid {
             return Err(OAuthStoreError::Conflict);
         }
@@ -971,8 +976,9 @@ impl OAuthStore {
         let lease_token = self.crypto.new_refresh_lease_token();
         let lease_digest = self.crypto.refresh_lease_digest(&lease_token);
         let mut transaction = self.pool.begin().await.map_err(database)?;
-        let expired_base = sqlx::query_scalar::<_, i64>(
-            "SELECT base_secret_revision FROM oauth_refresh_leases
+        let expired_claim = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT base_secret_revision, connection_revision, config_revision
+             FROM oauth_refresh_leases
              WHERE connection_id = ? AND expires_at <= ?",
         )
         .bind(connection_id)
@@ -980,16 +986,19 @@ impl OAuthStore {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database)?;
-        if let Some(expired_base) = expired_base {
+        if let Some((expired_base, connection_revision, config_revision)) = expired_claim {
             let marked = sqlx::query(
                 "UPDATE oauth_connections
                  SET revision = revision + 1, status = 'reauth_required',
                      error_code = ?, updated_at = ?
-                 WHERE id = ? AND current_secret_revision = ?",
+                 WHERE id = ? AND status = 'active' AND revision = ?
+                   AND current_config_revision = ? AND current_secret_revision = ?",
             )
             .bind(REFRESH_ERROR_INTERRUPTED)
             .bind(now)
             .bind(connection_id)
+            .bind(connection_revision)
+            .bind(config_revision)
             .bind(expired_base)
             .execute(&mut *transaction)
             .await
@@ -1043,12 +1052,15 @@ impl OAuthStore {
             .open_secrets(connection_id, base_secret_revision, &ciphertext)?;
         let inserted = sqlx::query(
             "INSERT INTO oauth_refresh_leases (
-                connection_id, lease_digest, base_secret_revision, claimed_at, expires_at
-             ) VALUES (?, ?, ?, ?, ?)",
+                connection_id, lease_digest, base_secret_revision,
+                connection_revision, config_revision, claimed_at, expires_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(connection_id)
         .bind(lease_digest.to_vec())
         .bind(base_secret_revision)
+        .bind(row.get::<i64, _>("revision"))
+        .bind(row.get::<i64, _>("current_config_revision"))
         .bind(now)
         .bind(lease_expires_at)
         .execute(&mut *transaction)
@@ -1116,7 +1128,7 @@ impl OAuthStore {
                  revision = revision + 1, granted_scopes_json = ?,
                  has_client_secret = ?, has_refresh_token = ?, access_expires_at = ?,
                  last_refreshed_at = ?, updated_at = ?
-             WHERE id = ? AND revision = ?
+             WHERE id = ? AND status = 'active' AND revision = ?
                AND current_config_revision = ? AND current_secret_revision = ?",
         )
         .bind(next_revision)
@@ -1156,7 +1168,7 @@ impl OAuthStore {
             "UPDATE oauth_connections
              SET status = 'reauth_required', error_code = ?,
                  revision = revision + 1, updated_at = ?
-             WHERE id = ? AND revision = ?
+             WHERE id = ? AND status = 'active' AND revision = ?
                AND current_config_revision = ? AND current_secret_revision = ?",
         )
         .bind(REFRESH_ERROR_INVALID_GRANT)
@@ -1174,14 +1186,6 @@ impl OAuthStore {
         delete_refresh_lease(&mut transaction, &claim.connection_id, &lease_digest).await?;
         transaction.commit().await.map_err(database)?;
         Ok(())
-    }
-
-    pub(crate) async fn release_refresh(
-        &self,
-        claim: &RefreshClaim,
-    ) -> Result<(), OAuthStoreError> {
-        self.mark_refresh_reauthorization_required(claim, REFRESH_ERROR_INTERRUPTED)
-            .await
     }
 
     pub(crate) async fn mark_refresh_reauthorization_required(
@@ -1202,7 +1206,7 @@ impl OAuthStore {
             "UPDATE oauth_connections
              SET status = 'reauth_required', error_code = ?,
                  revision = revision + 1, updated_at = ?
-             WHERE id = ? AND revision = ?
+             WHERE id = ? AND status = 'active' AND revision = ?
                AND current_config_revision = ? AND current_secret_revision = ?",
         )
         .bind(reason)
@@ -1302,9 +1306,11 @@ impl OAuthStore {
             "UPDATE oauth_connections
              SET revision = revision + 1, status = 'reauth_required',
                  error_code = ?, updated_at = ?
-             WHERE EXISTS (
+             WHERE status = 'active' AND EXISTS (
                 SELECT 1 FROM oauth_refresh_leases l
                 WHERE l.connection_id = oauth_connections.id
+                  AND l.connection_revision = oauth_connections.revision
+                  AND l.config_revision = oauth_connections.current_config_revision
                   AND l.base_secret_revision = oauth_connections.current_secret_revision
              )",
         )
@@ -1443,6 +1449,7 @@ async fn exchange_claim_is_current(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     claim: &AuthorizationExchangeClaim,
     claim_digest: &[u8; 32],
+    now: i64,
 ) -> Result<bool, OAuthStoreError> {
     sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(
@@ -1450,7 +1457,8 @@ async fn exchange_claim_is_current(
             FROM oauth_authorization_transactions t
             JOIN oauth_connections c ON c.id = t.connection_id
             WHERE t.id = ? AND t.connection_id = ? AND t.status = 'exchanging'
-              AND t.exchange_claim_digest = ? AND t.config_revision = ?
+              AND t.exchange_claim_digest = ? AND t.exchange_expires_at > ?
+              AND t.config_revision = ?
               AND t.connection_revision = ? AND c.revision = t.connection_revision
               AND ((t.base_secret_revision IS NULL AND ? IS NULL)
                    OR t.base_secret_revision = ?)
@@ -1462,6 +1470,7 @@ async fn exchange_claim_is_current(
     .bind(&claim.transaction_id)
     .bind(&claim.connection_id)
     .bind(claim_digest.to_vec())
+    .bind(now)
     .bind(claim.config_revision)
     .bind(claim.connection_revision)
     .bind(claim.base_secret_revision)
@@ -1485,8 +1494,9 @@ async fn refresh_claim_is_current(
             JOIN oauth_connections c ON c.id = l.connection_id
             WHERE l.connection_id = ? AND l.lease_digest = ?
               AND l.base_secret_revision = ? AND l.expires_at > ?
-              AND c.revision = ?
-              AND c.current_config_revision = ?
+              AND l.connection_revision = ? AND l.config_revision = ?
+              AND c.status = 'active' AND c.revision = l.connection_revision
+              AND c.current_config_revision = l.config_revision
               AND c.current_secret_revision = l.base_secret_revision
          )",
     )
@@ -1602,7 +1612,7 @@ mod tests {
 
     use crate::crypto::Keyring;
 
-    use super::{OAuthStore, OAuthStoreError};
+    use super::{OAuthStore, OAuthStoreError, REFRESH_ERROR_INTERRUPTED};
     use crate::catalog::{
         AuditContext, CatalogError, CatalogSnapshot, CatalogStore, CredentialPayload,
         OAuthBindingExpectation,
@@ -1934,6 +1944,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exchange_completion_rejects_the_exact_deadline() {
+        let (store, pool) = test_store().await;
+        let connection = store
+            .create_connection("source-1", "default", &config("New"), None, 10)
+            .await
+            .unwrap();
+        let session = [1_u8; 32];
+        let pending = store
+            .begin_authorization("source-1", "default", 1, &session, 11, 100)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_authorization_exchange(&connection.connection.id, &pending.state, &session, 12)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .complete_authorization_exchange(&claim, &secrets("a1", "r1"), 72)
+                .await,
+            Err(OAuthStoreError::Conflict)
+        ));
+        let secret_revisions = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM oauth_connection_secret_revisions WHERE connection_id = ?",
+        )
+        .bind(&connection.connection.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(secret_revisions, 0);
+        assert_eq!(store.expire_authorizations(72).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn startup_recovery_never_replays_an_interrupted_code_exchange() {
         let (store, pool) = test_store().await;
         let connection = store
@@ -2012,6 +2056,86 @@ mod tests {
         let loaded = store.connection(&connection.connection.id).await.unwrap();
         assert_eq!(loaded.connection.secret_revision, Some(2));
         assert_eq!(loaded.secrets.unwrap().refresh_token.as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_overwrite_a_new_authorization() {
+        let (store, _) = test_store().await;
+        let connection = store
+            .create_connection(
+                "source-1",
+                "default",
+                &config("Active"),
+                Some(&secrets("old-access", "old-refresh")),
+                10,
+            )
+            .await
+            .unwrap();
+        let refresh = store
+            .claim_refresh(&connection.connection.id, 20, 80)
+            .await
+            .unwrap();
+        let session = [3_u8; 32];
+        let authorization = store
+            .begin_authorization(
+                "source-1",
+                "default",
+                connection.connection.revision,
+                &session,
+                21,
+                100,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .complete_refresh(&refresh, &secrets("stale-access", "stale-refresh"), 22)
+                .await,
+            Err(OAuthStoreError::Conflict)
+        ));
+        assert!(matches!(
+            store
+                .mark_refresh_reauthorization_required(&refresh, "stale_refresh")
+                .await,
+            Err(OAuthStoreError::Conflict)
+        ));
+        let connecting = store.connection(&connection.connection.id).await.unwrap();
+        assert_eq!(
+            connecting.connection.status,
+            OAuthConnectionStatus::Connecting
+        );
+        assert_eq!(connecting.connection.error_code, None);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM oauth_refresh_leases WHERE connection_id = ?",
+            )
+            .bind(&connection.connection.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap(),
+            0
+        );
+
+        let claim = store
+            .claim_authorization_exchange(
+                &connection.connection.id,
+                &authorization.state,
+                &session,
+                23,
+            )
+            .await
+            .unwrap();
+        store
+            .complete_authorization_exchange(&claim, &secrets("new-access", "new-refresh"), 24)
+            .await
+            .unwrap();
+        let active = store.connection(&connection.connection.id).await.unwrap();
+        assert_eq!(active.connection.status, OAuthConnectionStatus::Active);
+        assert_eq!(
+            active.secrets.unwrap().access_token.as_deref(),
+            Some("new-access")
+        );
     }
 
     #[tokio::test]
@@ -2294,7 +2418,10 @@ mod tests {
             .claim_refresh(&connection.connection.id, now, now + 60)
             .await
             .unwrap();
-        store.release_refresh(&claim).await.unwrap();
+        store
+            .mark_refresh_reauthorization_required(&claim, REFRESH_ERROR_INTERRUPTED)
+            .await
+            .unwrap();
 
         let loaded = store.connection(&connection.connection.id).await.unwrap();
         assert_eq!(

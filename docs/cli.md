@@ -33,6 +33,52 @@ upstream tool failure is a completed call: `--json` prints its result envelope
 and the process exits successfully. Automation must inspect the envelope's
 `ok` and `error` fields instead of treating exit status alone as tool success.
 
+## Service lifecycle
+
+The release binary embeds the supported systemd and launchd assets. No source
+checkout is needed:
+
+```sh
+executor service install [--no-start]
+executor service status
+executor service start
+executor service stop
+executor service restart
+executor service remove
+```
+
+On Linux, `install`, `start`, `stop`, `restart`, and `remove` manage the system
+unit and must run through `sudo`. Status is unprivileged. On macOS these commands
+manage the logged-in user's LaunchAgent and reject `sudo`. Windows service
+management is not supported.
+
+Status output is intentionally stable for scripts. It prints exactly `active`
+and exits 0, or prints exactly `inactive` and exits 3. A command or platform
+failure exits 1. The global connection and `--json` options do not change
+service output.
+
+Install is idempotent and replaces only files tracked by a private ownership
+manifest. On first install it may adopt an identical copy of its currently
+running binary, but rejects other preexisting service files. It preserves
+existing data, configuration, template registry, and a valid master key.
+Remove unloads the service and removes its managed executable, service
+definition, and ownership manifest while preserving persistent state. Every
+non-install mutation verifies the recorded file hashes before touching a loaded
+service. Install verifies an existing manifest, or applies the first-install
+rules described above. Unsafe paths, symbolic links, hard links, permission
+changes, and replaced file contents fail closed. If manifest publication is
+interrupted, a private recovery marker authorizes only a new `service install`;
+other lifecycle mutations remain blocked until that rerun completes.
+
+On macOS, the service owns `$HOME/.executor/service/bin/executor` and its
+control files under `$HOME/.executor/service`. The archive installer separately
+owns `$HOME/.executor/bin`. Reinstalling the LaunchAgent with no configuration
+environment variables preserves the exact stored data directory, template
+file, public origin, and trusted proxy list. Supplying one variable updates
+only that field, and explicitly empty public-origin or trusted-proxy variables
+clear those fields. Service removal preserves this configuration for a later
+reinstall and does not change the archive installation.
+
 ## Tools
 
 Search the non-disabled global catalog. Enabled and Ask tools are discoverable;

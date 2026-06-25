@@ -3,6 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{
     ExecutionCancellation, HostToolDispatcher, ToolCall as RuntimeToolCall,
@@ -13,8 +14,8 @@ use crate::{
     approval::ApprovalStatus,
     catalog::{CatalogError, RequestSurface},
     invocation::{
-        ApprovalWaitError, ToolCall, ToolCallError, ToolCallService, ToolCallSubmission,
-        ToolDiscoveryError, ToolResult as InvocationToolResult,
+        ApprovalWaitError, ToolCall, ToolCallError, ToolCallOAuthError, ToolCallService,
+        ToolCallSubmission, ToolDiscoveryError, ToolResult as InvocationToolResult,
     },
 };
 
@@ -73,7 +74,7 @@ impl InvocationToolDispatcher {
             return internal_failure("execution_cancelled");
         }
         let service_call = ToolCall {
-            request_id: format!("{}:call:{}", self.context.request_id, call.call_id),
+            request_id: execution_call_request_id(&self.context.request_id, call.call_id),
             actor: self.context.actor.clone(),
             surface: self.context.surface,
             execution_id: self.context.execution_id.clone(),
@@ -262,7 +263,10 @@ fn approval_result(status: ApprovalStatus, result: Option<Value>) -> RuntimeTool
             "approval_stale",
             "The tool changed before approval completed.",
         ),
-        ApprovalStatus::Interrupted => internal_failure("approval_interrupted"),
+        ApprovalStatus::Interrupted => result
+            .and_then(|result| serde_json::from_value::<InvocationToolResult>(result).ok())
+            .map(invocation_result)
+            .unwrap_or_else(|| internal_failure("approval_interrupted")),
         ApprovalStatus::Pending | ApprovalStatus::Approved | ApprovalStatus::Executing => {
             internal_failure("approval_state_invalid")
         }
@@ -285,6 +289,13 @@ fn tool_call_failure(error: &ToolCallError) -> RuntimeToolResult {
     match error {
         ToolCallError::Catalog(error) => catalog_failure(error),
         ToolCallError::Adapter { code, message } => failure(*code, message.clone()),
+        ToolCallError::OAuth(error) if matches!(error, ToolCallOAuthError::Internal) => {
+            internal_failure(error.code())
+        }
+        ToolCallError::OAuth(error) => failure(
+            error.code(),
+            "Managed OAuth could not be resolved safely for this tool call.",
+        ),
         ToolCallError::ArgumentsTooLarge => failure(
             "arguments_too_large",
             "Tool arguments exceed the allowed size.",
@@ -386,4 +397,40 @@ fn failure(code: impl Into<String>, message: impl Into<String>) -> RuntimeToolRe
 
 fn internal_failure(code: impl Into<String>) -> RuntimeToolResult {
     RuntimeToolResult::InternalFailure { code: code.into() }
+}
+
+fn execution_call_request_id(request_id: &str, call_id: u64) -> String {
+    const MAX_REQUEST_LOG_ID_BYTES: usize = 128;
+    let suffix = format!(":call:{call_id}");
+    if request_id.len() + suffix.len() <= MAX_REQUEST_LOG_ID_BYTES {
+        return format!("{request_id}{suffix}");
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"executor-runtime-request-log-v1");
+    digest.update((request_id.len() as u64).to_be_bytes());
+    digest.update(request_id.as_bytes());
+    format!("exec:{:x}{suffix}", digest.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execution_call_request_id;
+
+    #[test]
+    fn execution_call_request_ids_respect_the_request_log_bound() {
+        let bounded_parent = "x".repeat(102);
+        let bounded = execution_call_request_id(&bounded_parent, u64::MAX);
+        assert_eq!(bounded.len(), 128);
+        assert!(bounded.starts_with(&bounded_parent));
+
+        let oversized_parent = "private-request-identity".repeat(64);
+        let first = execution_call_request_id(&oversized_parent, u64::MAX);
+        let repeated = execution_call_request_id(&oversized_parent, u64::MAX);
+        let distinct = execution_call_request_id(&format!("{oversized_parent}-other"), u64::MAX);
+        assert_eq!(first, repeated);
+        assert_ne!(first, distinct);
+        assert!(first.len() <= 128);
+        assert!(!first.contains(oversized_parent.as_str()));
+    }
 }

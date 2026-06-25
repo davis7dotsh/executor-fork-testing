@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -25,7 +25,9 @@ struct ManagerInner {
     shutting_down: AtomicBool,
     active_operations: AtomicUsize,
     idle: Notify,
+    source_deletions: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     watcher_operations: tokio::sync::Mutex<()>,
+    watcher_reconciliations: Arc<tokio::sync::Mutex<()>>,
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     watcher_state: Mutex<WatcherState>,
     next_watcher_generation: AtomicU64,
@@ -70,6 +72,19 @@ pub(crate) struct WatcherRevisionGuard {
     _lifecycle: tokio::sync::OwnedMutexGuard<()>,
 }
 
+pub(crate) struct SourceRevisionLease {
+    inner: Arc<ManagerInner>,
+    entries: HashMap<String, SourceRevisionEntry>,
+    _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceRevisionEntry {
+    generation: Option<u64>,
+    installed_revision: Option<i64>,
+    expected_catalog_revision: i64,
+}
+
 #[derive(Debug, Error)]
 #[error("MCP connections are shutting down")]
 pub(crate) struct McpShuttingDown;
@@ -82,7 +97,9 @@ impl McpConnectionManager {
                 shutting_down: AtomicBool::new(false),
                 active_operations: AtomicUsize::new(0),
                 idle: Notify::new(),
+                source_deletions: Mutex::new(HashMap::new()),
                 watcher_operations: tokio::sync::Mutex::new(()),
+                watcher_reconciliations: Arc::new(tokio::sync::Mutex::new(())),
                 lifecycle: Arc::new(tokio::sync::Mutex::new(())),
                 watcher_state: Mutex::new(WatcherState::default()),
                 next_watcher_generation: AtomicU64::new(1),
@@ -92,6 +109,28 @@ impl McpConnectionManager {
 
     pub(crate) fn stdio_templates(&self) -> &Arc<StdioTemplateRegistry> {
         &self.inner.stdio_templates
+    }
+
+    pub(crate) async fn lock_source_deletion(
+        &self,
+        source_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let deletion = {
+            let mut deletions = self
+                .inner
+                .source_deletions
+                .lock()
+                .expect("MCP source deletion mutex poisoned");
+            deletions.retain(|_, deletion| deletion.strong_count() > 0);
+            if let Some(deletion) = deletions.get(source_id).and_then(Weak::upgrade) {
+                deletion
+            } else {
+                let deletion = Arc::new(tokio::sync::Mutex::new(()));
+                deletions.insert(source_id.to_owned(), Arc::downgrade(&deletion));
+                deletion
+            }
+        };
+        deletion.lock_owned().await
     }
 
     pub(crate) fn begin_operation(&self) -> Result<McpOperationGuard, McpShuttingDown> {
@@ -332,6 +371,39 @@ impl McpConnectionManager {
         true
     }
 
+    pub(crate) async fn stop_watcher_and_wait_at_least_revision(
+        &self,
+        source_id: &str,
+        source_revision: i64,
+    ) {
+        let _operation = self.inner.watcher_operations.lock().await;
+        let (watcher, pending) = {
+            let _lifecycle = self.inner.lifecycle.lock().await;
+            let mut state = self
+                .inner
+                .watcher_state
+                .lock()
+                .expect("MCP watcher mutex poisoned");
+            prune_finished_tasks(&mut state.pending);
+            let revision = state
+                .latest_source_revisions
+                .get(source_id)
+                .copied()
+                .unwrap_or(source_revision)
+                .max(source_revision);
+            state
+                .latest_source_revisions
+                .insert(source_id.to_owned(), revision);
+            let watcher = state.active.remove(source_id);
+            let pending = take_pending_tasks(&mut state, source_id);
+            (watcher, pending)
+        };
+        if let Some(watcher) = watcher {
+            stop_and_join_watcher(watcher).await;
+        }
+        join_tasks(pending).await;
+    }
+
     pub(crate) async fn retire_source(&self, source_id: &str) {
         let _operation = self.inner.watcher_operations.lock().await;
         let (watcher, pending) = {
@@ -386,6 +458,101 @@ impl McpConnectionManager {
         }
     }
 
+    pub(crate) fn watcher_revision(&self, source_id: &str) -> Option<i64> {
+        self.inner
+            .watcher_state
+            .lock()
+            .expect("MCP watcher mutex poisoned")
+            .active
+            .get(source_id)
+            .map(|watcher| watcher.source_revision)
+    }
+
+    pub(crate) async fn lock_watcher_reconciliation(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner
+            .watcher_reconciliations
+            .clone()
+            .lock_owned()
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_generation(&self, source_id: &str) -> Option<u64> {
+        self.inner
+            .watcher_state
+            .lock()
+            .expect("MCP watcher mutex poisoned")
+            .active
+            .get(source_id)
+            .map(|watcher| watcher.generation)
+    }
+
+    /// Observes committed catalog revisions and leases the watcher revision registry while a
+    /// catalog mutation is applied.
+    ///
+    /// A `None` result means one of the observations was already stale. Callers should reload the
+    /// catalog revisions and try again before applying their mutation.
+    pub(crate) async fn lock_source_revisions(
+        &self,
+        observed_revisions: impl IntoIterator<Item = (String, i64)>,
+    ) -> Option<SourceRevisionLease> {
+        let mut observed = HashMap::new();
+        for (source_id, revision) in observed_revisions {
+            if observed
+                .insert(source_id, revision)
+                .is_some_and(|previous| previous != revision)
+            {
+                return None;
+            }
+        }
+
+        let lifecycle = self.inner.lifecycle.clone().lock_owned().await;
+        let mut state = self
+            .inner
+            .watcher_state
+            .lock()
+            .expect("MCP watcher mutex poisoned");
+        if observed.iter().any(|(source_id, observed_revision)| {
+            state
+                .latest_source_revisions
+                .get(source_id)
+                .is_some_and(|latest| *latest > *observed_revision)
+                || state
+                    .active
+                    .get(source_id)
+                    .is_some_and(|watcher| watcher.source_revision > *observed_revision)
+        }) {
+            return None;
+        }
+
+        let mut entries = HashMap::with_capacity(observed.len());
+        for (source_id, observed_revision) in observed {
+            let (generation, installed_revision) = state
+                .active
+                .get(&source_id)
+                .map_or((None, None), |watcher| {
+                    (Some(watcher.generation), Some(watcher.source_revision))
+                });
+            state
+                .latest_source_revisions
+                .insert(source_id.clone(), observed_revision);
+            entries.insert(
+                source_id,
+                SourceRevisionEntry {
+                    generation,
+                    installed_revision,
+                    expected_catalog_revision: observed_revision,
+                },
+            );
+        }
+        drop(state);
+        Some(SourceRevisionLease {
+            inner: self.inner.clone(),
+            entries,
+            _lifecycle: lifecycle,
+        })
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
         let wait_for_idle = async {
@@ -428,6 +595,20 @@ impl McpConnectionManager {
 }
 
 impl WatcherRevisionLease {
+    pub(crate) fn current_revision(&self) -> Option<i64> {
+        let state = self
+            .inner
+            .watcher_state
+            .lock()
+            .expect("MCP watcher mutex poisoned");
+        state.active.get(&self.source_id).and_then(|watcher| {
+            (watcher.generation == self.generation
+                && state.latest_source_revisions.get(&self.source_id)
+                    == Some(&watcher.source_revision))
+            .then_some(watcher.source_revision)
+        })
+    }
+
     pub(crate) async fn lock_revision(
         &self,
         expected_revision: i64,
@@ -455,6 +636,62 @@ impl WatcherRevisionLease {
             expected_revision,
             _lifecycle: lifecycle,
         })
+    }
+}
+
+impl SourceRevisionLease {
+    pub(crate) fn source_ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub(crate) fn advance(self, committed_revisions: &HashMap<String, i64>) -> bool {
+        if self.entries.len() != committed_revisions.len()
+            || self.entries.iter().any(|(source_id, entry)| {
+                committed_revisions
+                    .get(source_id)
+                    .is_none_or(|revision| *revision < entry.expected_catalog_revision)
+            })
+        {
+            return false;
+        }
+
+        let mut state = self
+            .inner
+            .watcher_state
+            .lock()
+            .expect("MCP watcher mutex poisoned");
+        let current = self.entries.iter().all(|(source_id, entry)| {
+            state.latest_source_revisions.get(source_id) == Some(&entry.expected_catalog_revision)
+                && match (
+                    entry.generation,
+                    entry.installed_revision,
+                    state.active.get(source_id),
+                ) {
+                    (Some(generation), Some(installed_revision), Some(watcher)) => {
+                        watcher.generation == generation
+                            && watcher.source_revision == installed_revision
+                    }
+                    (Some(_), Some(_), None) | (None, None, None) => true,
+                    (Some(_), None, _) | (None, Some(_), _) | (None, None, Some(_)) => false,
+                }
+        });
+        if !current {
+            return false;
+        }
+
+        for (source_id, entry) in &self.entries {
+            let revision = committed_revisions[source_id];
+            if let Some(watcher) = state.active.get_mut(source_id) {
+                debug_assert_eq!(entry.generation, Some(watcher.generation));
+                if entry.installed_revision == Some(entry.expected_catalog_revision) {
+                    watcher.source_revision = revision;
+                }
+            }
+            state
+                .latest_source_revisions
+                .insert(source_id.clone(), revision);
+        }
+        true
     }
 }
 
@@ -823,6 +1060,142 @@ mod tests {
         assert!(!manager.stop_watcher_at_revision("source", 1).await);
         assert!(!manager.stop_watcher_and_wait_at_revision("source", 1).await);
         assert!(manager.has_watcher("source"));
+        assert!(manager.stop_watcher_and_wait_at_revision("source", 2).await);
+    }
+
+    #[tokio::test]
+    async fn source_mutation_lease_rebases_active_and_inactive_revision_authority() {
+        let manager = McpConnectionManager::new(StdioTemplateRegistry::default());
+        let (lease_sender, lease_receiver) = tokio::sync::oneshot::channel();
+        manager
+            .replace_watcher(
+                "active".to_owned(),
+                3,
+                move |mut stop, revision_lease| async move {
+                    assert!(lease_sender.send(revision_lease).is_ok());
+                    let _ = (&mut stop).await;
+                },
+            )
+            .await
+            .expect("watcher installs");
+        let watcher_lease = lease_receiver.await.expect("watcher provides lease");
+
+        let source_lease = manager
+            .lock_source_revisions([("active".to_owned(), 3), ("inactive".to_owned(), 7)])
+            .await
+            .expect("observed revisions lease");
+        assert!(source_lease.advance(&HashMap::from([
+            ("active".to_owned(), 4),
+            ("inactive".to_owned(), 8),
+        ])));
+
+        assert_eq!(watcher_lease.current_revision(), Some(4));
+        assert!(watcher_lease.lock_revision(3).await.is_none());
+        assert!(watcher_lease.lock_revision(4).await.is_some());
+        assert!(
+            !manager
+                .replace_watcher(
+                    "inactive".to_owned(),
+                    7,
+                    move |_stop, _revision_lease| async {},
+                )
+                .await
+                .expect("stale inactive install is ignored")
+        );
+        assert!(manager.stop_watcher_and_wait_at_revision("active", 4).await);
+    }
+
+    #[tokio::test]
+    async fn higher_catalog_observation_does_not_promote_a_stale_watcher_generation() {
+        let manager = McpConnectionManager::new(StdioTemplateRegistry::default());
+        let (old_sender, old_receiver) = tokio::sync::oneshot::channel();
+        manager
+            .replace_watcher(
+                "source".to_owned(),
+                3,
+                move |mut stop, revision_lease| async move {
+                    assert!(old_sender.send(revision_lease).is_ok());
+                    let _ = (&mut stop).await;
+                },
+            )
+            .await
+            .expect("old watcher installs");
+        let old = old_receiver.await.expect("old watcher provides lease");
+
+        let source_lease = manager
+            .lock_source_revisions([("source".to_owned(), 4)])
+            .await
+            .expect("newer catalog observation leases");
+        assert_eq!(old.current_revision(), None);
+        assert!(source_lease.advance(&HashMap::from([("source".to_owned(), 5)])));
+        assert_eq!(old.current_revision(), None);
+        assert!(old.lock_revision(3).await.is_none());
+        assert!(old.lock_revision(5).await.is_none());
+
+        let (current_sender, current_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            manager
+                .replace_watcher(
+                    "source".to_owned(),
+                    5,
+                    move |mut stop, revision_lease| async move {
+                        current_sender.send(revision_lease).ok();
+                        let _ = (&mut stop).await;
+                    },
+                )
+                .await
+                .expect("current watcher installs")
+        );
+        let current = current_receiver
+            .await
+            .expect("current watcher provides lease");
+        assert_eq!(current.current_revision(), Some(5));
+        assert!(manager.stop_watcher_and_wait_at_revision("source", 5).await);
+    }
+
+    #[tokio::test]
+    async fn source_mutation_lease_waits_for_watcher_commit_and_rejects_stale_observation() {
+        let manager = McpConnectionManager::new(StdioTemplateRegistry::default());
+        let (lease_sender, lease_receiver) = tokio::sync::oneshot::channel();
+        manager
+            .replace_watcher(
+                "source".to_owned(),
+                1,
+                move |mut stop, revision_lease| async move {
+                    assert!(lease_sender.send(revision_lease).is_ok());
+                    let _ = (&mut stop).await;
+                },
+            )
+            .await
+            .expect("watcher installs");
+        let watcher_lease = lease_receiver.await.expect("watcher provides lease");
+        let watcher_commit = watcher_lease
+            .lock_revision(1)
+            .await
+            .expect("watcher revision locks");
+
+        let attempted = Arc::new(Notify::new());
+        let source_mutation = tokio::spawn({
+            let manager = manager.clone();
+            let attempted = attempted.clone();
+            async move {
+                attempted.notify_one();
+                manager
+                    .lock_source_revisions([("source".to_owned(), 1)])
+                    .await
+            }
+        });
+        attempted.notified().await;
+        assert!(!source_mutation.is_finished());
+
+        assert!(watcher_commit.advance(2));
+        assert!(
+            source_mutation
+                .await
+                .expect("source mutation task joins")
+                .is_none()
+        );
+        assert_eq!(watcher_lease.current_revision(), Some(2));
         assert!(manager.stop_watcher_and_wait_at_revision("source", 2).await);
     }
 

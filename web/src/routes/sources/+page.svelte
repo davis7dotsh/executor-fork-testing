@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { replaceState } from "$app/navigation";
+  import { beforeNavigate, replaceState } from "$app/navigation";
   import { page } from "$app/state";
   import { tick, untrack } from "svelte";
   import DashboardShell from "$lib/DashboardShell.svelte";
@@ -13,12 +13,15 @@
   import {
     authorizeOAuthConnection,
     createGraphqlSource,
+    createMcpHttpSource,
+    createMcpStdioSource,
     createOpenApiSource,
     deleteOAuthConnection,
     deleteOpenApiCredentials,
     deleteSource,
     disconnectOAuthConnection,
     getOpenApiCredentials,
+    getSourceCreationResolution,
     getSourceCredentials,
     listSources,
     listOAuthConnections,
@@ -27,6 +30,7 @@
     putOAuthConnection,
     putGraphqlCredentials,
     refreshSourceCatalog,
+    sealMissingSourceCreation,
     setSourceMode,
     type ApiError,
     type OpenApiPreview,
@@ -55,14 +59,35 @@
   import { safeGraphqlSourceDetails } from "$lib/graphql-source-state";
   import { safeMcpSourceDetails } from "$lib/mcp-source-state";
   import {
+    oauthCallbackOutcomeNotice,
     oauthCallbackNoticeWithoutEligibleSources,
     oauthCallbackRefreshKey,
     type OAuthConnectionOperations,
     withoutOAuthCallbackParameters,
   } from "$lib/oauth-connection-state";
+  import {
+    browserSourceCreateEnvironment,
+    createSourceCreateCoordinator,
+    emptySourceCreateState,
+    type SourceCreateEnvironment,
+    type SourceCreateInput,
+  } from "$lib/source-create-lifecycle";
+
+  type OAuthNavigationOverride = {
+    readonly url: URL;
+    readonly state: App.PageState;
+    readonly replaceState: (url: URL, state: App.PageState) => void;
+  };
+
+  let {
+    oauthNavigation,
+    sourceCreateEnvironment = browserSourceCreateEnvironment(),
+  }: {
+    oauthNavigation?: OAuthNavigationOverride;
+    sourceCreateEnvironment?: SourceCreateEnvironment;
+  } = $props();
 
   const auth = useAuthState();
-  const latest = createLatestRequest();
   const credentialRequest = createLatestRequest();
   let resource = $state(emptyResource<SourceList>());
   let refreshKey = $state(0);
@@ -81,18 +106,28 @@
   let preferredSlug = $state("");
   let sourceDescription = $state("");
   let sourceType = $state<"openapi" | "graphql" | "mcp_http" | "mcp_stdio">("openapi");
+  let sourceFormGeneration = $state(0);
   let importCredentialRows = $state<CredentialDraft[]>([]);
   let credentialEditorSource = $state<string | null>(null);
   let confirmingCredentialClear = $state<string | null>(null);
   let credentialRevision = $state<number | null>(null);
   let credentialRows = $state<CredentialDraft[]>([]);
   let credentialBusySource = $state<string | null>(null);
+  let credentialMutation = $state<{
+    sourceId: string;
+    kind: "save" | "clear";
+  } | null>(null);
   let graphqlCredentialBusySourceIds = $state<string[]>([]);
+  let graphqlCredentialMutationSourceIds = $state<string[]>([]);
   let mcpCredentialBusySourceIds = $state<string[]>([]);
+  let mcpCredentialMutationSourceIds = $state<string[]>([]);
   let oauthBusySourceIds = $state<string[]>([]);
-  let oauthCallbackCheckKey = $state<string | null>(null);
-  let oauthCallbackCheckedSourceIds = $state<string[]>([]);
-  let handledZeroSourceCallbackKey: string | null = null;
+  let oauthMutationSourceIds = $state<string[]>([]);
+  let oauthCallbackCheck = $state<{
+    identity: string;
+    checkedSourceIds: string[];
+  } | null>(null);
+  let handledUnmatchedCallbackIdentity: string | null = null;
   let credentialFailure = $state<{ sourceId: string; error: ApiError } | null>(null);
   let credentialCleanup: (() => void) | null = null;
   let credentialCounter = 0;
@@ -103,7 +138,47 @@
   let importNotice = $state<string | null>(null);
   let previewBusy = $state(false);
   let createBusy = $state(false);
-  let oauthCallbackKey = $derived(oauthCallbackRefreshKey(page.url.searchParams));
+  let sourceCreateState = $state(emptySourceCreateState());
+  let navigationNotice = $state<string | null>(null);
+  let sourceListGeneration = 0;
+  let activeSourceListRequest: {
+    cancel: () => void;
+    generation: number;
+    refreshKey: number;
+  } | null = null;
+  let lifetime = 0;
+  let oauthUrl = $derived(oauthNavigation?.url ?? page.url);
+  let oauthCallbackKey = $derived(oauthCallbackRefreshKey(oauthUrl.searchParams));
+  let eligibleOAuthSourceIds = $derived(
+    resource.data?.sources
+      .filter(
+        (source) =>
+          source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http",
+      )
+      .map((source) => source.id)
+      .sort() ?? [],
+  );
+  let eligibleOAuthSourceIdentity = $derived(
+    `${resource.data?.catalogRevision ?? "loading"}:${
+      resource.data?.sources
+        .filter((source) => eligibleOAuthSourceIds.includes(source.id))
+        .map((source) => `${source.id}:${source.revision}:${source.catalogRevision}`)
+        .sort()
+        .join("\u0000") ?? ""
+    }`,
+  );
+  let sourceCreateDispatching = $derived(sourceCreateState.phase === "dispatching");
+  let sourceCreateLocked = $derived(sourceCreateState.phase !== "idle");
+  let sourceWritePending = $derived(
+    sourceCreateDispatching ||
+      pending.some(
+        (id) => id.startsWith("mode:") || id.startsWith("refresh:") || id.startsWith("delete:"),
+      ) ||
+      credentialMutation !== null ||
+      graphqlCredentialMutationSourceIds.length > 0 ||
+      mcpCredentialMutationSourceIds.length > 0 ||
+      oauthMutationSourceIds.length > 0,
+  );
   let previewCurrent = $derived(
     preview !== null && previewFingerprint === currentSpecFingerprint(),
   );
@@ -119,24 +194,35 @@
     remove: (sourceId, credentialKey, input, signal) =>
       deleteOAuthConnection(sourceId, credentialKey, input, undefined, signal),
   };
+  const sourceCreateCoordinator = createSourceCreateCoordinator({
+    environment: {
+      getStorage: () => sourceCreateEnvironment.getStorage(),
+      fillRandom: (bytes) => sourceCreateEnvironment.fillRandom(bytes),
+      wait: (milliseconds, signal) => sourceCreateEnvironment.wait(milliseconds, signal),
+    },
+    create: dispatchSourceCreate,
+    lookup: (key, signal) => getSourceCreationResolution(key, undefined, signal),
+    seal: (key, signal) => sealMissingSourceCreation(key, undefined, signal),
+    refresh: refreshSourcesAfterCreate,
+    onstatechange: (state) => {
+      sourceCreateState = state;
+      if (state.error !== null) {
+        auth.recoverFromApiError(state.error);
+        void focusSourceCreateStatus();
+      }
+    },
+    oncompleted: connectedSource,
+  });
+
+  beforeNavigate(({ cancel }) => {
+    if (allowSourceExit()) return;
+    cancel();
+  });
 
   $effect(() => {
-    const requestKey = String(refreshKey);
-    resource = beginResourceLoad(untrack(() => resource));
-    return latest.start(
-      async (signal) => ({ requestKey, result: await listSources(undefined, signal) }),
-      ({ requestKey: completedKey, result }) => {
-        if (completedKey !== String(refreshKey)) return;
-        if (!result.ok && auth.recoverFromApiError(result.error)) return;
-        resource = settleResourceLoad(resource, result);
-      },
-      () => {
-        resource = settleResourceLoad(resource, {
-          ok: false,
-          error: unexpectedRequestError(),
-        });
-      },
-    );
+    const currentRefreshKey = refreshKey;
+    const request = untrack(() => startSourceListLoad(currentRefreshKey));
+    return request.cancel;
   });
 
   $effect(() => {
@@ -144,13 +230,7 @@
     const sourceData = resource.data;
     const sourceLoading = resource.loading;
     const sourceError = resource.error;
-    if (
-      callbackKey === null ||
-      sourceData === null ||
-      sourceLoading ||
-      sourceError !== null ||
-      handledZeroSourceCallbackKey === callbackKey
-    )
+    if (callbackKey === null || sourceData === null || sourceLoading || sourceError !== null)
       return;
     const notice = oauthCallbackNoticeWithoutEligibleSources(
       callbackKey,
@@ -158,15 +238,26 @@
       sourceLoading,
     );
     if (notice === null) return;
-    handledZeroSourceCallbackKey = callbackKey;
-    importNotice = notice.message;
-    consumeOAuthCallback();
-    focusSourceStatus();
+    void showUnmatchedOAuthCallback(callbackKey, eligibleOAuthSourceIdentity, notice.message);
   });
 
-  $effect(() => () => {
-    for (const controller of mutationControllers.values()) controller.abort();
-    credentialCleanup?.();
+  $effect(() => {
+    if (!sourceWritePending) navigationNotice = null;
+  });
+
+  $effect(() => {
+    void sourceCreateCoordinator.recoverStored();
+  });
+
+  $effect(() => {
+    lifetime += 1;
+    return () => {
+      lifetime += 1;
+      activeSourceListRequest?.cancel();
+      for (const controller of mutationControllers.values()) controller.abort();
+      credentialCleanup?.();
+      sourceCreateCoordinator.dispose();
+    };
   });
 
   async function persistSourceMode(sourceId: string, mode: ToolMode | null, revision: number) {
@@ -267,36 +358,32 @@
   }
 
   async function createSource() {
-    if (!previewCurrent || displayName.trim() === "") return;
+    if (!previewCurrent || sourceCreateLocked || displayName.trim() === "") return;
     const credentials = buildCredentialMap(importCredentialRows);
     if (credentials === null) return;
-    const submissionFingerprint = currentImportFingerprint();
-    const controller = beginMutation("openapi-create");
+    const owner = lifetime;
     createBusy = true;
     importError = null;
-    const result = await createOpenApiSource(
-      {
-        kind: "openapi",
-        displayName: displayName.trim(),
-        ...(preferredSlug.trim() ? { preferredSlug: preferredSlug.trim() } : {}),
-        ...(sourceDescription.trim() ? { description: sourceDescription.trim() } : {}),
-        spec: currentSpec(),
-        allowPrivateNetwork,
-        ...(Object.keys(credentials).length === 0 ? {} : { credential: { schemes: credentials } }),
-      },
-      undefined,
-      controller.signal,
-    );
-    if (!finishMutation("openapi-create", controller)) return;
+    const input = {
+      kind: "openapi",
+      displayName: displayName.trim(),
+      ...(preferredSlug.trim() ? { preferredSlug: preferredSlug.trim() } : {}),
+      ...(sourceDescription.trim() ? { description: sourceDescription.trim() } : {}),
+      spec: currentSpec(),
+      allowPrivateNetwork,
+      ...(Object.keys(credentials).length === 0 ? {} : { credential: { schemes: credentials } }),
+    } satisfies SourceCreateInput;
+    importCredentialRows = importCredentialRows.map((row) => ({ ...row, value: "" }));
+    const result = await sourceCreateCoordinator.start(input);
+    if (owner !== lifetime) return;
     createBusy = false;
     if (!result.ok) {
       if (auth.recoverFromApiError(result.error)) return;
       importError = result.error;
+      await focusImportError();
       return;
     }
-    importNotice = `${result.value.displayName} was imported with ${result.value.toolCount} tools.`;
-    if (submissionFingerprint === currentImportFingerprint()) clearImportForm();
-    refreshKey += 1;
+    clearImportForm();
   }
 
   async function refreshSource(sourceId: string) {
@@ -315,12 +402,14 @@
   }
 
   function openCredentialEditor(sourceId: string) {
+    if (credentialBusySource !== null) return;
     if (credentialEditorSource === sourceId) {
       clearCredentialEditor();
       return;
     }
     runCredentialOperation(
       sourceId,
+      "load",
       (signal) => getOpenApiCredentials(sourceId, undefined, signal),
       (result) => {
         if (!result.ok) {
@@ -341,12 +430,14 @@
   }
 
   function saveCredentials(sourceId: string) {
-    if (credentialRevision === null || credentialRows.length === 0) return;
+    if (credentialBusySource !== null || credentialRevision === null || credentialRows.length === 0)
+      return;
     const credentials = buildCredentialMap(credentialRows);
     if (credentials === null) return;
     const expectedRevision = credentialRevision;
     runCredentialOperation(
       sourceId,
+      "save",
       (signal) => putOpenApiCredentials(sourceId, expectedRevision, credentials, undefined, signal),
       (result) => {
         if (!result.ok) {
@@ -369,10 +460,11 @@
   }
 
   function clearCredentials(sourceId: string) {
-    if (credentialRevision === null) return;
+    if (credentialBusySource !== null || credentialRevision === null) return;
     const expectedRevision = credentialRevision;
     runCredentialOperation(
       sourceId,
+      "clear",
       (signal) => deleteOpenApiCredentials(sourceId, expectedRevision, undefined, signal),
       (result) => {
         if (!result.ok) {
@@ -396,6 +488,7 @@
 
   function runCredentialOperation<Value>(
     sourceId: string,
+    kind: "load" | "save" | "clear",
     task: (signal: AbortSignal) => Promise<Value>,
     commit: (value: Value) => void,
   ) {
@@ -403,16 +496,19 @@
     conflictNotice = null;
     importNotice = null;
     credentialBusySource = sourceId;
+    credentialMutation = kind === "load" ? null : { sourceId, kind };
     credentialCleanup = credentialRequest.start(
       task,
       (value) => {
         credentialBusySource = null;
+        credentialMutation = null;
         credentialCleanup = null;
         credentialFailure = null;
         commit(value);
       },
       () => {
         credentialBusySource = null;
+        credentialMutation = null;
         credentialCleanup = null;
         credentialFailure = { sourceId, error: unexpectedRequestError() };
       },
@@ -424,6 +520,7 @@
     credentialCleanup?.();
     credentialCleanup = null;
     credentialBusySource = null;
+    credentialMutation = null;
     credentialEditorSource = null;
     confirmingCredentialClear = null;
     credentialFailure = null;
@@ -436,6 +533,11 @@
 
   function focusSourceStatus() {
     void tick().then(() => document.getElementById("source-status")?.focus());
+  }
+
+  async function focusImportError() {
+    await tick();
+    document.getElementById("source-import-error")?.focus();
   }
 
   async function beginDelete(sourceId: string) {
@@ -478,10 +580,12 @@
   }
 
   function addCredentialRow() {
+    if (credentialBusySource !== null) return;
     credentialRows = [...credentialRows, credentialRow("", "api_key", true)];
   }
 
   async function removeCredentialRow(key: string, sourceId: string) {
+    if (credentialBusySource !== null) return;
     const index = credentialRows.findIndex((row) => row.key === key);
     const remaining = credentialRows.filter((row) => row.key !== key);
     credentialRows = remaining;
@@ -495,12 +599,14 @@
   }
 
   async function beginCredentialClear(sourceId: string) {
+    if (credentialBusySource !== null) return;
     confirmingCredentialClear = sourceId;
     await tick();
     document.getElementById(`cancel-clear-credentials-${sourceId}`)?.focus();
   }
 
   async function cancelCredentialClear(sourceId: string) {
+    if (credentialBusySource !== null) return;
     confirmingCredentialClear = null;
     await tick();
     document.getElementById(`clear-credentials-${sourceId}`)?.focus();
@@ -522,10 +628,9 @@
   }
 
   function clearImportForm() {
+    if (sourceCreateLocked || createBusy) return;
     cancelMutation("openapi-preview");
-    cancelMutation("openapi-create");
     previewBusy = false;
-    createBusy = false;
     locatorType = "url";
     specUrl = "";
     specContent = "";
@@ -540,33 +645,45 @@
     importError = null;
   }
 
-  function currentImportFingerprint() {
-    return JSON.stringify({
-      spec: currentSpecFingerprint(),
-      displayName,
-      preferredSlug,
-      sourceDescription,
-      credentials: buildCredentialMap(importCredentialRows),
-    });
-  }
-
   function switchSourceType(next: "openapi" | "graphql" | "mcp_http" | "mcp_stdio") {
-    if (next === sourceType) return;
+    if (sourceCreateLocked || next === sourceType) return;
     if (sourceType === "openapi") clearImportForm();
     sourceType = next;
   }
 
   function connectedSource(source: SourceList["sources"][number]) {
     importNotice = `${source.displayName} connected with ${source.toolCount} tools.`;
-    refreshKey += 1;
+    if (sourceType === "openapi") clearImportForm();
+    else sourceFormGeneration += 1;
     focusSourceStatus();
   }
 
   function connectGraphqlSource(
     input: Parameters<typeof createGraphqlSource>[0],
-    signal: AbortSignal,
+    _signal: AbortSignal,
   ) {
-    return createGraphqlSource(input, undefined, signal);
+    return sourceCreateCoordinator.start(input);
+  }
+
+  function connectMcpHttpSource(
+    input: Parameters<typeof createMcpHttpSource>[0],
+    _signal: AbortSignal,
+  ) {
+    return sourceCreateCoordinator.start(input);
+  }
+
+  function connectMcpStdioSource(
+    input: Parameters<typeof createMcpStdioSource>[0],
+    _signal: AbortSignal,
+  ) {
+    return sourceCreateCoordinator.start(input);
+  }
+
+  function dispatchSourceCreate(input: SourceCreateInput, key: string, signal: AbortSignal) {
+    if (input.kind === "openapi") return createOpenApiSource(input, key, undefined, signal);
+    if (input.kind === "graphql") return createGraphqlSource(input, key, undefined, signal);
+    if (input.kind === "mcp_http") return createMcpHttpSource(input, key, undefined, signal);
+    return createMcpStdioSource(input, key, undefined, signal);
   }
 
   function loadGraphqlCredentials(sourceId: string, signal: AbortSignal) {
@@ -607,6 +724,7 @@
     return (
       resource.loading ||
       sourceMutationPending(sourceId) ||
+      credentialBusySource === sourceId ||
       graphqlCredentialBusySourceIds.includes(sourceId) ||
       mcpCredentialBusySourceIds.includes(sourceId) ||
       oauthBusySourceIds.includes(sourceId)
@@ -625,10 +743,22 @@
       : graphqlCredentialBusySourceIds.filter((candidate) => candidate !== sourceId);
   }
 
+  function setGraphqlCredentialMutation(sourceId: string, busy: boolean) {
+    graphqlCredentialMutationSourceIds = busy
+      ? [...new Set([...graphqlCredentialMutationSourceIds, sourceId])]
+      : graphqlCredentialMutationSourceIds.filter((candidate) => candidate !== sourceId);
+  }
+
   function setOAuthBusy(sourceId: string, busy: boolean) {
     oauthBusySourceIds = busy
       ? [...new Set([...oauthBusySourceIds, sourceId])]
       : oauthBusySourceIds.filter((candidate) => candidate !== sourceId);
+  }
+
+  function setOAuthMutation(sourceId: string, busy: boolean) {
+    oauthMutationSourceIds = busy
+      ? [...new Set([...oauthMutationSourceIds, sourceId])]
+      : oauthMutationSourceIds.filter((candidate) => candidate !== sourceId);
   }
 
   function setMcpCredentialBusy(sourceId: string, busy: boolean) {
@@ -637,30 +767,179 @@
       : mcpCredentialBusySourceIds.filter((candidate) => candidate !== sourceId);
   }
 
-  function consumeOAuthCallback() {
-    if (oauthCallbackKey === null) return;
-    replaceState(withoutOAuthCallbackParameters(page.url), page.state);
+  function setMcpCredentialMutation(sourceId: string, busy: boolean) {
+    mcpCredentialMutationSourceIds = busy
+      ? [...new Set([...mcpCredentialMutationSourceIds, sourceId])]
+      : mcpCredentialMutationSourceIds.filter((candidate) => candidate !== sourceId);
   }
 
-  function completeOAuthCallbackCheck(sourceId: string, matched: boolean) {
-    const callbackKey = oauthCallbackKey;
-    if (callbackKey === null) return;
-    if (oauthCallbackCheckKey !== callbackKey) {
-      oauthCallbackCheckKey = callbackKey;
-      oauthCallbackCheckedSourceIds = [];
+  function startSourceListLoad(requestRefreshKey: number, parentSignal?: AbortSignal) {
+    activeSourceListRequest?.cancel();
+    const controller = new AbortController();
+    const generation = ++sourceListGeneration;
+    const abortFromParent = () => controller.abort();
+    let cancelled = false;
+    if (parentSignal?.aborted) controller.abort();
+    else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    resource = beginResourceLoad(resource);
+
+    function cancel() {
+      if (cancelled) return;
+      cancelled = true;
+      parentSignal?.removeEventListener("abort", abortFromParent);
+      controller.abort();
+      if (generation === sourceListGeneration) sourceListGeneration += 1;
+      if (activeSourceListRequest?.generation === generation) activeSourceListRequest = null;
     }
-    if (matched) {
-      consumeOAuthCallback();
+
+    const result = listSources(undefined, controller.signal)
+      .then(
+        (response) => response,
+        () => ({ ok: false, error: unexpectedRequestError() }) as const,
+      )
+      .then((response) => {
+        parentSignal?.removeEventListener("abort", abortFromParent);
+        if (
+          controller.signal.aborted ||
+          generation !== sourceListGeneration ||
+          activeSourceListRequest?.generation !== generation ||
+          activeSourceListRequest.refreshKey !== requestRefreshKey
+        ) {
+          if (activeSourceListRequest?.generation === generation) activeSourceListRequest = null;
+          return null;
+        }
+        activeSourceListRequest = null;
+        if (!response.ok && auth.recoverFromApiError(response.error)) return null;
+        resource = settleResourceLoad(resource, response);
+        return response;
+      });
+    activeSourceListRequest = { cancel, generation, refreshKey: requestRefreshKey };
+    return { cancel, result };
+  }
+
+  function refreshSourcesAfterCreate(signal: AbortSignal) {
+    return startSourceListLoad(refreshKey, signal).result;
+  }
+
+  function allowSourceExit() {
+    if (!sourceWritePending) return true;
+    navigationNotice = sourceCreateDispatching
+      ? "A source connection is still being submitted. Wait for it to finish before leaving this page."
+      : "A source or credential change is still being saved. Wait for it to finish before leaving this page.";
+    void focusNavigationNotice();
+    return false;
+  }
+
+  function beforeSourceSignOut() {
+    if (!allowSourceExit()) return false;
+    return sourceCreateCoordinator.suspendForSignOut();
+  }
+
+  function sourceSignOutFailed() {
+    sourceCreateCoordinator.signOutFailed();
+    void focusSourceCreateStatus();
+  }
+
+  async function focusNavigationNotice() {
+    const message = navigationNotice;
+    await tick();
+    if (!sourceWritePending || navigationNotice !== message) return;
+    document.getElementById("source-navigation-status")?.focus();
+  }
+
+  async function focusSourceCreateStatus() {
+    await tick();
+    document.getElementById("source-create-status")?.focus();
+  }
+
+  async function resumeSourceCreate() {
+    const result = await sourceCreateCoordinator.resume();
+    if (result !== null && !result.ok) auth.recoverFromApiError(result.error);
+  }
+
+  function guardBeforeUnload(event: BeforeUnloadEvent) {
+    if (!sourceWritePending) return;
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function consumeOAuthCallback(expectedKey: string, expectedSourceIdentity: string) {
+    if (
+      oauthCallbackKey !== expectedKey ||
+      eligibleOAuthSourceIdentity !== expectedSourceIdentity
+    ) {
       return;
     }
-    oauthCallbackCheckedSourceIds = [...new Set([...oauthCallbackCheckedSourceIds, sourceId])];
-    const eligibleSourceCount =
-      resource.data?.sources.filter(
-        (source) =>
-          source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http",
-      ).length ?? 0;
-    if (eligibleSourceCount > 0 && oauthCallbackCheckedSourceIds.length >= eligibleSourceCount) {
-      consumeOAuthCallback();
+    const nextUrl = withoutOAuthCallbackParameters(oauthUrl);
+    const currentState = oauthNavigation?.state ?? page.state;
+    if (oauthNavigation !== undefined) oauthNavigation.replaceState(nextUrl, currentState);
+    else replaceState(nextUrl, currentState);
+  }
+
+  async function showUnmatchedOAuthCallback(
+    callbackKey: string,
+    sourceIdentity: string,
+    message: string,
+  ) {
+    const completionIdentity = `${callbackKey}:${sourceIdentity}`;
+    if (
+      oauthCallbackKey !== callbackKey ||
+      eligibleOAuthSourceIdentity !== sourceIdentity ||
+      handledUnmatchedCallbackIdentity === completionIdentity
+    ) {
+      return;
+    }
+    handledUnmatchedCallbackIdentity = completionIdentity;
+    const owner = lifetime;
+    importNotice = message;
+    await tick();
+    if (
+      owner !== lifetime ||
+      oauthCallbackKey !== callbackKey ||
+      eligibleOAuthSourceIdentity !== sourceIdentity
+    ) {
+      if (handledUnmatchedCallbackIdentity === completionIdentity) {
+        handledUnmatchedCallbackIdentity = null;
+      }
+      return;
+    }
+    document.getElementById("source-status")?.focus();
+    consumeOAuthCallback(callbackKey, sourceIdentity);
+  }
+
+  function completeOAuthCallbackCheck(
+    sourceId: string,
+    matched: boolean,
+    callbackKey: string | null,
+    sourceIdentity: string,
+  ) {
+    if (
+      callbackKey === null ||
+      oauthCallbackKey !== callbackKey ||
+      eligibleOAuthSourceIdentity !== sourceIdentity ||
+      resource.loading ||
+      resource.error !== null ||
+      !eligibleOAuthSourceIds.includes(sourceId)
+    ) {
+      return;
+    }
+    if (matched) {
+      consumeOAuthCallback(callbackKey, sourceIdentity);
+      return;
+    }
+    const checkIdentity = `${callbackKey}:${sourceIdentity}`;
+    const currentCheckedIds =
+      oauthCallbackCheck?.identity === checkIdentity
+        ? oauthCallbackCheck.checkedSourceIds.filter((id) => eligibleOAuthSourceIds.includes(id))
+        : [];
+    const checkedSourceIds = [...new Set([...currentCheckedIds, sourceId])];
+    oauthCallbackCheck = { identity: checkIdentity, checkedSourceIds };
+    if (
+      eligibleOAuthSourceIds.length > 0 &&
+      eligibleOAuthSourceIds.every((id) => checkedSourceIds.includes(id))
+    ) {
+      const notice = oauthCallbackOutcomeNotice(callbackKey, false);
+      void showUnmatchedOAuthCallback(callbackKey, sourceIdentity, notice.message);
     }
   }
 
@@ -700,6 +979,10 @@
     document.getElementById(`apply-source-mode-${sourceId}`)?.focus();
   }
 
+  function mutationIsCurrent(id: string, controller: AbortController) {
+    return mutationControllers.get(id) === controller && !controller.signal.aborted;
+  }
+
   function finishMutation(id: string, controller: AbortController) {
     if (mutationControllers.get(id) !== controller) return false;
     mutationControllers.delete(id);
@@ -729,10 +1012,34 @@
   }
 </script>
 
+<svelte:window onbeforeunload={guardBeforeUnload} />
+
 <DashboardShell
   title="Sources"
   description="Connect MCP servers and OpenAPI services to one global tool catalog."
+  beforeSignOut={beforeSourceSignOut}
+  onSignOutFailed={sourceSignOutFailed}
 >
+  {#if navigationNotice !== null}
+    <div id="source-navigation-status" class="notice warning" role="status" tabindex="-1">
+      {navigationNotice}
+    </div>
+  {/if}
+  {#if sourceCreateState.phase !== "idle" && sourceCreateState.notice !== null}
+    <div class="notice warning" role="status">{sourceCreateState.notice}</div>
+  {/if}
+  {#if sourceCreateState.error !== null || (sourceCreateState.phase === "paused" && sourceCreateState.retry !== null)}
+    <div id="source-create-status" tabindex="-1">
+      {#if sourceCreateState.error !== null}<ErrorNotice error={sourceCreateState.error} />{/if}
+      {#if sourceCreateState.phase === "blocked"}
+        <button type="button" onclick={resumeSourceCreate}>
+          {sourceCreateState.retry === "dispatch" ? "Retry exact request" : "Check again"}
+        </button>
+      {:else if sourceCreateState.phase === "paused" && sourceCreateState.retry !== null}
+        <button type="button" onclick={resumeSourceCreate}>Resume source recovery</button>
+      {/if}
+    </div>
+  {/if}
   {#if conflictNotice !== null}
     <div id="source-conflict" class="notice warning" role="status" tabindex="-1">
       {conflictNotice}
@@ -744,7 +1051,7 @@
 
   <details class="surface import-panel" open={resource.data?.sources.length === 0}>
     <summary>Connect a source</summary>
-    <fieldset class="mode-control source-type-picker">
+    <fieldset class="mode-control source-type-picker" disabled={sourceCreateLocked}>
       <legend>Source type</legend>
       <label>
         <input
@@ -789,7 +1096,7 @@
     </fieldset>
     {#if sourceType === "openapi"}
       <form class="import-form" onsubmit={previewSource}>
-        <fieldset class="mode-control">
+        <fieldset class="mode-control" disabled={sourceCreateLocked || createBusy}>
           <legend>Specification location</legend>
           <label
             ><input type="radio" name="locator" value="url" bind:group={locatorType} />URL</label
@@ -804,6 +1111,7 @@
             >OpenAPI URL<input
               type="url"
               required
+              disabled={sourceCreateLocked || createBusy}
               bind:value={specUrl}
               placeholder="https://api.example.com/openapi.json"
             /></label
@@ -812,6 +1120,7 @@
           <label
             >OpenAPI JSON or YAML<textarea
               required
+              disabled={sourceCreateLocked || createBusy}
               rows="10"
               bind:value={specContent}
               placeholder="openapi: 3.1.0"></textarea></label
@@ -820,6 +1129,7 @@
         <label class="checkbox-label private-network-choice">
           <input
             type="checkbox"
+            disabled={sourceCreateLocked || createBusy}
             bind:checked={allowPrivateNetwork}
             aria-describedby="private-network-help"
           />
@@ -828,15 +1138,17 @@
         <p class="field-help" id="private-network-help">
           Keep this off unless the specification or API intentionally runs on your local network.
         </p>
-        <button type="submit" disabled={previewBusy || createBusy}
+        <button type="submit" disabled={previewBusy || sourceCreateLocked}
           >{previewBusy ? "Inspecting..." : "Preview tools"}</button
         >
-        <button type="button" disabled={previewBusy || createBusy} onclick={clearImportForm}
+        <button type="button" disabled={previewBusy || sourceCreateLocked} onclick={clearImportForm}
           >Reset importer</button
         >
       </form>
 
-      {#if importError !== null}<ErrorNotice error={importError} />{/if}
+      {#if importError !== null}<div id="source-import-error" tabindex="-1">
+          <ErrorNotice error={importError} />
+        </div>{/if}
       {#if preview !== null}
         <form
           class="preview-panel"
@@ -868,6 +1180,7 @@
             <label
               >Source name<input
                 required
+                disabled={sourceCreateLocked || createBusy}
                 value={displayName}
                 oninput={(event) => {
                   displayName = event.currentTarget.value;
@@ -877,12 +1190,16 @@
             >
             <label
               >Slug (optional)<input
+                disabled={sourceCreateLocked || createBusy}
                 bind:value={preferredSlug}
                 placeholder="generated from name"
               /></label
             >
             <label class="wide-field"
-              >Description (optional)<input bind:value={sourceDescription} /></label
+              >Description (optional)<input
+                disabled={sourceCreateLocked || createBusy}
+                bind:value={sourceDescription}
+              /></label
             >
             {#if preview.securitySchemes.length > 0}
               <fieldset class="credential-schemes wide-field">
@@ -899,7 +1216,7 @@
                     <label class="checkbox-label">
                       <input
                         type="checkbox"
-                        disabled={row === undefined}
+                        disabled={sourceCreateLocked || createBusy || row === undefined}
                         checked={row?.enabled ?? false}
                         onchange={(event) => {
                           if (row !== undefined) row.enabled = event.currentTarget.checked;
@@ -917,6 +1234,7 @@
                       {#if row.credentialType === "basic"}<label
                           >Username<input
                             required
+                            disabled={sourceCreateLocked || createBusy}
                             bind:value={row.username}
                             autocomplete="off"
                           /></label
@@ -925,6 +1243,7 @@
                         >{credentialTypeLabel(row.credentialType)}<input
                           required
                           type="password"
+                          disabled={sourceCreateLocked || createBusy}
                           bind:value={row.value}
                           autocomplete="off"
                         /></label
@@ -946,7 +1265,7 @@
             class="primary"
             disabled={!previewCurrent ||
               previewBusy ||
-              createBusy ||
+              sourceCreateLocked ||
               displayName.trim() === "" ||
               buildCredentialMap(importCredentialRows) === null}
           >
@@ -962,11 +1281,17 @@
         </form>
       {/if}
     {:else if sourceType === "graphql"}
-      <GraphqlSourceForm create={connectGraphqlSource} oncreated={connectedSource} />
+      {#key sourceFormGeneration}
+        <GraphqlSourceForm create={connectGraphqlSource} disabled={sourceCreateLocked} />
+      {/key}
     {:else if sourceType === "mcp_http"}
-      <McpHttpSourceForm oncreated={connectedSource} />
+      {#key sourceFormGeneration}
+        <McpHttpSourceForm create={connectMcpHttpSource} disabled={sourceCreateLocked} />
+      {/key}
     {:else}
-      <McpStdioSourceForm oncreated={connectedSource} />
+      {#key sourceFormGeneration}
+        <McpStdioSourceForm create={connectMcpStdioSource} disabled={sourceCreateLocked} />
+      {/key}
     {/if}
   </details>
 
@@ -1212,6 +1537,7 @@
                   oauthBusySourceIds.includes(source.id) ||
                   graphqlCredentialBusySourceIds.includes(source.id)}
                 onbusychange={(busy) => setMcpCredentialBusy(source.id, busy)}
+                onmutationchange={(busy) => setMcpCredentialMutation(source.id, busy)}
               />
             {/if}
             {#if source.kind === "graphql"}
@@ -1223,20 +1549,35 @@
                   oauthBusySourceIds.includes(source.id) ||
                   mcpCredentialBusySourceIds.includes(source.id)}
                 onbusychange={(busy) => setGraphqlCredentialBusy(source.id, busy)}
+                onmutationchange={(busy) => setGraphqlCredentialMutation(source.id, busy)}
               />
             {/if}
             {#if source.kind === "openapi" || source.kind === "graphql" || source.kind === "mcp_http"}
-              <OAuthSourceConnections
-                {source}
-                operations={oauthOperations}
-                callbackRefreshKey={oauthCallbackKey}
-                disabled={sourceMutationPending(source.id) ||
-                  graphqlCredentialBusySourceIds.includes(source.id) ||
-                  mcpCredentialBusySourceIds.includes(source.id) ||
-                  credentialBusySource === source.id}
-                onbusychange={(busy) => setOAuthBusy(source.id, busy)}
-                oncallbackchecked={(matched) => completeOAuthCallbackCheck(source.id, matched)}
-              />
+              {@const oauthCheckContext = {
+                callbackKey: oauthCallbackKey,
+                sourceIdentity: eligibleOAuthSourceIdentity,
+              }}
+              {#key `${source.id}:${source.revision}:${source.catalogRevision}`}
+                <OAuthSourceConnections
+                  {source}
+                  sourceIdentity={source.id}
+                  operations={oauthOperations}
+                  callbackRefreshKey={oauthCheckContext.callbackKey}
+                  disabled={sourceMutationPending(source.id) ||
+                    graphqlCredentialBusySourceIds.includes(source.id) ||
+                    mcpCredentialBusySourceIds.includes(source.id) ||
+                    credentialBusySource === source.id}
+                  onbusychange={(busy) => setOAuthBusy(source.id, busy)}
+                  onmutationchange={(busy) => setOAuthMutation(source.id, busy)}
+                  oncallbackchecked={(matched) =>
+                    completeOAuthCallbackCheck(
+                      source.id,
+                      matched,
+                      oauthCheckContext.callbackKey,
+                      oauthCheckContext.sourceIdentity,
+                    )}
+                />
+              {/key}
             {/if}
             {#if confirmingDelete === source.id}
               <div class="inline-confirm" role="group" aria-label={`Delete ${source.displayName}`}>
@@ -1293,7 +1634,7 @@
                 <p>Existing values are hidden. Re-enter every credential you want to keep.</p>
               </div>
               {#each credentialRows as row (row.key)}
-                <fieldset class="credential-row">
+                <fieldset class="credential-row" disabled={credentialBusySource === source.id}>
                   <legend>Credential</legend>
                   <label
                     >Security scheme name<input
@@ -1365,7 +1706,10 @@
                     currentDuplicateCredentialNames.length > 0}
                   aria-describedby={currentDuplicateCredentialNames.length > 0
                     ? `credential-errors-${source.id}`
-                    : undefined}>Save replacement</button
+                    : undefined}
+                  >{credentialMutation?.sourceId === source.id && credentialMutation.kind === "save"
+                    ? "Saving..."
+                    : "Save replacement"}</button
                 >
                 {#if currentDuplicateCredentialNames.length > 0}<p
                     id={`credential-errors-${source.id}`}
@@ -1399,6 +1743,7 @@
                     id={`clear-credentials-${source.id}`}
                     type="button"
                     class="danger-link"
+                    disabled={credentialBusySource !== null}
                     onclick={() => beginCredentialClear(source.id)}>Clear all credentials</button
                   >
                 {/if}

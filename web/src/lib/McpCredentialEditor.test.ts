@@ -14,6 +14,26 @@ function deferred<Value>() {
   return { promise, resolve };
 }
 
+function deferredDecodedResponse() {
+  const response = deferred<Response>();
+  const settled = deferred<void>();
+  return {
+    promise: response.promise,
+    settled: settled.promise,
+    resolve(value: unknown) {
+      const decodedResponse = Response.json(value);
+      const read = decodedResponse.text.bind(decodedResponse);
+      decodedResponse.text = async () => {
+        const text = await read();
+        // The next task starts after API decoding and component promise continuations settle.
+        setTimeout(() => settled.resolve(undefined), 0);
+        return text;
+      };
+      response.resolve(decodedResponse);
+    },
+  };
+}
+
 function source(kind: "mcp_http" | "mcp_stdio"): Source {
   return {
     id: `${kind}-source`,
@@ -44,14 +64,67 @@ afterEach(() => {
 });
 
 describe("MCP credential editor", () => {
-  it("reports busy state and aborts an in-flight save when externally disabled", async () => {
-    const replacement = deferred<Response>();
+  it("preserves an unsaved HTTP secret across a temporary disabled state", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        revision: 4,
+        configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const mounted = render(McpCredentialEditor, { source: source("mcp_http") });
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    const token = await screen.findByLabelText<HTMLInputElement>("Bearer token");
+    await fireEvent.input(token, { target: { value: "still-unsaved" } });
+
+    await mounted.rerender({ source: source("mcp_http"), disabled: true });
+    await waitFor(() => expect(token.closest("fieldset")?.hasAttribute("disabled")).toBe(true));
+    expect(token.value).toBe("still-unsaved");
+
+    await mounted.rerender({ source: source("mcp_http"), disabled: false });
+    await waitFor(() => expect(token.closest("fieldset")?.hasAttribute("disabled")).toBe(false));
+    expect(token.value).toBe("still-unsaved");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("preserves an unsaved stdio secret across a temporary disabled state", async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/credentials")) {
+        return Response.json({
+          revision: 9,
+          configuredSchemes: [{ name: "TOKEN", credentialType: "secret_env" }],
+        });
+      }
+      return Response.json({ templates: [{ name: "github", secretFields: ["TOKEN"] }] });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const mounted = render(McpCredentialEditor, { source: source("mcp_stdio") });
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    const secret = await screen.findByLabelText<HTMLInputElement>("TOKEN");
+    await fireEvent.input(secret, { target: { value: "still-unsaved" } });
+
+    await mounted.rerender({ source: source("mcp_stdio"), disabled: true });
+    await waitFor(() => expect(secret.closest("fieldset")?.hasAttribute("disabled")).toBe(true));
+    expect(secret.value).toBe("still-unsaved");
+
+    await mounted.rerender({ source: source("mcp_stdio"), disabled: false });
+    await waitFor(() => expect(secret.closest("fieldset")?.hasAttribute("disabled")).toBe(false));
+    expect(secret.value).toBe("still-unsaved");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts a submitted secret, reloads metadata, and ignores the late save completion", async () => {
+    const saveA = deferredDecodedResponse();
+    const reloadB = deferredDecodedResponse();
     const request = { signal: null as AbortSignal | null };
+    let metadataRequests = 0;
     const onbusychange = vi.fn();
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>((_input, init) => {
         if (init?.method !== "PUT") {
+          metadataRequests += 1;
+          if (metadataRequests === 2) return reloadB.promise;
           return Promise.resolve(
             Response.json({
               revision: 4,
@@ -60,7 +133,7 @@ describe("MCP credential editor", () => {
           );
         }
         request.signal = init.signal ?? null;
-        return replacement.promise;
+        return saveA.promise;
       }),
     );
     const mounted = render(McpCredentialEditor, {
@@ -69,10 +142,11 @@ describe("MCP credential editor", () => {
     });
     await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
     const token = await screen.findByLabelText<HTMLInputElement>("Bearer token");
+    onbusychange.mockClear();
     await fireEvent.input(token, { target: { value: "must-be-cleared" } });
     await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
     await waitFor(() => expect(request.signal).not.toBeNull());
-    expect(onbusychange).toHaveBeenCalledWith(true);
+    await waitFor(() => expect(onbusychange.mock.calls).toEqual([[true]]));
 
     await mounted.rerender({
       source: source("mcp_http"),
@@ -80,8 +154,133 @@ describe("MCP credential editor", () => {
       onbusychange,
     });
     await waitFor(() => expect(request.signal?.aborted).toBe(true));
-    expect(screen.getByLabelText<HTMLInputElement>("Bearer token").value).toBe("");
-    await waitFor(() => expect(onbusychange).toHaveBeenLastCalledWith(false));
+    await waitFor(() => expect(screen.queryByLabelText("Bearer token")).toBeNull());
+    await waitFor(() => expect(onbusychange.mock.calls).toEqual([[true], [false]]));
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Save replacement" }).disabled,
+    ).toBe(true);
+
+    await mounted.rerender({
+      source: source("mcp_http"),
+      disabled: false,
+      onbusychange,
+    });
+    await waitFor(() => expect(metadataRequests).toBe(2));
+    await waitFor(() => expect(onbusychange.mock.calls).toEqual([[true], [false], [true]]));
+    reloadB.resolve({
+      revision: 8,
+      configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+    });
+    await reloadB.settled;
+    const reloadedToken = await screen.findByLabelText<HTMLInputElement>("Bearer token");
+    expect(reloadedToken.value).toBe("");
+    await waitFor(() =>
+      expect(onbusychange.mock.calls).toEqual([[true], [false], [true], [false]]),
+    );
+
+    saveA.resolve({
+      revision: 5,
+      configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+    });
+    await saveA.settled;
+    expect(screen.getByRole("button", { name: "Close credentials" })).toBeDefined();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(onbusychange.mock.calls).toEqual([[true], [false], [true], [false]]);
+  });
+
+  it("reports only MCP credential writes as mutations and clears the fence on unmount", async () => {
+    const saveResponse = deferredDecodedResponse();
+    const request = { signal: null as AbortSignal | null };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((_input, init) => {
+        if (init?.method === "PUT") {
+          request.signal = init.signal ?? null;
+          return saveResponse.promise;
+        }
+        return Promise.resolve(
+          Response.json({
+            revision: 4,
+            configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+          }),
+        );
+      }),
+    );
+    const onmutationchange = vi.fn();
+    const mounted = render(McpCredentialEditor, {
+      source: source("mcp_http"),
+      onmutationchange,
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    const token = await screen.findByLabelText<HTMLInputElement>("Bearer token");
+    expect(onmutationchange).not.toHaveBeenCalled();
+    await fireEvent.input(token, { target: { value: "pending-secret" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
+    await waitFor(() => expect(onmutationchange).toHaveBeenLastCalledWith(true));
+
+    mounted.unmount();
+    expect(request.signal?.aborted).toBe(true);
+    expect(onmutationchange).toHaveBeenLastCalledWith(false);
+    saveResponse.resolve({
+      revision: 5,
+      configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+    });
+    await saveResponse.settled;
+  });
+
+  it("retries an aborted metadata load and ignores its late completion", async () => {
+    const loadA = deferredDecodedResponse();
+    const retryB = deferredDecodedResponse();
+    const requests: AbortSignal[] = [];
+    const onbusychange = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((_input, init) => {
+        if (init?.signal instanceof AbortSignal) requests.push(init.signal);
+        return requests.length === 1 ? loadA.promise : retryB.promise;
+      }),
+    );
+    const mounted = render(McpCredentialEditor, {
+      source: source("mcp_http"),
+      onbusychange,
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    await waitFor(() => expect(onbusychange.mock.calls).toEqual([[true]]));
+
+    await mounted.rerender({
+      source: source("mcp_http"),
+      disabled: true,
+      onbusychange,
+    });
+    await waitFor(() => expect(requests[0]?.aborted).toBe(true));
+    await waitFor(() => expect(onbusychange.mock.calls).toEqual([[true], [false]]));
+
+    await mounted.rerender({
+      source: source("mcp_http"),
+      disabled: false,
+      onbusychange,
+    });
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(screen.queryByLabelText("Username")).toBeNull();
+
+    retryB.resolve({
+      revision: 7,
+      configuredSchemes: [{ name: "authorization", credentialType: "bearer" }],
+    });
+    await retryB.settled;
+    await screen.findByLabelText("Bearer token");
+    expect(onbusychange.mock.calls).toEqual([[true], [false], [true], [false]]);
+
+    loadA.resolve({
+      revision: 3,
+      configuredSchemes: [{ name: "authorization", credentialType: "basic" }],
+    });
+    await loadA.settled;
+    expect(screen.queryByLabelText("Username")).toBeNull();
+    expect(screen.getByLabelText("Bearer token")).toBeDefined();
+    expect(onbusychange.mock.calls).toEqual([[true], [false], [true], [false]]);
   });
 
   it("replaces HTTP API-key auth with the viewed CAS revision", async () => {

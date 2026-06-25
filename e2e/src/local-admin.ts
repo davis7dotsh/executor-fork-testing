@@ -52,7 +52,13 @@ export class LocalAdminClient {
   }
 
   async createToken(name: string) {
-    return this.#json<LocalToken>("/api/v1/tokens", { method: "POST", body: { name } });
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const idempotencyKey = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return this.#json<LocalToken>("/api/v1/tokens", {
+      method: "POST",
+      body: { name },
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
   }
 
   async revokeToken(tokenId: string) {
@@ -61,6 +67,10 @@ export class LocalAdminClient {
 
   async createSource(input: unknown) {
     return this.#json<LocalSource>("/api/v1/sources", { method: "POST", body: input });
+  }
+
+  async listSources() {
+    return this.#json<{ readonly sources: readonly LocalSource[] }>("/api/v1/sources");
   }
 
   async deleteSource(sourceId: string) {
@@ -121,7 +131,11 @@ export class LocalAdminClient {
 
   async #json<Value>(
     path: string,
-    options: { readonly method?: string; readonly body?: unknown } = {},
+    options: {
+      readonly method?: string;
+      readonly body?: unknown;
+      readonly headers?: Readonly<Record<string, string>>;
+    } = {},
   ) {
     const response = await this.#request(path, options);
     return (await response.json()) as Value;
@@ -129,10 +143,18 @@ export class LocalAdminClient {
 
   async #request(
     path: string,
-    options: { readonly method?: string; readonly body?: unknown } = {},
+    options: {
+      readonly method?: string;
+      readonly body?: unknown;
+      readonly headers?: Readonly<Record<string, string>>;
+    } = {},
   ) {
     const method = options.method ?? "GET";
-    const headers = new Headers({ accept: "application/json", cookie: this.#cookie });
+    const headers = new Headers({
+      accept: "application/json",
+      cookie: this.#cookie,
+      ...options.headers,
+    });
     if (options.body !== undefined) headers.set("content-type", "application/json");
     if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
       headers.set("origin", new URL(this.#origin).origin);

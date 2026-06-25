@@ -14,7 +14,7 @@ import {
   inspectToolPath,
   normalizeCliErrorText,
   parseJsonObjectInput,
-} from "../apps/cli/src/tooling";
+} from "../legacy/cli/src/tooling";
 
 describe("CLI tooling helpers", () => {
   it.effect("parses empty input as an empty args object", () =>

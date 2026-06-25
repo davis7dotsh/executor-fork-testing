@@ -79,6 +79,16 @@ const SourceListSchema = Schema.Struct({
   catalogRevision: Schema.Number,
 });
 
+const SourceCreationStatusSchema = Schema.Struct({
+  status: Schema.Literals([
+    "missing",
+    "in_progress",
+    "abandoned",
+    "interrupted",
+    "expired_unknown",
+  ]),
+});
+
 const OAuthFlowSchema = Schema.Struct({
   authorizationUrl: Schema.NullOr(Schema.String),
   tokenUrl: Schema.NullOr(Schema.String),
@@ -343,6 +353,10 @@ export type CreatedToken = typeof CreatedTokenSchema.Type;
 export type ToolMode = typeof ToolModeSchema.Type;
 export type Source = typeof SourceSchema.Type;
 export type SourceList = typeof SourceListSchema.Type;
+export type SourceCreationStatus = (typeof SourceCreationStatusSchema.Type)["status"];
+export type SourceCreationResolution =
+  | { readonly kind: "status"; readonly status: SourceCreationStatus }
+  | { readonly kind: "replay"; readonly result: ApiResult<Source> };
 export type OpenApiPreview = typeof OpenApiPreviewSchema.Type;
 export type CatalogSyncResult = typeof CatalogSyncResultSchema.Type;
 export type OpenApiCredentialMetadata = typeof CredentialMetadataSchema.Type;
@@ -370,6 +384,34 @@ export type ApiResult<Value> =
   | { readonly ok: true; readonly value: Value }
   | { readonly ok: false; readonly error: ApiError };
 
+export type TokenCreateApiResult =
+  | {
+      readonly ok: true;
+      readonly value: CreatedToken;
+      readonly replayProvenance: "none" | "authoritative" | "invalid";
+      readonly responseDisposition: "authoritative" | "ambiguous";
+    }
+  | {
+      readonly ok: false;
+      readonly error: ApiError;
+      readonly replayProvenance: "none" | "authoritative" | "invalid";
+      readonly responseDisposition: "authoritative" | "ambiguous";
+    };
+
+export type SourceCreateApiResult =
+  | {
+      readonly ok: true;
+      readonly value: Source;
+      readonly replayProvenance: "none" | "authoritative" | "invalid";
+      readonly responseDisposition: "authoritative" | "ambiguous";
+    }
+  | {
+      readonly ok: false;
+      readonly error: ApiError;
+      readonly replayProvenance: "none" | "authoritative" | "invalid";
+      readonly responseDisposition: "authoritative" | "ambiguous";
+    };
+
 type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type ResponsePayload = { text: string; requestId: string | null };
 
@@ -379,6 +421,11 @@ const decodeCreatedToken = Schema.decodeUnknownOption(Schema.fromJsonString(Crea
 const decodeTokenList = Schema.decodeUnknownOption(Schema.fromJsonString(TokenListSchema));
 const decodeRawSource = Schema.decodeUnknownOption(Schema.fromJsonString(SourceSchema));
 const decodeRawSourceList = Schema.decodeUnknownOption(Schema.fromJsonString(SourceListSchema));
+const decodeSourceCreationStatusJson = Schema.decodeUnknownOption(
+  Schema.fromJsonString(SourceCreationStatusSchema),
+);
+const decodeSourceCreationStatus = (text: string) =>
+  decodeSourceCreationStatusJson(text, { onExcessProperty: "error" });
 const decodeSource = (text: string) => sanitizeDecodedSource(decodeRawSource(text));
 const decodeSourceList = (text: string) => {
   const decoded = decodeRawSourceList(text);
@@ -479,24 +526,25 @@ export async function listTokens(fetcher: Fetcher = fetch, signal?: AbortSignal)
   return { ok: true, value: [...decoded.value.tokens] } as const;
 }
 
-export async function createToken(name: string, fetcher: Fetcher = fetch, signal?: AbortSignal) {
-  const response = await request(
-    "/api/v1/tokens",
-    { method: "POST", body: JSON.stringify({ name }), signal },
-    fetcher,
-  );
-  if (!response.ok) return response;
-  return decodeResponse(response.value, decodeCreatedToken);
+export async function createToken(
+  name: string,
+  idempotencyKey: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  return tokenCreateRequest(name, idempotencyKey, fetcher, signal);
 }
 
 export async function revokeToken(tokenId: string, fetcher: Fetcher = fetch, signal?: AbortSignal) {
-  const response = await request(
-    `/api/v1/tokens/${encodeURIComponent(tokenId)}`,
-    { method: "DELETE", signal },
-    fetcher,
-  );
-  if (!response.ok) return response;
-  return { ok: true, value: undefined } as const;
+  const revoke = () =>
+    request(`/api/v1/tokens/${encodeURIComponent(tokenId)}`, { method: "DELETE", signal }, fetcher);
+  const first = await revoke();
+  if (!isAmbiguousRevokeResult(first) || signal?.aborted) {
+    return first.ok ? ({ ok: true, value: undefined } as const) : first;
+  }
+
+  const second = await revoke();
+  return second.ok ? ({ ok: true, value: undefined } as const) : second;
 }
 
 export async function listSources(fetcher: Fetcher = fetch, signal?: AbortSignal) {
@@ -623,44 +671,29 @@ export async function previewOpenApiSource(
 
 export async function createOpenApiSource(
   input: OpenApiSourceInput,
+  idempotencyKey: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
 ) {
-  const response = await request(
-    "/api/v1/sources",
-    { method: "POST", body: JSON.stringify(input), signal },
-    fetcher,
-  );
-  if (!response.ok) return response;
-  return decodeResponse(response.value, decodeSource);
+  return sourceCreateRequest(input, idempotencyKey, fetcher, signal);
 }
 
 export async function createMcpHttpSource(
   input: McpHttpSourceInput,
+  idempotencyKey: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
 ) {
-  const response = await request(
-    "/api/v1/sources",
-    { method: "POST", body: JSON.stringify(input), signal },
-    fetcher,
-  );
-  if (!response.ok) return response;
-  return decodeResponse(response.value, decodeSource);
+  return sourceCreateRequest(input, idempotencyKey, fetcher, signal);
 }
 
 export async function createGraphqlSource(
   input: GraphqlSourceInput,
+  idempotencyKey: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
 ) {
-  const response = await request(
-    "/api/v1/sources",
-    { method: "POST", body: JSON.stringify(input), signal },
-    fetcher,
-  );
-  if (!response.ok) return response;
-  return decodeResponse(response.value, decodeSource);
+  return sourceCreateRequest(input, idempotencyKey, fetcher, signal);
 }
 
 export async function listMcpStdioTemplates(fetcher: Fetcher = fetch, signal?: AbortSignal) {
@@ -671,16 +704,39 @@ export async function listMcpStdioTemplates(fetcher: Fetcher = fetch, signal?: A
 
 export async function createMcpStdioSource(
   input: McpStdioSourceInput,
+  idempotencyKey: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
 ) {
-  const response = await request(
-    "/api/v1/sources",
-    { method: "POST", body: JSON.stringify(input), signal },
+  return sourceCreateRequest(input, idempotencyKey, fetcher, signal);
+}
+
+export async function getSourceCreationResolution(
+  idempotencyKey: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  return sourceCreationResolutionRequest(
+    "/api/v1/sources/idempotency",
+    "GET",
+    idempotencyKey,
     fetcher,
+    signal,
   );
-  if (!response.ok) return response;
-  return decodeResponse(response.value, decodeSource);
+}
+
+export async function sealMissingSourceCreation(
+  idempotencyKey: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+) {
+  return sourceCreationResolutionRequest(
+    "/api/v1/sources/idempotency/seal",
+    "POST",
+    idempotencyKey,
+    fetcher,
+    signal,
+  );
 }
 
 export async function refreshOpenApiSource(
@@ -1066,6 +1122,412 @@ export async function decideApproval(
   );
   if (!response.ok) return response;
   return decodeResponse(response.value, decodeApprovalDetail);
+}
+
+async function tokenCreateRequest(
+  name: string,
+  idempotencyKey: string,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+): Promise<TokenCreateApiResult> {
+  const headers = new Headers({
+    accept: "application/json",
+    "content-type": "application/json",
+    "Idempotency-Key": idempotencyKey,
+  });
+  const csrfToken = readCookie("executor_csrf");
+  if (csrfToken !== null) headers.set("x-executor-csrf", csrfToken);
+
+  const fetched = await fetcher("/api/v1/tokens", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+  }).then(
+    (response) => ({ ok: true, response }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!fetched.ok) {
+    return tokenCreateResult(
+      failure(
+        signal?.aborted ? "request_cancelled" : "network_error",
+        signal?.aborted
+          ? "The request was cancelled."
+          : "Executor could not be reached. Check that the local server is running.",
+        null,
+        0,
+      ),
+      { replayProvenance: "none", responseDisposition: "ambiguous" },
+    );
+  }
+
+  const { response } = fetched;
+  const requestId = response.headers.get("x-request-id");
+  const body = await response.text().then(
+    (text) => ({ ok: true, text }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!body.ok) {
+    return tokenCreateResult(
+      invalidTokenCreateResponse(requestId),
+      tokenCreateResponseMetadata(response, "failure", false),
+    );
+  }
+
+  if (response.ok) {
+    const decoded = decodeResponse({ text: body.text, requestId }, decodeCreatedToken);
+    const bodyValid = decoded.ok && validCreatedToken(decoded.value, name);
+    const metadata = tokenCreateResponseMetadata(response, "success", bodyValid);
+    return bodyValid && metadata.responseDisposition === "authoritative"
+      ? tokenCreateResult(decoded, metadata)
+      : tokenCreateResult(invalidTokenCreateResponse(requestId), metadata);
+  }
+
+  const decodedEnvelope = decodeErrorEnvelope(body.text);
+  const metadata = tokenCreateResponseMetadata(response, "failure", Option.isSome(decodedEnvelope));
+  return tokenCreateContractValid(response, "failure", Option.isSome(decodedEnvelope))
+    ? tokenCreateResult(decodeError(body.text, requestId, response.status), metadata)
+    : tokenCreateResult(invalidTokenCreateResponse(requestId), metadata);
+}
+
+function tokenCreateResult(
+  result: ApiResult<CreatedToken>,
+  metadata: Pick<TokenCreateApiResult, "replayProvenance" | "responseDisposition">,
+): TokenCreateApiResult {
+  return result.ok ? { ...result, ...metadata } : { ...result, ...metadata };
+}
+
+function tokenCreateResponseMetadata(
+  response: Response,
+  outcome: "success" | "failure",
+  bodyValid: boolean,
+): Pick<TokenCreateApiResult, "replayProvenance" | "responseDisposition"> {
+  const replayed = response.headers.get("idempotency-replayed");
+  const replayProvenance =
+    replayed === null ? "none" : replayed === "true" ? "authoritative" : "invalid";
+  const responseDisposition =
+    tokenCreateContractValid(response, outcome, bodyValid) &&
+    (outcome === "success" || replayProvenance === "authoritative" || response.status < 500)
+      ? "authoritative"
+      : "ambiguous";
+  return { replayProvenance, responseDisposition };
+}
+
+function tokenCreateContractValid(
+  response: Response,
+  outcome: "success" | "failure",
+  bodyValid: boolean,
+) {
+  const replayed = response.headers.get("idempotency-replayed");
+  const statusValid =
+    outcome === "success"
+      ? response.status === 201
+      : response.status >= 400 && response.status <= 599;
+  return (
+    bodyValid &&
+    statusValid &&
+    hasJsonContentType(response.headers.get("content-type")) &&
+    hasNoStoreDirective(response.headers.get("cache-control")) &&
+    (replayed === null || replayed === "true")
+  );
+}
+
+function invalidTokenCreateResponse(requestId: string | null) {
+  return failure(
+    "invalid_response",
+    "Executor returned a token creation response the dashboard could not safely use.",
+    requestId,
+    502,
+  );
+}
+
+function hasJsonContentType(value: string | null) {
+  return value?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
+}
+
+function validCreatedToken(token: CreatedToken, expectedName: string) {
+  return (
+    token.id === token.id.trim() &&
+    token.id.length > 0 &&
+    token.id.length <= 128 &&
+    token.name === expectedName &&
+    /^exr_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(token.token) &&
+    Number.isSafeInteger(token.createdAt) &&
+    token.createdAt >= 0
+  );
+}
+
+function isAmbiguousRevokeResult(result: ApiResult<unknown>) {
+  if (result.ok) return false;
+  if (
+    ["network_error", "invalid_response", "unexpected_client_error"].includes(result.error.code)
+  ) {
+    return true;
+  }
+  return result.error.status >= 500;
+}
+
+async function sourceCreateRequest(
+  input: OpenApiSourceInput | GraphqlSourceInput | McpHttpSourceInput | McpStdioSourceInput,
+  idempotencyKey: string,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+) {
+  const headers = new Headers({
+    accept: "application/json",
+    "content-type": "application/json",
+    "Idempotency-Key": idempotencyKey,
+  });
+  const csrfToken = readCookie("executor_csrf");
+  if (csrfToken !== null) headers.set("x-executor-csrf", csrfToken);
+
+  const fetched = await fetcher("/api/v1/sources", {
+    method: "POST",
+    body: JSON.stringify(input),
+    headers,
+    credentials: "same-origin",
+    signal,
+  }).then(
+    (response) => ({ ok: true, response }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!fetched.ok) {
+    return sourceCreateResult(
+      failure(
+        signal?.aborted ? "request_cancelled" : "network_error",
+        signal?.aborted
+          ? "The request was cancelled."
+          : "Executor could not be reached. Check that the local server is running.",
+        null,
+        0,
+      ),
+      { replayProvenance: "none", responseDisposition: "ambiguous" },
+    );
+  }
+
+  const { response } = fetched;
+  const requestId = response.headers.get("x-request-id");
+  const body = await response.text().then(
+    (text) => ({ ok: true, text }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!body.ok) {
+    return sourceCreateResult(
+      failure(
+        "invalid_response",
+        "Executor returned a response body the dashboard could not read.",
+        requestId,
+        502,
+      ),
+      sourceCreateResponseMetadata(response, "failure", false),
+    );
+  }
+  if (response.ok) {
+    const decoded = decodeResponse({ text: body.text, requestId }, decodeSource);
+    return sourceCreateResult(
+      decoded,
+      sourceCreateResponseMetadata(response, "success", decoded.ok),
+    );
+  }
+  const decodedError = decodeErrorEnvelope(body.text);
+  return sourceCreateResult(
+    decodeError(body.text, requestId, response.status),
+    sourceCreateResponseMetadata(response, "failure", Option.isSome(decodedError)),
+  );
+}
+
+function sourceCreateResult(
+  result: ApiResult<Source>,
+  metadata: Pick<SourceCreateApiResult, "replayProvenance" | "responseDisposition">,
+): SourceCreateApiResult {
+  return result.ok ? { ...result, ...metadata } : { ...result, ...metadata };
+}
+
+function sourceCreateResponseMetadata(
+  response: Response,
+  outcome: "success" | "failure",
+  bodyValid: boolean,
+) {
+  const replayed = response.headers.get("idempotency-replayed");
+  if (replayed === null) {
+    return isAuthoritativeSourceCreationResponse(response, "fresh", outcome, bodyValid)
+      ? ({ replayProvenance: "none", responseDisposition: "authoritative" } as const)
+      : ({ replayProvenance: "none", responseDisposition: "ambiguous" } as const);
+  }
+  return isAuthoritativeSourceCreationResponse(response, "replay", outcome, bodyValid)
+    ? ({ replayProvenance: "authoritative", responseDisposition: "authoritative" } as const)
+    : ({ replayProvenance: "invalid", responseDisposition: "ambiguous" } as const);
+}
+
+function isAuthoritativeSourceCreationResponse(
+  response: Pick<Response, "headers" | "status">,
+  origin: "fresh" | "replay",
+  outcome: "success" | "failure",
+  bodyValid: boolean,
+) {
+  const statusValid =
+    outcome === "success"
+      ? response.status === 201
+      : response.status >= 400 && response.status <= (origin === "fresh" ? 499 : 599);
+  const replayHeader = response.headers.get("idempotency-replayed");
+  return (
+    bodyValid &&
+    statusValid &&
+    (origin === "fresh" ? replayHeader === null : replayHeader === "true") &&
+    hasNoStoreDirective(response.headers.get("cache-control"))
+  );
+}
+
+async function sourceCreationResolutionRequest(
+  path: string,
+  method: "GET" | "POST",
+  idempotencyKey: string,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+) {
+  const headers = new Headers({
+    accept: "application/json",
+    "Idempotency-Key": idempotencyKey,
+  });
+  if (method === "POST") {
+    const csrfToken = readCookie("executor_csrf");
+    if (csrfToken !== null) headers.set("x-executor-csrf", csrfToken);
+  }
+  const fetched = await fetcher(path, {
+    method,
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+  }).then(
+    (response) => ({ ok: true, response }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!fetched.ok) {
+    return failure(
+      signal?.aborted ? "request_cancelled" : "network_error",
+      signal?.aborted
+        ? "The request was cancelled."
+        : "Executor could not be reached. Check that the local server is running.",
+      null,
+      0,
+    );
+  }
+
+  const { response } = fetched;
+  const requestId = response.headers.get("x-request-id");
+  const body = await response.text().then(
+    (text) => ({ ok: true, text }) as const,
+    () => ({ ok: false }) as const,
+  );
+  if (!body.ok) return invalidSourceCreationResolution(requestId);
+  if (!hasNoStoreDirective(response.headers.get("cache-control"))) {
+    return invalidSourceCreationResolution(requestId);
+  }
+
+  const replayed = response.headers.get("idempotency-replayed");
+  if (replayed !== null && replayed !== "true") {
+    return invalidSourceCreationResolution(requestId);
+  }
+  if (replayed === "true") {
+    if (response.status === 201) {
+      const decoded = decodeResponse({ text: body.text, requestId }, decodeSource);
+      if (
+        !decoded.ok ||
+        !isAuthoritativeSourceCreationResponse(response, "replay", "success", true)
+      ) {
+        return invalidSourceCreationResolution(requestId);
+      }
+      return {
+        ok: true,
+        value: { kind: "replay", result: decoded } as const,
+      } as const;
+    }
+    const decoded = decodeErrorEnvelope(body.text);
+    if (
+      Option.isNone(decoded) ||
+      !isAuthoritativeSourceCreationResponse(response, "replay", "failure", true)
+    ) {
+      return invalidSourceCreationResolution(requestId);
+    }
+    return {
+      ok: true,
+      value: {
+        kind: "replay",
+        result: failure(
+          decoded.value.error.code,
+          decoded.value.error.message,
+          decoded.value.error.requestId || requestId,
+          response.status,
+        ),
+      } as const,
+    } as const;
+  }
+
+  if (response.ok) {
+    if (response.status !== 200) return invalidSourceCreationResolution(requestId);
+    const decoded = decodeResponse({ text: body.text, requestId }, decodeSourceCreationStatus);
+    if (!decoded.ok) return decoded;
+    return {
+      ok: true,
+      value: { kind: "status", status: decoded.value.status } as const,
+    } as const;
+  }
+
+  const decoded = decodeErrorEnvelope(body.text);
+  if (Option.isNone(decoded)) return invalidSourceCreationResolution(requestId);
+  const error = failure(
+    decoded.value.error.code,
+    decoded.value.error.message,
+    decoded.value.error.requestId || requestId,
+    response.status,
+  );
+  if (
+    method === "POST" &&
+    response.status === 409 &&
+    decoded.value.error.code === "idempotency_in_progress"
+  ) {
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter === null || !/^\d+$/.test(retryAfter) || Number(retryAfter) < 1) {
+      return invalidSourceCreationResolution(requestId);
+    }
+    return {
+      ok: true,
+      value: { kind: "status", status: "in_progress" } as const,
+    } as const;
+  }
+  if (method === "POST") {
+    const status = sourceCreationTerminalStatus(decoded.value.error.code);
+    const expectedStatus = status === "expired_unknown" ? 410 : 409;
+    if (status !== null && response.status === expectedStatus) {
+      return { ok: true, value: { kind: "status", status } as const } as const;
+    }
+  }
+  return error;
+}
+
+function sourceCreationTerminalStatus(code: string): SourceCreationStatus | null {
+  if (code === "idempotency_abandoned") return "abandoned";
+  if (code === "idempotency_interrupted") return "interrupted";
+  if (code === "idempotency_expired_unknown") return "expired_unknown";
+  return null;
+}
+
+function invalidSourceCreationResolution(requestId: string | null) {
+  return failure(
+    "invalid_response",
+    "Executor returned an idempotency status the dashboard could not understand.",
+    requestId,
+    502,
+  );
+}
+
+function hasNoStoreDirective(value: string | null) {
+  return (
+    value?.split(",").some((directive) => directive.trim().toLowerCase() === "no-store") ?? false
+  );
 }
 
 async function request(path: string, init: RequestInit, fetcher: Fetcher, includeCsrf = true) {

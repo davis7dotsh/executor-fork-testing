@@ -6,7 +6,7 @@
 // the binary fails. If this dev sidecar is compiled directly, copy each
 // platform's `.node` next to the executable (`libsql.node`, `keyring.node`);
 // here we publish their
-// on-disk paths via env vars the loaders read. Mirrors apps/cli/src/native-bindings.ts.
+// on-disk paths via env vars the loaders read. Mirrors legacy/cli/src/native-bindings.ts.
 //
 // This MUST be the FIRST import in server.ts. ES modules evaluate every import
 // before the importer's own body, and libSQL resolves its native addon EAGERLY

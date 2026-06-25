@@ -21,6 +21,7 @@ use super::{
     model::{
         OAuthClientAuthentication as StoredClientAuthentication, OAuthClientSecretUpdate,
         OAuthConnection, OAuthConnectionConfig, OAuthConnectionStatus, OAuthSecretSet,
+        RefreshClaim,
     },
     store::{OAuthStore, OAuthStoreError},
     transport::{
@@ -30,6 +31,7 @@ use super::{
 };
 
 const AUTHORIZATION_TTL_SECONDS: i64 = 10 * 60;
+const ACCESS_TOKEN_MIN_VALIDITY_SECONDS: i64 = 30;
 const REFRESH_LEASE_TTL_SECONDS: i64 = 60;
 const MAX_DISPLAY_URL_BYTES: usize = 16 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 4 * 1024;
@@ -181,12 +183,28 @@ pub(crate) enum OAuthError {
     Internal,
 }
 
+impl OAuthError {
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::Validation { code, .. }
+            | Self::Conflict { code, .. }
+            | Self::Upstream { code } => code,
+            Self::NotFound => "oauth_connection_required",
+            Self::UnauthorizedTransaction => "oauth_transaction_unauthorized",
+            Self::AuthorizationDenied { .. } => "oauth_authorization_denied",
+            Self::Internal => "oauth_internal_error",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OAuthBinding {
     pub(crate) connection_id: String,
     pub(crate) credential_key: String,
     pub(crate) config_revision: i64,
+    #[serde(default)]
+    pub(crate) granted_scopes: Vec<String>,
 }
 
 pub(crate) struct OAuthAccessToken {
@@ -285,52 +303,7 @@ impl OAuthService {
             Err(OAuthStoreError::ConnectionNotFound) => return Ok(None),
             Err(error) => return Err(map_store_error(error)),
         };
-        Ok(Some(OAuthBinding {
-            connection_id: credential.connection.id,
-            credential_key: credential.connection.credential_key,
-            config_revision: credential.connection.config_revision,
-        }))
-    }
-
-    pub(crate) async fn binding_for_scopes(
-        &self,
-        source_id: &str,
-        credential_key: &str,
-        required_scopes: &[String],
-    ) -> Result<Option<OAuthBinding>, OAuthError> {
-        let credential = match self
-            .store
-            .connection_by_source_key(source_id, credential_key)
-            .await
-        {
-            Ok(credential) => credential,
-            Err(OAuthStoreError::ConnectionNotFound) => return Ok(None),
-            Err(error) => return Err(map_store_error(error)),
-        };
-        if !required_scopes
-            .iter()
-            .all(|scope| credential.connection.config.scopes.contains(scope))
-        {
-            return Err(validation(
-                "oauth_scope_not_requested",
-                "The managed OAuth connection does not request every scope required by this tool.",
-            ));
-        }
-        if credential.connection.status == OAuthConnectionStatus::Active
-            && !required_scopes
-                .iter()
-                .all(|scope| credential.connection.granted_scopes.contains(scope))
-        {
-            return Err(OAuthError::Conflict {
-                code: "oauth_scope_not_granted",
-                message: "The OAuth provider did not grant every scope required by this tool.",
-            });
-        }
-        Ok(Some(OAuthBinding {
-            connection_id: credential.connection.id,
-            credential_key: credential.connection.credential_key,
-            config_revision: credential.connection.config_revision,
-        }))
+        Ok(Some(snapshot_binding(&credential.connection)?))
     }
 
     pub(crate) async fn ready_binding_for_scopes(
@@ -376,29 +349,23 @@ impl OAuthService {
         if !token_is_usable(&credential.secrets, unix_timestamp()) && !refreshable {
             return Ok(None);
         }
-        Ok(Some(OAuthBinding {
-            connection_id: credential.connection.id,
-            credential_key: credential.connection.credential_key,
-            config_revision: credential.connection.config_revision,
-        }))
+        Ok(Some(snapshot_binding(&credential.connection)?))
     }
 
     pub(crate) async fn bindings_for_source(
         &self,
         source_id: &str,
     ) -> Result<Vec<OAuthBinding>, OAuthError> {
+        let now = unix_timestamp();
         let mut bindings = self
             .store
             .list_connections(source_id)
             .await
             .map_err(map_store_error)?
             .into_iter()
-            .map(|connection| OAuthBinding {
-                connection_id: connection.id,
-                credential_key: connection.credential_key,
-                config_revision: connection.config_revision,
-            })
-            .collect::<Vec<_>>();
+            .filter(|connection| connection_is_dispatch_ready(connection, now))
+            .map(|connection| snapshot_binding(&connection))
+            .collect::<Result<Vec<_>, _>>()?;
         bindings.sort();
         Ok(bindings)
     }
@@ -408,7 +375,10 @@ impl OAuthService {
         source_id: &str,
         expected: &[OAuthBinding],
     ) -> Result<bool, OAuthError> {
-        Ok(self.bindings_for_source(source_id).await? == expected)
+        let current = self.bindings_for_source(source_id).await?;
+        Ok(expected
+            .iter()
+            .all(|binding| current.binary_search(binding).is_ok()))
     }
 
     pub(crate) async fn access_token_for_binding(
@@ -441,6 +411,9 @@ impl OAuthService {
         let (issuer, resource) = self
             .resolve_discovery(source_id, request.discovery, &scopes, &transport)
             .await?;
+        transport
+            .validate_issuer(&issuer)
+            .map_err(map_configured_issuer_error)?;
         let metadata = transport
             .discover_authorization_server(&issuer)
             .await
@@ -626,59 +599,64 @@ impl OAuthService {
                 "The OAuth callback must include an authorization code.",
             )
         })?;
-        let client = client_authentication(&claim.config, claim.secrets.as_ref())?;
-        let callback_url = self.callback_url(&claim.connection_id)?;
-        let current = self
-            .store
-            .connection(&claim.connection_id)
-            .await
-            .map_err(map_store_error)?;
-        if current.connection.revision != claim.connection_revision {
-            return Err(conflict());
+        let exchange_result = async {
+            let client = client_authentication(&claim.config, claim.secrets.as_ref())?;
+            let callback_url = self.callback_url(&claim.connection_id)?;
+            let current = self
+                .store
+                .connection(&claim.connection_id)
+                .await
+                .map_err(map_store_error)?;
+            if current.connection.revision != claim.connection_revision {
+                return Err(conflict());
+            }
+            let allow_private_network = self
+                .source_allows_private_network(&current.connection.source_id)
+                .await?;
+            let token = self
+                .transport(allow_private_network)
+                .exchange_authorization_code(
+                    &metadata_from_config(&claim.config)?,
+                    &AuthorizationCodeExchange {
+                        code,
+                        redirect_uri: callback_url,
+                        code_verifier: claim.pkce_verifier.clone(),
+                        resource: claim.config.resource.clone(),
+                        client,
+                    },
+                )
+                .await
+                .map_err(map_transport_error)?;
+            let secrets = token_secrets(
+                token,
+                claim
+                    .secrets
+                    .as_ref()
+                    .and_then(|secrets| secrets.client_secret.clone()),
+                None,
+                &claim.config.scopes,
+                unix_timestamp(),
+            )?;
+            Ok((secrets, current.connection.source_id))
         }
-        let allow_private_network = self
-            .source_allows_private_network(&current.connection.source_id)
-            .await?;
-        let exchanged = self
-            .transport(allow_private_network)
-            .exchange_authorization_code(
-                &metadata_from_config(&claim.config)?,
-                &AuthorizationCodeExchange {
-                    code,
-                    redirect_uri: callback_url,
-                    code_verifier: claim.pkce_verifier.clone(),
-                    resource: claim.config.resource.clone(),
-                    client,
-                },
-            )
-            .await;
-        let token = match exchanged {
-            Ok(token) => token,
+        .await;
+        let (secrets, source_id) = match exchange_result {
+            Ok(result) => result,
             Err(error) => {
-                let _ = self
-                    .store
+                self.store
                     .fail_authorization_exchange(&claim, error.code(), unix_timestamp())
-                    .await;
-                return Err(map_transport_error(error));
+                    .await
+                    .map_err(map_store_error)?;
+                return Err(error);
             }
         };
-        let secrets = token_secrets(
-            token,
-            claim
-                .secrets
-                .as_ref()
-                .and_then(|secrets| secrets.client_secret.clone()),
-            None,
-            &claim.config.scopes,
-            unix_timestamp(),
-        )?;
         self.store
             .complete_authorization_exchange(&claim, &secrets, unix_timestamp())
             .await
             .map_err(map_store_error)?;
         Ok(CallbackResult {
             connection_id: claim.connection_id,
-            source_id: current.connection.source_id,
+            source_id,
         })
     }
 
@@ -693,6 +671,7 @@ impl OAuthService {
             .await
             .map_err(map_store_error)?;
         require_config_revision(&current.connection, expected_config_revision)?;
+        require_active_connection(&current.connection)?;
         if token_is_usable(&current.secrets, unix_timestamp()) {
             return access_token_from(current);
         }
@@ -704,6 +683,7 @@ impl OAuthService {
             .await
             .map_err(map_store_error)?;
         require_config_revision(&current.connection, expected_config_revision)?;
+        require_active_connection(&current.connection)?;
         if token_is_usable(&current.secrets, unix_timestamp()) {
             return access_token_from(current);
         }
@@ -716,18 +696,6 @@ impl OAuthService {
             .claim_refresh(connection_id, now, lease_expires_at)
             .await
             .map_err(map_store_error)?;
-        let current = self
-            .store
-            .connection(&claim.connection_id)
-            .await
-            .map_err(map_store_error)?;
-        if current.connection.revision != claim.connection_revision {
-            let _ = self.store.release_refresh(&claim).await;
-            return Err(conflict());
-        }
-        let allow_private_network = self
-            .source_allows_private_network(&current.connection.source_id)
-            .await?;
         let Some(refresh_token) = claim.secrets.refresh_token.clone() else {
             self.store
                 .mark_refresh_reauthorization_required(&claim, "refresh_token_missing")
@@ -738,11 +706,31 @@ impl OAuthService {
                 message: "The OAuth connection must be authorized again.",
             });
         };
-        let client = client_authentication(&claim.config, Some(&claim.secrets))?;
+        let prepared = async {
+            let current = self
+                .store
+                .connection(&claim.connection_id)
+                .await
+                .map_err(map_store_error)?;
+            if current.connection.revision != claim.connection_revision {
+                return Err(conflict());
+            }
+            let allow_private_network = self
+                .source_allows_private_network(&current.connection.source_id)
+                .await?;
+            let client = client_authentication(&claim.config, Some(&claim.secrets))?;
+            let metadata = metadata_from_config(&claim.config)?;
+            Ok((allow_private_network, client, metadata))
+        }
+        .await;
+        let (allow_private_network, client, metadata) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(self.terminalize_refresh_error(&claim, error).await),
+        };
         let refreshed = self
             .transport(allow_private_network)
             .refresh_access_token(
-                &metadata_from_config(&claim.config)?,
+                &metadata,
                 &RefreshTokenExchange {
                     refresh_token,
                     resource: claim.config.resource.clone(),
@@ -763,17 +751,11 @@ impl OAuthService {
                 });
             }
             Err(error) => {
-                let _ = self.store.release_refresh(&claim).await;
-                return Err(map_transport_error(error));
+                let error = map_transport_error(error);
+                return Err(self.terminalize_refresh_error(&claim, error).await);
             }
         };
-        let rotated = token_secrets(
-            token,
-            claim.secrets.client_secret.clone(),
-            claim.secrets.refresh_token.clone(),
-            &claim.secrets.granted_scopes,
-            unix_timestamp(),
-        )?;
+        let rotated = self.refresh_token_secrets(&claim, token).await?;
         self.store
             .complete_refresh(&claim, &rotated, unix_timestamp())
             .await
@@ -784,7 +766,40 @@ impl OAuthService {
             .await
             .map_err(map_store_error)?;
         require_config_revision(&current.connection, expected_config_revision)?;
+        require_active_connection(&current.connection)?;
         access_token_from(current)
+    }
+
+    async fn refresh_token_secrets(
+        &self,
+        claim: &RefreshClaim,
+        token: TokenResponse,
+    ) -> Result<OAuthSecretSet, OAuthError> {
+        match token_secrets(
+            token,
+            claim.secrets.client_secret.clone(),
+            claim.secrets.refresh_token.clone(),
+            &claim.secrets.granted_scopes,
+            unix_timestamp(),
+        ) {
+            Ok(rotated) => Ok(rotated),
+            Err(error) => Err(self.terminalize_refresh_error(claim, error).await),
+        }
+    }
+
+    async fn terminalize_refresh_error(
+        &self,
+        claim: &RefreshClaim,
+        error: OAuthError,
+    ) -> OAuthError {
+        match self
+            .store
+            .mark_refresh_reauthorization_required(claim, error.code())
+            .await
+        {
+            Ok(()) => error,
+            Err(store_error) => map_store_error(store_error),
+        }
     }
 
     async fn resolve_discovery(
@@ -1165,15 +1180,23 @@ fn token_secrets(
 ) -> Result<OAuthSecretSet, OAuthError> {
     let expires_at = match token.expires_in {
         Some(seconds) => Some(
-            now.checked_add(i64::try_from(seconds).map_err(|_| OAuthError::Internal)?)
-                .ok_or(OAuthError::Internal)?,
+            now.checked_add(i64::try_from(seconds).map_err(|_| malformed_token_response())?)
+                .ok_or_else(malformed_token_response)?,
         ),
         None => None,
     };
+    if expires_at.is_some_and(|expires_at| {
+        expires_at <= now.saturating_add(ACCESS_TOKEN_MIN_VALIDITY_SECONDS)
+    }) {
+        return Err(OAuthError::Upstream {
+            code: "oauth_access_token_lifetime_too_short",
+        });
+    }
     let granted_scopes = match token.scope {
         Some(scopes) => {
             let scopes =
-                validate_scopes(scopes.split_ascii_whitespace().map(str::to_owned).collect())?;
+                validate_scopes(scopes.split_ascii_whitespace().map(str::to_owned).collect())
+                    .map_err(|_| malformed_token_response())?;
             if !scopes.iter().all(|scope| fallback_scopes.contains(scope)) {
                 return Err(OAuthError::Upstream {
                     code: "oauth_scope_escalation",
@@ -1196,10 +1219,32 @@ fn token_secrets(
 fn token_is_usable(secrets: &Option<OAuthSecretSet>, now: i64) -> bool {
     secrets.as_ref().is_some_and(|secrets| {
         secrets.access_token.is_some()
-            && secrets
-                .access_token_expires_at
-                .is_none_or(|expires_at| expires_at > now)
+            && secrets.access_token_expires_at.is_none_or(|expires_at| {
+                expires_at > now.saturating_add(ACCESS_TOKEN_MIN_VALIDITY_SECONDS)
+            })
     })
+}
+
+fn snapshot_binding(connection: &OAuthConnection) -> Result<OAuthBinding, OAuthError> {
+    validate_credential_key(&connection.credential_key).map_err(|_| OAuthError::Internal)?;
+    let mut granted_scopes =
+        validate_scopes(connection.granted_scopes.clone()).map_err(|_| OAuthError::Internal)?;
+    granted_scopes.sort();
+    Ok(OAuthBinding {
+        connection_id: connection.id.clone(),
+        credential_key: connection.credential_key.clone(),
+        config_revision: connection.config_revision,
+        granted_scopes,
+    })
+}
+
+fn connection_is_dispatch_ready(connection: &OAuthConnection, now: i64) -> bool {
+    connection.status == OAuthConnectionStatus::Active
+        && (connection.has_refresh_token
+            || (connection.secret_revision.is_some()
+                && connection.access_expires_at.is_none_or(|expires_at| {
+                    expires_at > now.saturating_add(ACCESS_TOKEN_MIN_VALIDITY_SECONDS)
+                })))
 }
 
 fn access_token_from(
@@ -1236,6 +1281,14 @@ fn require_config_revision(
         Ok(())
     } else {
         Err(conflict())
+    }
+}
+
+fn require_active_connection(connection: &OAuthConnection) -> Result<(), OAuthError> {
+    if connection.status == OAuthConnectionStatus::Active {
+        Ok(())
+    } else {
+        Err(reauthorization_required())
     }
 }
 
@@ -1313,6 +1366,25 @@ fn map_transport_error(error: OAuthTransportError) -> OAuthError {
     OAuthError::Upstream { code: error.code() }
 }
 
+fn map_configured_issuer_error(error: super::discovery::OAuthDiscoveryError) -> OAuthError {
+    use super::discovery::OAuthDiscoveryError;
+
+    match error {
+        OAuthDiscoveryError::InvalidUrl => {
+            validation("invalid_oauth_url", "The OAuth issuer URL is invalid.")
+        }
+        OAuthDiscoveryError::InsecureEndpoint => validation(
+            "insecure_oauth_endpoint",
+            "The OAuth issuer must use HTTPS, except for loopback local-test endpoints.",
+        ),
+        OAuthDiscoveryError::InvalidIssuer => validation(
+            "invalid_oauth_issuer",
+            "The OAuth issuer URL must not contain a query or fragment.",
+        ),
+        error => OAuthError::Upstream { code: error.code() },
+    }
+}
+
 fn map_discovery_error(error: super::discovery::OAuthDiscoveryError) -> OAuthError {
     use super::discovery::OAuthDiscoveryError;
 
@@ -1331,6 +1403,12 @@ fn map_discovery_error(error: super::discovery::OAuthDiscoveryError) -> OAuthErr
 
 fn validation(code: &'static str, message: &'static str) -> OAuthError {
     OAuthError::Validation { code, message }
+}
+
+fn malformed_token_response() -> OAuthError {
+    OAuthError::Upstream {
+        code: "malformed_oauth_response",
+    }
 }
 
 fn conflict() -> OAuthError {
@@ -1452,6 +1530,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn access_tokens_require_more_than_the_minimum_validity_buffer() {
+        let secrets = |access_token_expires_at| {
+            Some(OAuthSecretSet {
+                access_token: Some("access-token".into()),
+                access_token_expires_at,
+                ..OAuthSecretSet::default()
+            })
+        };
+        let now = 1_000;
+
+        assert!(!token_is_usable(
+            &secrets(Some(now + ACCESS_TOKEN_MIN_VALIDITY_SECONDS)),
+            now,
+        ));
+        assert!(token_is_usable(
+            &secrets(Some(now + ACCESS_TOKEN_MIN_VALIDITY_SECONDS + 1)),
+            now,
+        ));
+        assert!(token_is_usable(&secrets(None), now));
+    }
+
+    #[test]
+    fn successful_token_responses_must_clear_the_minimum_validity_buffer() {
+        let token = |expires_in| TokenResponse {
+            access_token: "access-token".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(expires_in),
+            refresh_token: Some("refresh-token".into()),
+            scope: Some("read".into()),
+        };
+        let now = 1_000;
+        let error = token_secrets(
+            token(ACCESS_TOKEN_MIN_VALIDITY_SECONDS as u64),
+            None,
+            None,
+            &["read".into()],
+            now,
+        )
+        .expect_err("a token expiring at the safety boundary is rejected");
+        assert!(matches!(
+            error,
+            OAuthError::Upstream {
+                code: "oauth_access_token_lifetime_too_short"
+            }
+        ));
+        assert!(
+            token_secrets(
+                token((ACCESS_TOKEN_MIN_VALIDITY_SECONDS + 1) as u64),
+                None,
+                None,
+                &["read".into()],
+                now,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_refresh_success_terminalizes_the_lease_and_allows_reconnect() {
+        let service = binding_test_service().await;
+        let created = service
+            .store
+            .create_connection(
+                "source-1",
+                "default",
+                &binding_test_config(),
+                Some(&binding_test_secrets("old-access", "old-refresh")),
+                10,
+            )
+            .await
+            .unwrap();
+        let now = unix_timestamp();
+        let refresh = service
+            .store
+            .claim_refresh(&created.connection.id, now, now + 60)
+            .await
+            .unwrap();
+        let error = service
+            .refresh_token_secrets(
+                &refresh,
+                TokenResponse {
+                    access_token: "malformed-access".into(),
+                    token_type: "Bearer".into(),
+                    expires_in: Some(60),
+                    refresh_token: None,
+                    scope: Some("read unrequested".into()),
+                },
+            )
+            .await
+            .expect_err("scope escalation is rejected");
+        assert!(matches!(
+            error,
+            OAuthError::Upstream {
+                code: "oauth_scope_escalation"
+            }
+        ));
+        let terminal = service
+            .store
+            .connection(&created.connection.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal.connection.status,
+            OAuthConnectionStatus::ReauthorizationRequired
+        );
+        assert_eq!(
+            terminal.connection.error_code.as_deref(),
+            Some("oauth_scope_escalation")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM oauth_refresh_leases WHERE connection_id = ?",
+            )
+            .bind(&created.connection.id)
+            .fetch_one(&service.pool)
+            .await
+            .unwrap(),
+            0
+        );
+
+        let session = [9_u8; 32];
+        let pending = service
+            .store
+            .begin_authorization(
+                "source-1",
+                "default",
+                terminal.connection.revision,
+                &session,
+                now + 1,
+                now + 120,
+            )
+            .await
+            .unwrap();
+        let authorization = service
+            .store
+            .claim_authorization_exchange(&created.connection.id, &pending.state, &session, now + 2)
+            .await
+            .unwrap();
+        service
+            .store
+            .complete_authorization_exchange(
+                &authorization,
+                &binding_test_secrets("new-access", "new-refresh"),
+                now + 3,
+            )
+            .await
+            .unwrap();
+        service
+            .store
+            .claim_refresh(&created.connection.id, now + 4, now + 64)
+            .await
+            .expect("refresh can be claimed after reconnecting");
+    }
+
     #[tokio::test]
     async fn binding_generation_changes_on_reauthorization_but_not_refresh() {
         let service = binding_test_service().await;
@@ -1478,6 +1711,7 @@ mod tests {
                 "connectionId": created.connection.id,
                 "credentialKey": "default",
                 "configRevision": 1,
+                "grantedScopes": ["read"],
             })
         );
         let serialized = serde_json::to_string(&captured).unwrap();
@@ -1562,5 +1796,139 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn approval_binding_snapshots_include_only_dispatch_ready_connections() {
+        let service = binding_test_service().await;
+        service
+            .store
+            .create_connection("source-1", "pending", &binding_test_config(), None, 10)
+            .await
+            .unwrap();
+        let active = service
+            .store
+            .create_connection(
+                "source-1",
+                "active",
+                &binding_test_config(),
+                Some(&binding_test_secrets("access", "refresh")),
+                10,
+            )
+            .await
+            .unwrap();
+
+        let captured = service.bindings_for_source("source-1").await.unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].credential_key, "active");
+        assert_eq!(captured[0].granted_scopes, vec!["read"]);
+
+        service
+            .disconnect("source-1", "active", active.connection.revision)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .bindings_for_source("source-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_binding_match_ignores_new_unselected_connections() {
+        let service = binding_test_service().await;
+        let pending = service
+            .store
+            .create_connection(
+                "source-1",
+                "first",
+                &binding_test_config(),
+                Some(&binding_test_secrets("first-access", "first-refresh")),
+                10,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE oauth_connections SET status = 'connecting' WHERE id = ?")
+            .bind(&pending.connection.id)
+            .execute(&service.pool)
+            .await
+            .unwrap();
+        service
+            .store
+            .create_connection(
+                "source-1",
+                "second",
+                &binding_test_config(),
+                Some(&binding_test_secrets("second-access", "second-refresh")),
+                10,
+            )
+            .await
+            .unwrap();
+        let approved = service.bindings_for_source("source-1").await.unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].credential_key, "second");
+
+        sqlx::query("UPDATE oauth_connections SET status = 'active' WHERE id = ?")
+            .bind(&pending.connection.id)
+            .execute(&service.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.bindings_for_source("source-1").await.unwrap().len(),
+            2
+        );
+        assert!(service.bindings_match("source-1", &approved).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn access_token_refuses_non_active_connections_even_with_a_fresh_old_token() {
+        let service = binding_test_service().await;
+        let secrets = OAuthSecretSet {
+            client_secret: Some("client-secret".into()),
+            access_token: Some("fresh-old-token".into()),
+            refresh_token: Some("refresh-token".into()),
+            token_type: Some("Bearer".into()),
+            granted_scopes: vec!["read".into()],
+            access_token_expires_at: Some(i64::MAX),
+        };
+        let created = service
+            .store
+            .create_connection(
+                "source-1",
+                "default",
+                &binding_test_config(),
+                Some(&secrets),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .access_token(&created.connection.id, created.connection.config_revision)
+                .await
+                .unwrap()
+                .expose(),
+            "fresh-old-token"
+        );
+
+        for (status, error_code) in [
+            ("connecting", None),
+            ("reauth_required", Some("reauthorization_required")),
+        ] {
+            sqlx::query("UPDATE oauth_connections SET status = ?, error_code = ? WHERE id = ?")
+                .bind(status)
+                .bind(error_code)
+                .bind(&created.connection.id)
+                .execute(&service.pool)
+                .await
+                .unwrap();
+            let error = service
+                .access_token(&created.connection.id, created.connection.config_revision)
+                .await
+                .expect_err("a non-active connection cannot release its retained token");
+            assert_eq!(error.code(), "oauth_reauthorization_required");
+        }
     }
 }

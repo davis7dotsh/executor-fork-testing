@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
@@ -28,7 +28,7 @@ use crate::{
         OpenApiSecurityRequirement, OpenApiSecurityScheme, build_protocol_request_with_base,
         compile_document,
     },
-    outbound::{HardenedHttpClient, OutboundPolicy, OutboundRequest, parse_url},
+    outbound::{HardenedHttpClient, OutboundError, OutboundPolicy, OutboundRequest, parse_url},
 };
 
 const MAX_SPEC_BYTES: usize = 16 * 1024 * 1024;
@@ -38,6 +38,9 @@ const MAX_MANAGED_OAUTH_OPTIONS: usize = 64;
 const MAX_MANAGED_OAUTH_SCOPES: usize = 64;
 const MAX_MANAGED_OAUTH_KEY_BYTES: usize = 128;
 const MAX_MANAGED_OAUTH_SCOPE_BYTES: usize = 256;
+const MAX_BOUND_CREDENTIAL_SCHEMES: usize = 128;
+const MAX_CREDENTIAL_ORIGINS_PER_SCHEME: usize = 1_024;
+const MAX_ORIGIN_RETIRE_CAS_ATTEMPTS: usize = 4;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -168,12 +171,15 @@ enum StoredOpenApiLocatorV1 {
 struct StoredOpenApiCredentialV1 {
     locator: StoredOpenApiLocatorV1,
     credentials: OpenApiCredentialSet,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credential_origins: BTreeMap<String, Vec<String>>,
 }
 
 impl StoredOpenApiCredentialV1 {
     fn decode(stored: &StoredCredential) -> Result<Self, ProtocolError> {
         if stored.credential.schema_version != OPENAPI_CREDENTIAL_SCHEMA_VERSION {
-            return Err(ProtocolError::corrupt(
+            return Err(ProtocolError::new(
+                ProtocolErrorCategory::Conflict,
                 "unsupported_credential_schema",
                 "The stored OpenAPI credential schema is not supported.",
             ));
@@ -214,6 +220,25 @@ impl StoredOpenApiCredentialV1 {
                 )
             })?;
         }
+        if self.credential_origins.len() > MAX_BOUND_CREDENTIAL_SCHEMES {
+            return Err(invalid_stored_credentials());
+        }
+        for (scheme_name, origins) in &self.credential_origins {
+            if scheme_name.is_empty()
+                || scheme_name.len() > 256
+                || scheme_name.chars().any(char::is_control)
+                || origins.len() > MAX_CREDENTIAL_ORIGINS_PER_SCHEME
+                || origins.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(invalid_stored_credentials());
+            }
+            for origin in origins {
+                let parsed = require_http_url(origin).map_err(|_| invalid_stored_credentials())?;
+                if parsed.origin().ascii_serialization() != origin.as_str() {
+                    return Err(invalid_stored_credentials());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -251,6 +276,8 @@ struct PreparedOAuthAuthorization {
 
 #[derive(Debug, Error)]
 pub enum OpenApiExecutionError {
+    #[error("OpenAPI transport is not confidential")]
+    InsecureTransport,
     #[error("OpenAPI transport failed")]
     Outbound {
         #[source]
@@ -260,7 +287,7 @@ pub enum OpenApiExecutionError {
     #[error("the OpenAPI mutation outcome is unknown")]
     Indeterminate,
     #[error("managed OAuth authorization is unavailable")]
-    OAuth { code: &'static str },
+    OAuth(#[source] OAuthError),
 }
 
 impl OpenApiExecutionError {
@@ -276,9 +303,14 @@ impl OpenApiExecutionError {
 
     pub fn code(&self) -> &'static str {
         match self {
+            Self::InsecureTransport => "insecure_openapi_transport",
+            Self::Outbound {
+                source: OutboundError::InsecureTransport,
+                ..
+            } => "insecure_openapi_transport",
             Self::Outbound { source, .. } => source.code(),
             Self::Indeterminate => "openapi_outcome_unknown",
-            Self::OAuth { code } => code,
+            Self::OAuth(error) => error.code(),
         }
     }
 }
@@ -331,14 +363,27 @@ impl OpenApiAdapter {
 
     pub(super) async fn execute_invocation(
         &self,
-        mut prepared: PreparedOpenApiInvocation,
+        prepared: PreparedOpenApiInvocation,
     ) -> Result<ProtocolExecutionResponse, OpenApiExecutionError> {
+        let client = HardenedHttpClient::new(prepared.policy.clone());
+        self.execute_invocation_with_client(prepared, client).await
+    }
+
+    async fn execute_invocation_with_client(
+        &self,
+        mut prepared: PreparedOpenApiInvocation,
+        client: HardenedHttpClient,
+    ) -> Result<ProtocolExecutionResponse, OpenApiExecutionError> {
+        if !is_confidential_openapi_url(&prepared.request.url) {
+            return Err(OpenApiExecutionError::InsecureTransport);
+        }
         if let Some(authorization) = prepared.oauth_authorization {
-            let oauth = self.oauth.as_ref().ok_or(OpenApiExecutionError::OAuth {
-                code: "oauth_service_unavailable",
-            })?;
+            let oauth = self
+                .oauth
+                .as_ref()
+                .ok_or(OpenApiExecutionError::OAuth(OAuthError::Internal))?;
             let current_binding = oauth
-                .binding_for_scopes(
+                .ready_binding_for_scopes(
                     &authorization.source_id,
                     &authorization.scheme_name,
                     &authorization.required_scopes,
@@ -350,21 +395,18 @@ impl OpenApiAdapter {
                     authorization.expected_binding
                 }
                 _ => {
-                    return Err(OpenApiExecutionError::OAuth {
+                    return Err(OpenApiExecutionError::OAuth(OAuthError::Conflict {
                         code: "oauth_binding_changed",
-                    });
+                        message: "The managed OAuth binding changed before dispatch.",
+                    }));
                 }
             };
             let token = oauth
                 .access_token_for_binding(&binding)
                 .await
                 .map_err(openapi_oauth_error)?;
-            let mut value =
-                HeaderValue::from_str(&format!("Bearer {}", token.expose())).map_err(|_| {
-                    OpenApiExecutionError::OAuth {
-                        code: "oauth_access_token_invalid",
-                    }
-                })?;
+            let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+                .map_err(|_| OpenApiExecutionError::OAuth(OAuthError::Internal))?;
             value.set_sensitive(true);
             prepared
                 .request
@@ -374,13 +416,12 @@ impl OpenApiAdapter {
         let mutating = prepared.request.method != Method::GET
             && prepared.request.method != Method::HEAD
             && prepared.request.method != Method::OPTIONS;
-        let response = HardenedHttpClient::new(prepared.policy)
-            .execute(prepared.request)
-            .await
-            .map_err(|source| OpenApiExecutionError::Outbound {
+        let response = client.execute(prepared.request).await.map_err(|source| {
+            OpenApiExecutionError::Outbound {
                 outcome_unknown: mutating && may_have_dispatched(&source),
                 source,
-            })?;
+            }
+        })?;
         let succeeded = response.status.is_success();
         if mutating
             && (response.status.is_server_error()
@@ -425,6 +466,16 @@ impl OpenApiAdapter {
                 "Managed OAuth is unavailable.",
             )
         })?;
+        if let Some(expected) = expected_oauth_bindings {
+            return Self::resolve_snapshotted_managed_oauth(
+                oauth,
+                source_id,
+                binding,
+                &credential,
+                expected,
+            )
+            .await;
+        }
         let mut eligible_binding = binding.clone();
         eligible_binding.security.clear();
         let mut resolved = BTreeMap::new();
@@ -472,27 +523,7 @@ impl OpenApiAdapter {
                     }
                     Err(error) => return Err(openapi_oauth_prepare_error(error)),
                 };
-                let selected = match expected_oauth_bindings {
-                    Some(expected) => {
-                        let expected = expected
-                            .iter()
-                            .find(|binding| binding.credential_key == requirement.scheme_name);
-                        match (expected, current) {
-                            (Some(expected), Some(current)) if expected == &current => {
-                                Some(expected.clone())
-                            }
-                            (_, None) => None,
-                            _ => {
-                                return Err(ProtocolError::new(
-                                    ProtocolErrorCategory::Conflict,
-                                    "oauth_binding_changed",
-                                    "The OAuth connection changed before execution.",
-                                ));
-                            }
-                        }
-                    }
-                    None => current,
-                };
+                let selected = current;
                 let Some(selected) = selected else {
                     eligible = false;
                     break;
@@ -503,6 +534,72 @@ impl OpenApiAdapter {
                 eligible_binding.security.push(alternative.clone());
             }
         }
+        Ok((eligible_binding, resolved))
+    }
+
+    async fn resolve_snapshotted_managed_oauth(
+        oauth: &OAuthService,
+        source_id: &str,
+        binding: &OpenApiBinding,
+        credential: &StoredOpenApiCredentialV1,
+        expected: &[OAuthBinding],
+    ) -> Result<(OpenApiBinding, BTreeMap<String, OAuthBinding>), ProtocolError> {
+        let expected = expected
+            .iter()
+            .map(|binding| (binding.credential_key.as_str(), binding))
+            .collect::<BTreeMap<_, _>>();
+        let selected = binding.security.iter().find(|alternative| {
+            alternative.requirements.iter().all(|requirement| {
+                credential
+                    .credentials
+                    .schemes
+                    .contains_key(&requirement.scheme_name)
+                    || (managed_oauth_supported(requirement)
+                        && expected
+                            .get(requirement.scheme_name.as_str())
+                            .is_some_and(|binding| {
+                                requirement
+                                    .scopes
+                                    .iter()
+                                    .all(|scope| binding.granted_scopes.contains(scope))
+                            }))
+            })
+        });
+        let Some(selected) = selected else {
+            let mut eligible_binding = binding.clone();
+            eligible_binding.security.clear();
+            return Ok((eligible_binding, BTreeMap::new()));
+        };
+        let mut resolved = BTreeMap::new();
+        for requirement in &selected.requirements {
+            if credential
+                .credentials
+                .schemes
+                .contains_key(&requirement.scheme_name)
+            {
+                continue;
+            }
+            let expected = expected
+                .get(requirement.scheme_name.as_str())
+                .expect("the snapshotted alternative was selected from this binding map");
+            let current = oauth
+                .binding(source_id, &requirement.scheme_name)
+                .await
+                .map_err(openapi_oauth_prepare_error)?;
+            if current.as_ref() != Some(*expected) {
+                return Err(oauth_binding_changed());
+            }
+            let ready = oauth
+                .ready_binding_for_scopes(source_id, &requirement.scheme_name, &requirement.scopes)
+                .await
+                .map_err(openapi_oauth_prepare_error)?;
+            if ready.as_ref() != Some(*expected) {
+                return Err(oauth_binding_changed());
+            }
+            resolved.insert(requirement.scheme_name.clone(), (*expected).clone());
+        }
+        let mut eligible_binding = binding.clone();
+        eligible_binding.security = vec![selected.clone()];
         Ok((eligible_binding, resolved))
     }
 
@@ -527,10 +624,23 @@ impl OpenApiAdapter {
         let preferred_slug = input
             .preferred_slug
             .unwrap_or_else(|| input.display_name.clone());
-        let credential = StoredOpenApiCredentialV1 {
+        let mut credential = StoredOpenApiCredentialV1 {
             locator: fetched.locator,
             credentials: input.credential,
+            credential_origins: BTreeMap::new(),
         };
+        let credential_keys = credential
+            .credentials
+            .schemes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        bind_missing_credential_origins(
+            &mut credential,
+            fetched.compiled.tools.iter().map(|tool| &tool.binding),
+            credential_keys,
+            OriginInput::Untrusted,
+        )?;
         let snapshot = initial_catalog_snapshot(&fetched.compiled);
         let bindings = staged_bindings(&fetched.compiled);
         let (source, _) = catalog
@@ -584,8 +694,10 @@ impl OpenApiAdapter {
                         "The source has no OpenAPI document to refresh.",
                     )
                 })?;
+                let compiled = compile_bytes(document.into_bytes()).await?;
+                validate_inline_operation_transports(&compiled)?;
                 FetchedSpec {
-                    compiled: compile_bytes(document.into_bytes()).await?,
+                    compiled,
                     locator: StoredOpenApiLocatorV1::Inline,
                 }
             }
@@ -593,6 +705,7 @@ impl OpenApiAdapter {
                 fetch_url(url, configuration.allow_private_network).await?
             }
         };
+        verify_refresh_credential_origins(&credential, &fetched.compiled)?;
         let snapshot = catalog_snapshot(&fetched.compiled, source.revision, stored.revision);
         catalog
             .sync_catalog_with_bindings(
@@ -650,7 +763,22 @@ impl OpenApiAdapter {
             return Err(revision_conflict());
         }
         let mut credential = StoredOpenApiCredentialV1::decode(&stored)?;
+        let bindings = stored_openapi_bindings(catalog, source_id).await?;
         credential.credentials = credential_set;
+        self.retire_unused_credential_origins(source_id, &mut credential)
+            .await?;
+        let credential_keys = credential
+            .credentials
+            .schemes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        bind_missing_credential_origins(
+            &mut credential,
+            bindings.iter(),
+            credential_keys,
+            OriginInput::Stored,
+        )?;
         catalog
             .put_credential(
                 source_id,
@@ -661,6 +789,84 @@ impl OpenApiAdapter {
             .await
             .map_err(protocol_catalog_error)?;
         self.credential_metadata(catalog, source_id).await
+    }
+
+    pub(crate) async fn ensure_managed_oauth_origin_bound(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        credential_key: &str,
+        audit: AuditContext<'_>,
+    ) -> Result<(), ProtocolError> {
+        let stored = required_stored_credential(catalog, source_id).await?;
+        let mut credential = StoredOpenApiCredentialV1::decode(&stored)?;
+        let bindings = stored_openapi_bindings(catalog, source_id).await?;
+        if !matches!(credential.locator, StoredOpenApiLocatorV1::Url { .. })
+            || credential.credential_origins.contains_key(credential_key)
+        {
+            return Ok(());
+        }
+        bind_missing_credential_origins(
+            &mut credential,
+            bindings.iter(),
+            [credential_key.to_owned()],
+            OriginInput::Stored,
+        )?;
+        catalog
+            .put_credential(
+                source_id,
+                &credential.payload()?,
+                Some(stored.revision),
+                audit,
+            )
+            .await
+            .map_err(protocol_catalog_error)?;
+        Ok(())
+    }
+
+    pub(crate) async fn retire_managed_oauth_origin(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        credential_key: &str,
+        audit: AuditContext<'_>,
+    ) -> Result<(), ProtocolError> {
+        let Some(oauth) = self.oauth.as_ref() else {
+            return Ok(());
+        };
+        for _ in 0..MAX_ORIGIN_RETIRE_CAS_ATTEMPTS {
+            let stored = required_stored_credential(catalog, source_id).await?;
+            let mut credential = StoredOpenApiCredentialV1::decode(&stored)?;
+            if !credential.credential_origins.contains_key(credential_key)
+                || credential.credentials.schemes.contains_key(credential_key)
+                || oauth
+                    .binding(source_id, credential_key)
+                    .await
+                    .map_err(openapi_oauth_prepare_error)?
+                    .is_some()
+            {
+                return Ok(());
+            }
+            credential.credential_origins.remove(credential_key);
+            match catalog
+                .put_credential(
+                    source_id,
+                    &credential.payload()?,
+                    Some(stored.revision),
+                    audit,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    let error = protocol_catalog_error(error);
+                    if error.code != "revision_conflict" {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(revision_conflict())
     }
 
     pub async fn clear_credentials(
@@ -676,6 +882,8 @@ impl OpenApiAdapter {
         }
         let mut credential = StoredOpenApiCredentialV1::decode(&stored)?;
         credential.credentials = OpenApiCredentialSet::default();
+        self.retire_unused_credential_origins(source_id, &mut credential)
+            .await?;
         catalog
             .put_credential(
                 source_id,
@@ -686,6 +894,40 @@ impl OpenApiAdapter {
             .await
             .map_err(protocol_catalog_error)?;
         self.credential_metadata(catalog, source_id).await
+    }
+
+    async fn retire_unused_credential_origins(
+        &self,
+        source_id: &str,
+        credential: &mut StoredOpenApiCredentialV1,
+    ) -> Result<(), ProtocolError> {
+        let static_keys = credential
+            .credentials
+            .schemes
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let Some(oauth) = self.oauth.as_ref() else {
+            return Ok(());
+        };
+        let mut retained = BTreeSet::new();
+        for key in credential.credential_origins.keys() {
+            if static_keys.contains(key) {
+                continue;
+            }
+            if oauth
+                .binding(source_id, key)
+                .await
+                .map_err(openapi_oauth_prepare_error)?
+                .is_some()
+            {
+                retained.insert(key.clone());
+            }
+        }
+        credential
+            .credential_origins
+            .retain(|key, _| static_keys.contains(key) || retained.contains(key));
+        Ok(())
     }
 
     fn plan_invocation(
@@ -703,6 +945,9 @@ impl OpenApiAdapter {
                 "The stored OpenAPI tool binding schema is not supported.",
             ));
         }
+        let binding_url =
+            require_http_url(&binding.server_url).map_err(|_| invalid_tool_binding())?;
+        require_confidential_stored_url(&binding_url)?;
         let configuration = OpenApiSourceConfigurationV1::decode(source_configuration)?;
         let stored = stored.ok_or_else(|| {
             ProtocolError::corrupt(
@@ -714,13 +959,25 @@ impl OpenApiAdapter {
         let document_base_url = match &credential.locator {
             StoredOpenApiLocatorV1::Inline => None,
             StoredOpenApiLocatorV1::Url {
-                document_base_url, ..
-            } => Some(require_http_url(document_base_url).map_err(|_| {
-                ProtocolError::corrupt(
-                    "invalid_source_credentials",
-                    "The stored OpenAPI credential state is invalid.",
-                )
-            })?),
+                url,
+                document_base_url,
+            } => {
+                let locator_url = require_http_url(url).map_err(|_| {
+                    ProtocolError::corrupt(
+                        "invalid_source_credentials",
+                        "The stored OpenAPI credential state is invalid.",
+                    )
+                })?;
+                require_confidential_stored_url(&locator_url)?;
+                let document_base_url = require_http_url(document_base_url).map_err(|_| {
+                    ProtocolError::corrupt(
+                        "invalid_source_credentials",
+                        "The stored OpenAPI credential state is invalid.",
+                    )
+                })?;
+                require_confidential_stored_url(&document_base_url)?;
+                Some(document_base_url)
+            }
         };
         let mut invocation_credentials = credential.credentials.clone();
         for scheme_name in resolved_oauth.keys() {
@@ -740,6 +997,8 @@ impl OpenApiAdapter {
             document_base_url.as_ref(),
         )
         .map_err(invocation_error)?;
+        require_confidential_stored_url(&protocol_request.url)?;
+        verify_invocation_credential_origins(&credential, &protocol_request)?;
         let managed = protocol_request
             .selected_security_schemes
             .iter()
@@ -812,6 +1071,7 @@ impl OpenApiAdapter {
             request,
             policy: OutboundPolicy {
                 allow_private_networks: configuration.allow_private_network,
+                require_https_or_loopback: true,
                 ..OutboundPolicy::default()
             },
             oauth_authorization,
@@ -820,16 +1080,7 @@ impl OpenApiAdapter {
 }
 
 fn openapi_oauth_error(error: OAuthError) -> OpenApiExecutionError {
-    let code = match error {
-        OAuthError::Validation { code, .. }
-        | OAuthError::Conflict { code, .. }
-        | OAuthError::Upstream { code } => code,
-        OAuthError::NotFound => "oauth_connection_required",
-        OAuthError::UnauthorizedTransaction => "oauth_transaction_unauthorized",
-        OAuthError::AuthorizationDenied { .. } => "oauth_authorization_denied",
-        OAuthError::Internal => "oauth_internal_error",
-    };
-    OpenApiExecutionError::OAuth { code }
+    OpenApiExecutionError::OAuth(error)
 }
 
 fn openapi_oauth_prepare_error(error: OAuthError) -> ProtocolError {
@@ -858,6 +1109,14 @@ fn openapi_oauth_prepare_error(error: OAuthError) -> ProtocolError {
             "Managed OAuth could not be resolved safely.",
         ),
     }
+}
+
+fn oauth_binding_changed() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCategory::Conflict,
+        "oauth_binding_changed",
+        "The OAuth connection changed before execution.",
+    )
 }
 
 fn may_have_dispatched(error: &crate::outbound::OutboundError) -> bool {
@@ -903,6 +1162,236 @@ fn safe_response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
     .collect()
 }
 
+#[derive(Clone, Copy)]
+enum OriginInput {
+    Stored,
+    Untrusted,
+}
+
+fn bind_missing_credential_origins<'a>(
+    credential: &mut StoredOpenApiCredentialV1,
+    bindings: impl IntoIterator<Item = &'a OpenApiBinding>,
+    credential_keys: impl IntoIterator<Item = String>,
+    input: OriginInput,
+) -> Result<(), ProtocolError> {
+    if !matches!(&credential.locator, StoredOpenApiLocatorV1::Url { .. }) {
+        return Ok(());
+    }
+    let missing = credential_keys
+        .into_iter()
+        .filter(|key| !credential.credential_origins.contains_key(key))
+        .collect::<BTreeSet<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if credential
+        .credential_origins
+        .len()
+        .checked_add(missing.len())
+        .is_none_or(|count| count > MAX_BOUND_CREDENTIAL_SCHEMES)
+    {
+        return Err(origin_limit_error(input));
+    }
+    credential
+        .credential_origins
+        .extend(credential_origins_for_bindings(bindings, missing, input)?);
+    Ok(())
+}
+
+fn credential_origins_for_bindings<'a>(
+    bindings: impl IntoIterator<Item = &'a OpenApiBinding>,
+    credential_keys: impl IntoIterator<Item = String>,
+    input: OriginInput,
+) -> Result<BTreeMap<String, Vec<String>>, ProtocolError> {
+    let mut origins = credential_keys
+        .into_iter()
+        .map(|key| (key, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    if origins.len() > MAX_BOUND_CREDENTIAL_SCHEMES {
+        return Err(origin_limit_error(input));
+    }
+    for binding in bindings {
+        let matching = binding
+            .security
+            .iter()
+            .flat_map(|alternative| &alternative.requirements)
+            .map(|requirement| requirement.scheme_name.as_str())
+            .filter(|scheme_name| origins.contains_key(*scheme_name))
+            .collect::<BTreeSet<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        let server_url = require_http_url(&binding.server_url).map_err(|_| match input {
+            OriginInput::Stored => invalid_tool_binding(),
+            OriginInput::Untrusted => ProtocolError::new(
+                ProtocolErrorCategory::InvalidInput,
+                "invalid_openapi_document",
+                "The OpenAPI document contains an invalid server URL.",
+            ),
+        })?;
+        require_confidential_untrusted_url(&server_url)?;
+        let origin = normalized_http_origin(&binding.server_url).map_err(|_| match input {
+            OriginInput::Stored => ProtocolError::corrupt(
+                "invalid_tool_binding",
+                "The stored OpenAPI tool binding is invalid.",
+            ),
+            OriginInput::Untrusted => ProtocolError::new(
+                ProtocolErrorCategory::InvalidInput,
+                "invalid_openapi_document",
+                "The OpenAPI document contains an invalid server URL.",
+            ),
+        })?;
+        for scheme_name in matching {
+            let destinations = origins
+                .get_mut(scheme_name)
+                .expect("the matching credential key came from the destination map");
+            destinations.insert(origin.clone());
+            if destinations.len() > MAX_CREDENTIAL_ORIGINS_PER_SCHEME {
+                return Err(origin_limit_error(input));
+            }
+        }
+    }
+    Ok(origins
+        .into_iter()
+        .map(|(key, origins)| (key, origins.into_iter().collect()))
+        .collect())
+}
+
+fn verify_refresh_credential_origins(
+    credential: &StoredOpenApiCredentialV1,
+    compiled: &CompiledOpenApi,
+) -> Result<(), ProtocolError> {
+    verify_candidate_credential_origins(credential, compiled.tools.iter().map(|tool| &tool.binding))
+}
+
+fn verify_candidate_credential_origins<'a>(
+    credential: &StoredOpenApiCredentialV1,
+    bindings: impl IntoIterator<Item = &'a OpenApiBinding>,
+) -> Result<(), ProtocolError> {
+    if !matches!(&credential.locator, StoredOpenApiLocatorV1::Url { .. }) {
+        return Ok(());
+    }
+    for key in credential.credentials.schemes.keys() {
+        if !credential.credential_origins.contains_key(key) {
+            return Err(unbound_credential_origin());
+        }
+    }
+    let candidates = credential_origins_for_bindings(
+        bindings,
+        credential.credential_origins.keys().cloned(),
+        OriginInput::Untrusted,
+    )?;
+    for (scheme_name, destinations) in candidates {
+        let allowed = credential
+            .credential_origins
+            .get(&scheme_name)
+            .ok_or_else(unbound_credential_origin)?;
+        if destinations
+            .iter()
+            .any(|destination| allowed.binary_search(destination).is_err())
+        {
+            return Err(changed_credential_origin());
+        }
+    }
+    Ok(())
+}
+
+fn verify_invocation_credential_origins(
+    credential: &StoredOpenApiCredentialV1,
+    request: &crate::openapi::OpenApiProtocolRequest,
+) -> Result<(), ProtocolError> {
+    if !matches!(&credential.locator, StoredOpenApiLocatorV1::Url { .. })
+        || request.selected_security_schemes.is_empty()
+    {
+        return Ok(());
+    }
+    let destination = request.url.origin().ascii_serialization();
+    for scheme_name in &request.selected_security_schemes {
+        let allowed = credential
+            .credential_origins
+            .get(scheme_name)
+            .ok_or_else(unbound_credential_origin)?;
+        if allowed.binary_search(&destination).is_err() {
+            return Err(changed_credential_origin());
+        }
+    }
+    Ok(())
+}
+
+fn normalized_http_origin(value: &str) -> Result<String, crate::outbound::OutboundError> {
+    Ok(require_http_url(value)?.origin().ascii_serialization())
+}
+
+fn origin_limit_error(input: OriginInput) -> ProtocolError {
+    match input {
+        OriginInput::Stored => invalid_stored_credentials(),
+        OriginInput::Untrusted => ProtocolError::new(
+            ProtocolErrorCategory::InvalidInput,
+            "openapi_credential_origin_limit_exceeded",
+            "The OpenAPI document declares too many credential destinations.",
+        ),
+    }
+}
+
+fn unbound_credential_origin() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCategory::Conflict,
+        "openapi_credential_origin_unbound",
+        "The OpenAPI credential destination is not bound. Save the credential again before use.",
+    )
+}
+
+fn changed_credential_origin() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCategory::Conflict,
+        "openapi_credential_origin_changed",
+        "The OpenAPI refresh changed a credential destination origin.",
+    )
+}
+
+fn invalid_stored_credentials() -> ProtocolError {
+    ProtocolError::corrupt(
+        "invalid_source_credentials",
+        "The stored OpenAPI credential state is invalid.",
+    )
+}
+
+async fn stored_openapi_bindings(
+    catalog: &CatalogStore,
+    source_id: &str,
+) -> Result<Vec<OpenApiBinding>, ProtocolError> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT tool_bindings.binding_version, tool_bindings.definition_json \
+         FROM tool_bindings JOIN tools ON tools.id = tool_bindings.tool_id \
+         WHERE tools.source_id = ? AND tools.present = 1 \
+         AND tool_bindings.protocol = 'openapi' ORDER BY tools.stable_key",
+    )
+    .bind(source_id)
+    .fetch_all(catalog.pool())
+    .await
+    .map_err(|_| internal_storage_error())?;
+    rows.into_iter()
+        .map(|(version, definition)| {
+            let binding: OpenApiBinding =
+                serde_json::from_str(&definition).map_err(|_| invalid_tool_binding())?;
+            if version != 1 || binding.version != 1 {
+                return Err(invalid_tool_binding());
+            }
+            let server_url =
+                require_http_url(&binding.server_url).map_err(|_| invalid_tool_binding())?;
+            require_confidential_untrusted_url(&server_url)?;
+            Ok(binding)
+        })
+        .collect()
+}
+
+fn invalid_tool_binding() -> ProtocolError {
+    ProtocolError::corrupt(
+        "invalid_tool_binding",
+        "The stored OpenAPI tool binding is invalid.",
+    )
+}
+
 struct FetchedSpec {
     compiled: CompiledOpenApi,
     locator: StoredOpenApiLocatorV1,
@@ -922,17 +1411,7 @@ async fn fetch_and_compile(
                 ));
             }
             let compiled = compile_bytes(content.as_bytes().to_vec()).await?;
-            if compiled
-                .tools
-                .iter()
-                .any(|tool| require_http_url(&tool.binding.server_url).is_err())
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCategory::InvalidInput,
-                    "inline_openapi_server_required",
-                    "Inline OpenAPI documents must define an absolute HTTP or HTTPS server URL.",
-                ));
-            }
+            validate_inline_operation_transports(&compiled)?;
             Ok(FetchedSpec {
                 compiled,
                 locator: StoredOpenApiLocatorV1::Inline,
@@ -942,38 +1421,89 @@ async fn fetch_and_compile(
     }
 }
 
+fn validate_inline_operation_transports(compiled: &CompiledOpenApi) -> Result<(), ProtocolError> {
+    for tool in &compiled.tools {
+        let url = require_http_url(&tool.binding.server_url).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCategory::InvalidInput,
+                "inline_openapi_server_required",
+                "Inline OpenAPI documents must define an absolute HTTP or HTTPS server URL.",
+            )
+        })?;
+        require_confidential_untrusted_url(&url)?;
+    }
+    Ok(())
+}
+
 async fn fetch_url(url: &str, allow_private_network: bool) -> Result<FetchedSpec, ProtocolError> {
     let policy = OutboundPolicy {
         allow_private_networks: allow_private_network,
+        require_https_or_loopback: true,
         max_response_bytes: MAX_SPEC_BYTES,
         ..OutboundPolicy::default()
     };
+    let transport_url =
+        Url::parse(url).map_err(|_| protocol_outbound_error(OutboundError::InvalidUrl))?;
+    require_confidential_untrusted_url(&transport_url)?;
     let url = parse_url(url, &policy).map_err(protocol_outbound_error)?;
     let response = HardenedHttpClient::new(policy)
-        .fetch_spec(url.clone(), HeaderMap::new())
+        .fetch_spec_with_url_policy(url.clone(), HeaderMap::new(), |candidate| {
+            if is_confidential_openapi_url(candidate) {
+                Ok(())
+            } else {
+                Err(OutboundError::RedirectDowngrade)
+            }
+        })
         .await
-        .map_err(protocol_outbound_error)?;
+        .map_err(|error| match error {
+            OutboundError::RedirectDowngrade | OutboundError::InsecureTransport => {
+                insecure_openapi_transport(ProtocolErrorCategory::InvalidInput)
+            }
+            error => protocol_outbound_error(error),
+        })?;
+    require_confidential_untrusted_url(&response.final_url)?;
     let mut compiled = compile_bytes(response.body).await?;
+    let mut document_base_url = response.final_url.clone();
+    document_base_url.set_query(None);
+    document_base_url.set_fragment(None);
     for tool in &mut compiled.tools {
-        tool.binding.server_url = response
-            .final_url
-            .join(&tool.binding.server_url)
-            .map_err(|_| {
-                ProtocolError::new(
-                    ProtocolErrorCategory::InvalidInput,
-                    "invalid_openapi_document",
-                    "The OpenAPI document contains an invalid server URL.",
-                )
-            })?
-            .to_string();
+        tool.binding.server_url =
+            resolved_document_server_url(&document_base_url, &tool.binding.server_url)?;
     }
     Ok(FetchedSpec {
         compiled,
         locator: StoredOpenApiLocatorV1::Url {
             url: url.to_string(),
-            document_base_url: response.final_url.to_string(),
+            document_base_url: document_base_url.to_string(),
         },
     })
+}
+
+fn resolved_document_server_url(
+    document_base_url: &Url,
+    server_url: &str,
+) -> Result<String, ProtocolError> {
+    let resolved = document_base_url.join(server_url).map_err(|_| {
+        ProtocolError::new(
+            ProtocolErrorCategory::InvalidInput,
+            "invalid_openapi_document",
+            "The OpenAPI document contains an invalid server URL.",
+        )
+    })?;
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !resolved.username().is_empty()
+        || resolved.password().is_some()
+        || resolved.query().is_some()
+        || resolved.fragment().is_some()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCategory::InvalidInput,
+            "invalid_openapi_document",
+            "The OpenAPI document contains an invalid server URL.",
+        ));
+    }
+    require_confidential_untrusted_url(&resolved)?;
+    Ok(resolved.to_string())
 }
 
 async fn compile_bytes(bytes: Vec<u8>) -> Result<CompiledOpenApi, ProtocolError> {
@@ -1294,12 +1824,22 @@ fn credential_metadata(revision: i64, stored: StoredOpenApiCredentialV1) -> Cred
 }
 
 fn validate_input_credentials(credentials: &OpenApiCredentialSet) -> Result<(), ProtocolError> {
-    credentials.validate().map_err(|_| {
-        ProtocolError::new(
+    credentials.validate().map_err(|error| match error {
+        crate::openapi::OpenApiCredentialError::InvalidBasicUsername => ProtocolError::new(
+            ProtocolErrorCategory::InvalidInput,
+            "invalid_basic_username",
+            "An HTTP Basic username must not contain a colon.",
+        ),
+        crate::openapi::OpenApiCredentialError::InvalidBasicValue => ProtocolError::new(
+            ProtocolErrorCategory::InvalidInput,
+            "invalid_basic_credentials",
+            "HTTP Basic credentials must not contain control characters.",
+        ),
+        _ => ProtocolError::new(
             ProtocolErrorCategory::InvalidInput,
             "invalid_credentials",
             "The static credential configuration is invalid.",
-        )
+        ),
     })
 }
 
@@ -1376,6 +1916,45 @@ fn require_http_url(value: &str) -> Result<Url, crate::outbound::OutboundError> 
     Ok(url)
 }
 
+fn is_confidential_openapi_url(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn require_confidential_untrusted_url(url: &Url) -> Result<(), ProtocolError> {
+    if is_confidential_openapi_url(url) {
+        Ok(())
+    } else {
+        Err(insecure_openapi_transport(
+            ProtocolErrorCategory::InvalidInput,
+        ))
+    }
+}
+
+fn require_confidential_stored_url(url: &Url) -> Result<(), ProtocolError> {
+    if is_confidential_openapi_url(url) {
+        Ok(())
+    } else {
+        Err(insecure_openapi_transport(ProtocolErrorCategory::Conflict))
+    }
+}
+
+fn insecure_openapi_transport(category: ProtocolErrorCategory) -> ProtocolError {
+    ProtocolError::new(
+        category,
+        "insecure_openapi_transport",
+        "OpenAPI URLs must use HTTPS, except for loopback HTTP endpoints.",
+    )
+}
+
 fn revision_conflict() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCategory::Conflict,
@@ -1423,23 +2002,631 @@ mod tests {
         net::TcpListener,
         time::{Duration, timeout},
     };
+    use url::Url;
 
     use super::{
-        OpenApiAdapter, OpenApiSourceConfigurationV1, StoredOpenApiCredentialV1, response_data,
-        safe_response_headers,
+        OpenApiAdapter, OpenApiSourceConfigurationV1, StoredOpenApiCredentialV1,
+        StoredOpenApiLocatorV1, is_confidential_openapi_url, normalized_http_origin, response_data,
+        safe_response_headers, verify_candidate_credential_origins,
     };
     use crate::{
         catalog::{CredentialPayload, StoredCredential},
         crypto::Keyring,
         oauth::{
-            OAuthService,
-            model::{OAuthClientAuthentication, OAuthConnectionConfig, OAuthSecretSet},
+            OAuthBinding, OAuthService,
+            model::{
+                OAuthClientAuthentication, OAuthClientSecretUpdate, OAuthConnectionConfig,
+                OAuthSecretSet,
+            },
             store::OAuthStore,
         },
-        openapi::{OpenApiCredential, OpenApiCredentialSet, compile_document},
-        outbound::OutboundPolicy,
+        openapi::{
+            OpenApiBinding, OpenApiCredential, OpenApiCredentialSet, OpenApiSecurityAlternative,
+            OpenApiSecurityRequirement, OpenApiSecurityScheme, compile_document,
+        },
+        outbound::{HardenedHttpClient, OutboundPolicy},
         protocols::ProtocolErrorCategory,
     };
+
+    fn origin_binding(server_url: &str, scheme_name: &str) -> OpenApiBinding {
+        OpenApiBinding {
+            version: 1,
+            method: "GET".to_owned(),
+            path_template: "/credential".to_owned(),
+            server_url: server_url.to_owned(),
+            parameters: Vec::new(),
+            request_body: None,
+            security: vec![OpenApiSecurityAlternative {
+                requirements: vec![OpenApiSecurityRequirement {
+                    scheme_name: scheme_name.to_owned(),
+                    scopes: Vec::new(),
+                    scheme: OpenApiSecurityScheme::Http {
+                        scheme: "bearer".to_owned(),
+                        bearer_format: None,
+                    },
+                    oauth_flows: None,
+                }],
+            }],
+        }
+    }
+
+    struct ManagedAlternativeFixture {
+        adapter: OpenApiAdapter,
+        oauth: OAuthService,
+        store: OAuthStore,
+        pool: sqlx::SqlitePool,
+        binding: OpenApiBinding,
+        configuration: serde_json::Map<String, serde_json::Value>,
+        stored: StoredCredential,
+        expected: Vec<OAuthBinding>,
+        config: OAuthConnectionConfig,
+        first_connection_revision: i64,
+    }
+
+    async fn managed_alternative_fixture() -> ManagedAlternativeFixture {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("test database opens");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations apply");
+        sqlx::query(
+            "INSERT INTO sources (
+                id, kind, slug, display_name, configuration_json, health_status,
+                revision, catalog_revision, created_at, updated_at
+             ) VALUES (?, 'openapi', 'alternatives', 'Alternatives', ?, 'unknown', 0, 0, 1, 1)",
+        )
+        .bind("source-alternatives")
+        .bind(r#"{"spec":{"type":"inline"},"allowPrivateNetwork":false}"#)
+        .execute(&pool)
+        .await
+        .expect("source inserts");
+        let keyring = Keyring::from_master_key([57; 32]).expect("test keyring");
+        let store = OAuthStore::new(pool.clone(), keyring.clone());
+        let config = OAuthConnectionConfig {
+            issuer: "https://auth.example.test".to_owned(),
+            authorization_endpoint: "https://auth.example.test/authorize".to_owned(),
+            token_endpoint: "https://auth.example.test/token".to_owned(),
+            client_id: "client".to_owned(),
+            client_authentication: OAuthClientAuthentication::None,
+            token_endpoint_auth_methods_supported: vec!["none".to_owned()],
+            scopes: vec!["read".to_owned()],
+            allow_private_network: false,
+            resource: None,
+        };
+        let secrets = |token: &str| OAuthSecretSet {
+            access_token: Some(token.to_owned()),
+            token_type: Some("Bearer".to_owned()),
+            granted_scopes: vec!["read".to_owned()],
+            access_token_expires_at: Some(i64::MAX),
+            ..OAuthSecretSet::default()
+        };
+        let first = store
+            .create_connection(
+                "source-alternatives",
+                "oauthA",
+                &config,
+                Some(&secrets("token-a")),
+                1,
+            )
+            .await
+            .expect("first OAuth connection inserts");
+        store
+            .create_connection(
+                "source-alternatives",
+                "oauthB",
+                &config,
+                Some(&secrets("token-b")),
+                1,
+            )
+            .await
+            .expect("second OAuth connection inserts");
+        let oauth = OAuthService::new(
+            pool.clone(),
+            keyring,
+            "http://127.0.0.1:4788".to_owned(),
+            OutboundPolicy::default(),
+        );
+        let expected = oauth
+            .bindings_for_source("source-alternatives")
+            .await
+            .expect("approval OAuth snapshot reads");
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Managed alternatives" },
+            "servers": [{ "url": "https://api.example.test" }],
+            "components": { "securitySchemes": {
+                "oauthA": { "type": "oauth2", "flows": { "authorizationCode": {
+                    "authorizationUrl": "https://auth.example.test/authorize",
+                    "tokenUrl": "https://auth.example.test/token",
+                    "scopes": { "read": "Read" }
+                }}},
+                "oauthB": { "type": "oauth2", "flows": { "authorizationCode": {
+                    "authorizationUrl": "https://auth.example.test/authorize",
+                    "tokenUrl": "https://auth.example.test/token",
+                    "scopes": { "read": "Read" }
+                }}}
+            }},
+            "paths": { "/items": { "get": {
+                "security": [{ "oauthA": ["read"] }, { "oauthB": ["read"] }],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let binding = compile_document(&serde_json::to_vec(&document).unwrap())
+            .expect("OAuth alternatives compile")
+            .tools
+            .remove(0)
+            .binding;
+        ManagedAlternativeFixture {
+            adapter: OpenApiAdapter::with_oauth(oauth.clone()),
+            oauth,
+            store,
+            pool,
+            binding,
+            configuration: json!({
+                "spec": { "type": "inline" },
+                "allowPrivateNetwork": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            stored: StoredCredential {
+                revision: 1,
+                credential: CredentialPayload {
+                    schema_version: 1,
+                    payload: json!({
+                        "locator": { "type": "inline" },
+                        "credentials": { "schemes": {} }
+                    }),
+                },
+            },
+            expected,
+            config,
+            first_connection_revision: first.connection.revision,
+        }
+    }
+
+    #[test]
+    fn credential_origin_normalization_covers_default_ports_idna_case_and_ipv6() {
+        assert_eq!(
+            normalized_http_origin("HTTPS://EXAMPLE.COM:443/v1").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalized_http_origin("https://bücher.example/v1").unwrap(),
+            "https://xn--bcher-kva.example"
+        );
+        assert_eq!(
+            normalized_http_origin("http://[2001:db8::1]:80/v1").unwrap(),
+            "http://[2001:db8::1]"
+        );
+        assert_eq!(
+            normalized_http_origin("https://example.com:8443/v1").unwrap(),
+            "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn confidential_transport_allows_https_and_only_loopback_http() {
+        for allowed in [
+            "https://api.example.test/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1/v1",
+            "http://127.255.10.20/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(
+                is_confidential_openapi_url(&Url::parse(allowed).expect("allowed URL parses")),
+                "{allowed} should be confidential"
+            );
+        }
+        for rejected in [
+            "http://example.com/v1",
+            "http://10.0.0.1/v1",
+            "http://192.168.1.10/v1",
+            "http://[fd00::1]/v1",
+            "http://[::]/v1",
+            "http://localhost.example/v1",
+        ] {
+            assert!(
+                !is_confidential_openapi_url(&Url::parse(rejected).expect("rejected URL parses")),
+                "{rejected} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_origins_are_compared_per_scheme_and_unused_keys_bind_empty() {
+        let credential = StoredOpenApiCredentialV1 {
+            locator: StoredOpenApiLocatorV1::Url {
+                url: "https://spec.example/openapi.json".to_owned(),
+                document_base_url: "https://spec.example/openapi.json".to_owned(),
+            },
+            credentials: OpenApiCredentialSet {
+                schemes: [(
+                    "unused".to_owned(),
+                    OpenApiCredential::Bearer {
+                        token: "secret".to_owned(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+            credential_origins: BTreeMap::from([
+                ("first".to_owned(), vec!["https://one.example".to_owned()]),
+                ("second".to_owned(), vec!["https://two.example".to_owned()]),
+                ("unused".to_owned(), Vec::new()),
+            ]),
+        };
+        let same_origins_new_paths = [
+            origin_binding("https://one.example/new/path", "first"),
+            origin_binding("https://two.example:443/other", "second"),
+        ];
+        verify_candidate_credential_origins(&credential, same_origins_new_paths.iter())
+            .expect("same-origin path changes remain valid");
+
+        let swapped = [
+            origin_binding("https://two.example/path", "first"),
+            origin_binding("https://one.example/path", "second"),
+        ];
+        assert_eq!(
+            verify_candidate_credential_origins(&credential, swapped.iter())
+                .expect_err("per-scheme destination swaps must fail")
+                .code,
+            "openapi_credential_origin_changed"
+        );
+
+        let newly_used = [origin_binding("https://one.example/path", "unused")];
+        assert_eq!(
+            verify_candidate_credential_origins(&credential, newly_used.iter())
+                .expect_err("an unused configured credential has no approved destination")
+                .code,
+            "openapi_credential_origin_changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_static_credentials_retires_only_unused_origin_pins() {
+        let fixture = managed_alternative_fixture().await;
+        let mut credential = StoredOpenApiCredentialV1 {
+            locator: StoredOpenApiLocatorV1::Url {
+                url: "https://spec.example/openapi.json".to_owned(),
+                document_base_url: "https://spec.example/openapi.json".to_owned(),
+            },
+            credentials: OpenApiCredentialSet::default(),
+            credential_origins: BTreeMap::from([
+                ("oauthA".to_owned(), vec!["https://api.example".to_owned()]),
+                (
+                    "retiredStatic".to_owned(),
+                    vec!["https://old.example".to_owned()],
+                ),
+            ]),
+        };
+        let mut unavailable = credential.clone();
+        OpenApiAdapter::default()
+            .retire_unused_credential_origins("source-alternatives", &mut unavailable)
+            .await
+            .expect("an unavailable OAuth registry fails closed");
+        assert_eq!(
+            unavailable.credential_origins,
+            credential.credential_origins
+        );
+        fixture
+            .adapter
+            .retire_unused_credential_origins("source-alternatives", &mut credential)
+            .await
+            .expect("origin pins reconcile");
+        assert!(credential.credential_origins.contains_key("oauthA"));
+        assert!(!credential.credential_origins.contains_key("retiredStatic"));
+
+        fixture
+            .oauth
+            .delete_connection(
+                "source-alternatives",
+                "oauthA",
+                fixture.first_connection_revision,
+            )
+            .await
+            .expect("managed OAuth connection deletes");
+        fixture
+            .adapter
+            .retire_unused_credential_origins("source-alternatives", &mut credential)
+            .await
+            .expect("origin pins reconcile after OAuth deletion");
+        assert!(credential.credential_origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_oauth_alternative_does_not_fall_through_when_preferred_disappears() {
+        let fixture = managed_alternative_fixture().await;
+        let prepared = fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+            .expect("the approval snapshot should select its first alternative");
+        assert_eq!(
+            prepared
+                .oauth_authorization
+                .as_ref()
+                .map(|authorization| authorization.scheme_name.as_str()),
+            Some("oauthA")
+        );
+        fixture
+            .oauth
+            .delete_connection(
+                "source-alternatives",
+                "oauthA",
+                fixture.first_connection_revision,
+            )
+            .await
+            .expect("the preferred connection deletes");
+        assert!(
+            fixture
+                .oauth
+                .ready_binding_for_scopes("source-alternatives", "oauthB", &["read".to_owned()])
+                .await
+                .expect("fallback binding reads")
+                .is_some(),
+            "the fallback remains eligible"
+        );
+        let error = match fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+        {
+            Ok(_) => panic!("the approved connection may not fall through to another alternative"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "oauth_binding_changed");
+        assert_eq!(error.category, ProtocolErrorCategory::Conflict);
+    }
+
+    #[tokio::test]
+    async fn approved_oauth_alternative_does_not_fall_through_after_revision_change() {
+        let fixture = managed_alternative_fixture().await;
+        fixture
+            .store
+            .upsert_connection(
+                "source-alternatives",
+                "oauthA",
+                fixture.first_connection_revision,
+                &fixture.config,
+                OAuthClientSecretUpdate::Preserve,
+                2,
+            )
+            .await
+            .expect("the preferred connection revision changes");
+        assert!(
+            fixture
+                .oauth
+                .ready_binding_for_scopes("source-alternatives", "oauthB", &["read".to_owned()])
+                .await
+                .expect("fallback binding reads")
+                .is_some(),
+            "the fallback remains eligible"
+        );
+        let error = match fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+        {
+            Ok(_) => panic!("a changed approved connection may not fall through"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "oauth_binding_changed");
+        assert_eq!(error.category, ProtocolErrorCategory::Conflict);
+    }
+
+    #[tokio::test]
+    async fn approval_scope_snapshot_keeps_the_originally_eligible_alternative() {
+        let mut fixture = managed_alternative_fixture().await;
+        sqlx::query(
+            "UPDATE oauth_connections SET granted_scopes_json = '[]' \
+             WHERE source_id = ? AND credential_key = 'oauthA'",
+        )
+        .bind("source-alternatives")
+        .execute(&fixture.pool)
+        .await
+        .expect("first alternative loses its grant before approval");
+        fixture.expected = fixture
+            .oauth
+            .bindings_for_source("source-alternatives")
+            .await
+            .expect("approval OAuth snapshot reads");
+        assert_eq!(fixture.expected.len(), 2);
+        assert!(
+            fixture
+                .expected
+                .iter()
+                .find(|binding| binding.credential_key == "oauthA")
+                .expect("first OAuth alternative is snapshotted")
+                .granted_scopes
+                .is_empty()
+        );
+
+        let selected = fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+            .expect("the scope-eligible second alternative prepares");
+        assert_eq!(
+            selected
+                .oauth_authorization
+                .as_ref()
+                .map(|authorization| authorization.scheme_name.as_str()),
+            Some("oauthB")
+        );
+
+        sqlx::query(
+            "UPDATE oauth_connections SET granted_scopes_json = '[\"read\"]' \
+             WHERE source_id = ? AND credential_key = 'oauthA'",
+        )
+        .bind("source-alternatives")
+        .execute(&fixture.pool)
+        .await
+        .expect("first alternative gains scope while approval waits");
+        assert!(
+            !fixture
+                .oauth
+                .bindings_match("source-alternatives", &fixture.expected)
+                .await
+                .expect("approval OAuth snapshot compares"),
+            "a changed approval-time scope snapshot must become stale"
+        );
+        let still_selected = fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+            .expect("selection is reconstructed from approval-time scopes");
+        assert_eq!(
+            still_selected
+                .oauth_authorization
+                .as_ref()
+                .map(|authorization| authorization.scheme_name.as_str()),
+            Some("oauthB")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_oauth_invocation_rechecks_active_state_before_dispatch() {
+        let mut fixture = managed_alternative_fixture().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        fixture.binding.server_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address reads")
+        );
+        fixture.configuration.insert(
+            "allowPrivateNetwork".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let prepared = fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+            .expect("active OAuth invocation prepares");
+        fixture
+            .store
+            .begin_authorization(
+                "source-alternatives",
+                "oauthA",
+                fixture.first_connection_revision,
+                &[9_u8; 32],
+                10,
+                100,
+            )
+            .await
+            .expect("reauthorization transitions the selected connection to connecting");
+
+        let error = fixture
+            .adapter
+            .execute_invocation(prepared)
+            .await
+            .expect_err("a connecting OAuth binding cannot dispatch");
+        assert_eq!(error.code(), "oauth_binding_changed");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the upstream must receive no request after the OAuth state transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_oauth_invocation_rechecks_connection_existence_before_dispatch() {
+        let mut fixture = managed_alternative_fixture().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        fixture.binding.server_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address reads")
+        );
+        fixture.configuration.insert(
+            "allowPrivateNetwork".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let prepared = fixture
+            .adapter
+            .prepare_invocation(
+                "source-alternatives",
+                &fixture.binding,
+                &fixture.configuration,
+                Some(&fixture.stored),
+                &json!({}),
+                Some(&fixture.expected),
+            )
+            .await
+            .expect("active OAuth invocation prepares");
+        fixture
+            .oauth
+            .delete_connection(
+                "source-alternatives",
+                "oauthA",
+                fixture.first_connection_revision,
+            )
+            .await
+            .expect("the selected OAuth connection deletes");
+
+        let error = fixture
+            .adapter
+            .execute_invocation(prepared)
+            .await
+            .expect_err("a deleted OAuth binding cannot dispatch");
+        assert_eq!(error.code(), "oauth_binding_changed");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the upstream must receive no request after OAuth revocation"
+        );
+    }
 
     #[test]
     fn malformed_source_configuration_is_corrupt_data() {
@@ -1589,6 +2776,7 @@ mod tests {
             connection_id: "connection-id".to_owned(),
             credential_key: "oauth".to_owned(),
             config_revision: 3,
+            granted_scopes: Vec::new(),
         };
         let resolved = BTreeMap::from([("oauth".to_owned(), expected.clone())]);
 
@@ -1965,10 +3153,27 @@ mod tests {
             allow_private_network: true,
             resource: None,
         };
-        oauth_store
-            .create_connection("source-id", "oauthPending", &connection_config, None, 1)
+        let pending = oauth_store
+            .create_connection(
+                "source-id",
+                "oauthPending",
+                &connection_config,
+                Some(&OAuthSecretSet {
+                    access_token: Some("pending-access-token".to_owned()),
+                    token_type: Some("Bearer".to_owned()),
+                    granted_scopes: vec!["write:items".to_owned()],
+                    access_token_expires_at: Some(i64::MAX),
+                    ..OAuthSecretSet::default()
+                }),
+                1,
+            )
             .await
             .expect("pending OAuth connection inserts");
+        sqlx::query("UPDATE oauth_connections SET status = 'connecting' WHERE id = ?")
+            .bind(&pending.connection.id)
+            .execute(&pool)
+            .await
+            .expect("first OAuth alternative becomes pending");
         oauth_store
             .create_connection(
                 "source-id",
@@ -1986,7 +3191,7 @@ mod tests {
             .await
             .expect("managed OAuth connection inserts");
         let oauth = OAuthService::new(
-            pool,
+            pool.clone(),
             keyring,
             "http://127.0.0.1:4788".to_owned(),
             OutboundPolicy::default(),
@@ -1995,6 +3200,20 @@ mod tests {
             .bindings_for_source("source-id")
             .await
             .expect("approval OAuth bindings snapshot");
+        assert_eq!(expected_oauth_bindings.len(), 1);
+        assert_eq!(expected_oauth_bindings[0].credential_key, "oauthActive");
+        sqlx::query("UPDATE oauth_connections SET status = 'active' WHERE id = ?")
+            .bind(&pending.connection.id)
+            .execute(&pool)
+            .await
+            .expect("first OAuth alternative becomes ready while approval waits");
+        assert!(
+            oauth
+                .bindings_match("source-id", &expected_oauth_bindings)
+                .await
+                .expect("selected approval binding remains valid"),
+            "a newly ready unselected alternative must not invalidate the approved binding"
+        );
         let adapter = OpenApiAdapter::with_oauth(oauth);
         let configuration = json!({
             "spec": { "type": "inline" },
@@ -2013,7 +3232,7 @@ mod tests {
                 }),
             },
         };
-        let prepared = adapter
+        let mut insecure = adapter
             .prepare_invocation(
                 "source-id",
                 &compiled.tools[0].binding,
@@ -2024,14 +3243,79 @@ mod tests {
             )
             .await
             .expect("managed OAuth invocation prepares");
+        insecure.request.url = Url::parse(&format!(
+            "http://0.0.0.0:{}/write",
+            listener
+                .local_addr()
+                .expect("listener address reads")
+                .port()
+        ))
+        .expect("insecure target URL parses");
         assert_eq!(
-            prepared
+            insecure
                 .oauth_authorization
                 .as_ref()
                 .map(|authorization| authorization.scheme_name.as_str()),
             Some("oauthActive")
         );
-        assert!(!prepared.request.headers.contains_key(AUTHORIZATION));
+        assert!(!insecure.request.headers.contains_key(AUTHORIZATION));
+        let error = adapter
+            .execute_invocation(insecure)
+            .await
+            .expect_err("managed OAuth cannot dispatch over non-loopback HTTP");
+        assert_eq!(error.code(), "insecure_openapi_transport");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the insecure target must receive no managed OAuth request"
+        );
+        let mut poisoned = adapter
+            .prepare_invocation(
+                "source-id",
+                &compiled.tools[0].binding,
+                &configuration,
+                Some(&stored),
+                &json!({}),
+                Some(&expected_oauth_bindings),
+            )
+            .await
+            .expect("managed OAuth invocation prepares for a poisoned localhost");
+        poisoned.request.url = Url::parse(&format!(
+            "http://localhost:{}/write",
+            listener
+                .local_addr()
+                .expect("listener address reads")
+                .port()
+        ))
+        .expect("poisoned localhost URL parses");
+        let poisoned_client = HardenedHttpClient::new(poisoned.policy.clone())
+            .with_test_dns_resolution(
+                "localhost",
+                vec!["8.8.8.8".parse().expect("test IP parses")],
+            );
+        let error = adapter
+            .execute_invocation_with_client(poisoned, poisoned_client)
+            .await
+            .expect_err("managed OAuth cannot dispatch when localhost resolves off loopback");
+        assert_eq!(error.code(), "insecure_openapi_transport");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a poisoned localhost must receive no managed OAuth request"
+        );
+        let prepared = adapter
+            .prepare_invocation(
+                "source-id",
+                &compiled.tools[0].binding,
+                &configuration,
+                Some(&stored),
+                &json!({}),
+                Some(&expected_oauth_bindings),
+            )
+            .await
+            .expect("loopback managed OAuth invocation prepares");
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("request accepted");
             let mut request = vec![0_u8; 4096];

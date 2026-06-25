@@ -946,10 +946,12 @@ async fn call_tool(
                 );
                 match prepare_execute(arguments) {
                     Ok(arguments) => {
+                        let request_log_id =
+                            mcp_execution_request_id(&token_id, &session_id, &correlation);
                         run_idempotent_virtual(
                             state,
                             &request,
-                            execute_virtual(state, &actor, &correlation, arguments),
+                            execute_virtual(state, &actor, &request_log_id, arguments),
                             cancellation_signal(&cancellation),
                         )
                         .await
@@ -1218,7 +1220,7 @@ async fn call_virtual(
 async fn execute_virtual(
     state: &McpState,
     actor: &ToolActor,
-    correlation: &str,
+    request_log_id: &str,
     arguments: ExecuteArguments,
 ) -> Result<ToolResult, VirtualToolError> {
     let timeout_ms = arguments
@@ -1230,7 +1232,7 @@ async fn execute_virtual(
     let output = state
         .execution
         .execute(ExecuteCodeRequest {
-            request_id: format!("mcp-{correlation}"),
+            request_id: request_log_id.to_owned(),
             actor: actor.clone(),
             surface: RequestSurface::Mcp,
             code: arguments.code,
@@ -1958,6 +1960,32 @@ fn mcp_idempotency_key(session_id: &str, request_id: &str) -> String {
     digest.update((request_id.len() as u64).to_be_bytes());
     digest.update(request_id.as_bytes());
     format!("mcp_{:x}", digest.finalize())
+}
+
+fn mcp_execution_request_id(token_id: &str, session_id: &str, request_id: &str) -> String {
+    let token_digest = mcp_request_log_digest(b"executor-mcp-request-log-token-v1", &[token_id]);
+    let session_digest =
+        mcp_request_log_digest(b"executor-mcp-request-log-session-v1", &[session_id]);
+    let request_digest = mcp_request_log_digest(
+        b"executor-mcp-request-log-v1",
+        &[token_id, session_id, request_id],
+    );
+    format!(
+        "mcp:{}:{}:{}",
+        &token_digest[..16],
+        &session_digest[..16],
+        request_digest
+    )
+}
+
+fn mcp_request_log_digest(domain: &[u8], fields: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for field in fields {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn request_cancellation_key(session_id: &str, request_id: &str) -> String {

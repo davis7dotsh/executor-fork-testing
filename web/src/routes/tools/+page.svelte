@@ -59,13 +59,31 @@
   let bulkNotice = $state<string | null>(null);
   let bulkMode = $state<ToolMode>("ask");
   let confirmingBulk = $state<{
-    mode: ToolMode;
+    mode: ToolMode | null;
     ids: string[];
     catalogRevision: number;
+    enabledByInheritanceIds: string[];
   } | null>(null);
+  let displayedSelection = $derived(confirmingBulk?.ids ?? selected);
+  let activeToolIds = $derived(
+    resource.data?.items.filter((tool) => tool.present).map((tool) => tool.id) ?? [],
+  );
+  let selectedActiveCount = $derived(
+    activeToolIds.filter((id) => displayedSelection.includes(id)).length,
+  );
+  let allActiveToolsSelected = $derived(
+    activeToolIds.length > 0 && selectedActiveCount === activeToolIds.length,
+  );
+  let selectionLocked = $derived(
+    resource.loading || pending.includes("bulk") || confirmingBulk !== null,
+  );
+  let viewportWidth = $state(641);
+  let mobileToolsLayout = $derived(viewportWidth <= 640);
   let searchInput = $state<HTMLInputElement>();
   let searchForm = $state<HTMLFormElement>();
   let selectAllInput = $state<HTMLInputElement>();
+  let bulkBar = $state<HTMLElement>();
+  let bulkConfirmationOpener = $state<HTMLButtonElement>();
   let detailReturnId = $state<string | null>(null);
   const mutationControllers = new Map<string, AbortController>();
 
@@ -83,6 +101,7 @@
     if (untrack(() => listIdentity) !== identity) {
       selected = [];
       confirmingBulk = null;
+      bulkConfirmationOpener = undefined;
     }
     listIdentity = started.identity;
     resource = started.state;
@@ -158,8 +177,7 @@
     const toolId = urlState.tool;
     const requestKey = `${toolId ?? ""}\u0000${refreshKey}\u0000${detailRefreshKey}`;
     if (toolId === null) {
-      detail = emptyResource<ToolRecord>();
-      detail = { ...detail, loading: false };
+      detail = { ...emptyResource<ToolRecord>(), loading: false };
       detailIdentity = null;
       return;
     }
@@ -194,17 +212,15 @@
 
   $effect(() => {
     const input = selectAllInput;
-    const activeIds =
-      resource.data?.items.filter((tool) => tool.present).map((tool) => tool.id) ?? [];
-    const selectedCount = activeIds.filter((id) => selected.includes(id)).length;
     if (input !== undefined)
-      input.indeterminate = selectedCount > 0 && selectedCount < activeIds.length;
+      input.indeterminate = selectedActiveCount > 0 && selectedActiveCount < activeToolIds.length;
   });
 
   async function changeToolMode(
     tool: ToolRecord | ToolPage["items"][number],
     mode: ToolMode | null,
   ) {
+    if (confirmingBulk !== null || pending.includes("bulk") || resource.loading) return;
     const controller = beginMutation(tool.id);
     conflictNotice = null;
     const result = await setToolMode(tool.id, mode, tool.revision, undefined, controller.signal);
@@ -221,7 +237,8 @@
     ids: string[],
     expectedCatalogRevision: number,
   ) {
-    if (ids.length === 0 || resource.data === null || resource.loading) return;
+    if (ids.length === 0 || resource.data === null || resource.loading || pending.includes("bulk"))
+      return;
     const controller = beginMutation("bulk");
     conflictNotice = null;
     bulkNotice = null;
@@ -238,6 +255,7 @@
       return;
     }
     confirmingBulk = null;
+    bulkConfirmationOpener = undefined;
     bulkNotice = `${mode === null ? "Inherit" : modeName(mode)} applied to ${ids.length} selected ${ids.length === 1 ? "tool" : "tools"}.`;
     selected = [];
     refreshKey += 1;
@@ -245,15 +263,25 @@
     document.getElementById("bulk-status")?.focus();
   }
 
-  function requestBulkMode(mode: ToolMode | null) {
-    if (selected.length === 0 || resource.data === null || resource.loading) return;
+  function requestBulkMode(mode: ToolMode | null, opener: HTMLButtonElement) {
+    if (
+      confirmingBulk !== null ||
+      selected.length === 0 ||
+      resource.data === null ||
+      resource.loading ||
+      pending.length > 0 ||
+      (mode === null && inheritModeUnavailable(selected))
+    )
+      return;
     const snapshot = {
       mode,
       ids: selected.slice(0, 200),
       catalogRevision: resource.data.catalogRevision,
     };
-    if (mode !== null && requiresBroadConfirmation(mode)) {
-      confirmingBulk = { ...snapshot, mode };
+    const enabledByInheritanceIds = mode === null ? inheritedEnablingIds(snapshot.ids) : [];
+    if ((mode !== null && requiresBroadConfirmation(mode)) || enabledByInheritanceIds.length > 0) {
+      confirmingBulk = { ...snapshot, enabledByInheritanceIds };
+      bulkConfirmationOpener = opener;
       void tick().then(() => document.getElementById("cancel-bulk-mode")?.focus());
       return;
     }
@@ -267,9 +295,15 @@
   }
 
   async function cancelBulkConfirmation() {
+    const opener = bulkConfirmationOpener;
     confirmingBulk = null;
+    bulkConfirmationOpener = undefined;
     await tick();
-    document.getElementById("bulk-apply-mode")?.focus();
+    if (opener !== undefined && !opener.disabled) {
+      opener.focus();
+    } else {
+      bulkBar?.focus();
+    }
   }
 
   function inheritedMode(tool: ToolPage["items"][number]) {
@@ -280,11 +314,53 @@
     return source.modeOverride ?? tool.intrinsicMode;
   }
 
+  function inheritModeUnavailable(ids: string[]) {
+    return (
+      resource.data?.items.some(
+        (tool) =>
+          ids.includes(tool.id) && tool.modeOverride !== null && inheritedMode(tool) === null,
+      ) ?? false
+    );
+  }
+
+  function inheritedEnablingIds(ids: string[]) {
+    return (
+      resource.data?.items
+        .filter(
+          (tool) =>
+            ids.includes(tool.id) &&
+            tool.effectiveMode.mode !== "enabled" &&
+            inheritedMode(tool) === "enabled",
+        )
+        .map((tool) => tool.id) ?? []
+    );
+  }
+
+  function bulkConfirmationText(confirmation: NonNullable<typeof confirmingBulk>) {
+    if (confirmation.mode !== null) {
+      return broadConfirmationText(confirmation.mode, confirmation.ids.length);
+    }
+    const selectedNoun = confirmation.ids.length === 1 ? "tool" : "tools";
+    const transitionCount = confirmation.enabledByInheritanceIds.length;
+    const transition =
+      transitionCount === 1
+        ? "1 tool will become Enabled under its source default."
+        : `${transitionCount} tools will become Enabled under their source defaults.`;
+    return `Inherit ${confirmation.ids.length} selected ${selectedNoun}? ${transition}`;
+  }
+
+  function bulkConfirmationModeName(mode: ToolMode | null) {
+    return mode === null ? "Inherit" : modeName(mode);
+  }
+
   function handleMutationError(id: string, error: ApiError) {
     if (auth.recoverFromApiError(error)) return;
     if (error.status === 409) {
       conflictNotice = "Tool settings changed elsewhere. The latest catalog is shown for review.";
-      if (id === "bulk") confirmingBulk = null;
+      if (id === "bulk") {
+        confirmingBulk = null;
+        bulkConfirmationOpener = undefined;
+      }
       refreshKey += 1;
       void tick().then(() => document.getElementById("tool-conflict")?.focus());
     } else {
@@ -310,12 +386,14 @@
   }
 
   function toggleSelected(id: string, checked: boolean) {
+    if (selectionLocked) return;
     selected = checked
       ? [...new Set([...selected, id])].slice(0, 200)
       : selected.filter((candidate) => candidate !== id);
   }
 
   function toggleCurrentPage(checked: boolean) {
+    if (selectionLocked) return;
     const visible =
       resource.data?.items.filter((tool) => tool.present).map((tool) => tool.id) ?? [];
     selected = checked ? visible.slice(0, 200) : selected.filter((id) => !visible.includes(id));
@@ -362,7 +440,7 @@
   }
 </script>
 
-<svelte:window onkeydown={handleShortcut} />
+<svelte:window bind:innerWidth={viewportWidth} onkeydown={handleShortcut} />
 
 <DashboardShell title="Tools" description="Find and control the capabilities agents can use.">
   <form class="surface filter-bar" method="GET" bind:this={searchForm} onsubmit={submitFilters}>
@@ -462,14 +540,25 @@
   {/if}
 
   {#if resource.data !== null}
-    <section class="surface bulk-bar" aria-label="Bulk tool behavior">
+    <section
+      bind:this={bulkBar}
+      class="surface bulk-bar"
+      aria-label="Bulk tool behavior"
+      tabindex="-1"
+    >
       <div>
-        <strong>{selected.length} selected on this page</strong>
-        <small>Bulk changes use catalog revision {resource.data.catalogRevision}.</small>
+        <strong>{displayedSelection.length} selected on this page</strong>
+        <small
+          >Bulk changes use catalog revision {confirmingBulk?.catalogRevision ??
+            resource.data.catalogRevision}.</small
+        >
       </div>
       <fieldset
         class="mode-control compact"
-        disabled={resource.loading || selected.length === 0 || pending.includes("bulk")}
+        disabled={resource.loading ||
+          selected.length === 0 ||
+          pending.length > 0 ||
+          confirmingBulk !== null}
       >
         <legend>Set selected tools</legend>
         {#each toolModes as mode}
@@ -486,14 +575,22 @@
           type="button"
           class:primary={bulkMode === "enabled"}
           class:danger-button={bulkMode === "disabled"}
-          disabled={resource.loading || selected.length === 0 || pending.includes("bulk")}
-          onclick={() => requestBulkMode(bulkMode)}
-          >{bulkActionLabel(bulkMode, selected.length)}</button
+          disabled={resource.loading ||
+            selected.length === 0 ||
+            pending.length > 0 ||
+            confirmingBulk !== null}
+          onclick={(event) => requestBulkMode(bulkMode, event.currentTarget)}
+          >{bulkActionLabel(bulkMode, displayedSelection.length)}</button
         >
         <button
           type="button"
-          disabled={resource.loading || selected.length === 0 || pending.includes("bulk")}
-          onclick={() => requestBulkMode(null)}>{bulkActionLabel(null, selected.length)}</button
+          disabled={resource.loading ||
+            selected.length === 0 ||
+            pending.length > 0 ||
+            inheritModeUnavailable(selected) ||
+            confirmingBulk !== null}
+          onclick={(event) => requestBulkMode(null, event.currentTarget)}
+          >{bulkActionLabel(null, displayedSelection.length)}</button
         >
       </div>
       {#if confirmingBulk !== null}
@@ -502,7 +599,7 @@
           role="group"
           aria-label="Confirm bulk tool behavior"
         >
-          <strong>{broadConfirmationText(confirmingBulk.mode, confirmingBulk.ids.length)}</strong>
+          <strong>{bulkConfirmationText(confirmingBulk)}</strong>
           <button
             id="cancel-bulk-mode"
             type="button"
@@ -514,13 +611,14 @@
           >
           <button
             type="button"
-            class:primary={confirmingBulk.mode === "enabled"}
+            class:primary={confirmingBulk.mode === "enabled" || confirmingBulk.mode === null}
             class:danger-button={confirmingBulk.mode === "disabled"}
             disabled={pending.includes("bulk")}
             onkeydown={(event) => {
               if (event.key === "Escape") void cancelBulkConfirmation();
             }}
-            onclick={confirmBulkMode}>Confirm {modeName(confirmingBulk.mode)}</button
+            onclick={confirmBulkMode}
+            >Confirm {bulkConfirmationModeName(confirmingBulk.mode)}</button
           >
         </div>
       {/if}
@@ -558,23 +656,35 @@
         {/if}
       </div>
     {:else if resource.data !== null}
+      {#if mobileToolsLayout}
+        <label class="checkbox-label mobile-select-all">
+          <input
+            bind:this={selectAllInput}
+            aria-label="Select all active tools on this page"
+            type="checkbox"
+            disabled={selectionLocked}
+            checked={allActiveToolsSelected}
+            onchange={(event) => toggleCurrentPage(event.currentTarget.checked)}
+          />
+          Select all active tools on this page
+        </label>
+      {/if}
       <div class="table-scroll">
         <table>
           <caption>Only tools on this page are included in bulk changes.</caption>
           <thead
             ><tr>
               <th scope="col">
-                <input
-                  bind:this={selectAllInput}
-                  aria-label="Select all active tools on this page"
-                  type="checkbox"
-                  disabled={resource.loading || pending.includes("bulk")}
-                  checked={resource.data.items.some((tool) => tool.present) &&
-                    resource.data.items
-                      .filter((tool) => tool.present)
-                      .every((tool) => selected.includes(tool.id))}
-                  onchange={(event) => toggleCurrentPage(event.currentTarget.checked)}
-                />
+                {#if !mobileToolsLayout}
+                  <input
+                    bind:this={selectAllInput}
+                    aria-label="Select all active tools on this page"
+                    type="checkbox"
+                    disabled={selectionLocked}
+                    checked={allActiveToolsSelected}
+                    onchange={(event) => toggleCurrentPage(event.currentTarget.checked)}
+                  />
+                {/if}
               </th>
               <th scope="col">Tool</th><th scope="col">Behavior</th><th scope="col">Details</th>
             </tr></thead
@@ -587,8 +697,8 @@
                   <input
                     aria-label={`Select ${tool.displayName}`}
                     type="checkbox"
-                    disabled={resource.loading || pending.includes("bulk") || !tool.present}
-                    checked={selected.includes(tool.id)}
+                    disabled={selectionLocked || !tool.present}
+                    checked={displayedSelection.includes(tool.id)}
                     onchange={(event) => toggleSelected(tool.id, event.currentTarget.checked)}
                   />
                 </td>
@@ -601,7 +711,11 @@
                 <td data-label="Behavior">
                   <fieldset
                     class="mode-control row-modes"
-                    disabled={resource.loading || !tool.present || pending.includes(tool.id)}
+                    disabled={resource.loading ||
+                      !tool.present ||
+                      pending.includes(tool.id) ||
+                      pending.includes("bulk") ||
+                      confirmingBulk !== null}
                   >
                     <legend class="visually-hidden">Behavior for {tool.displayName}</legend>
                     <label
@@ -729,3 +843,13 @@
     </aside>
   {/if}
 </DashboardShell>
+
+<style>
+  .mobile-select-all {
+    margin: 0.85rem 1.2rem 0;
+    border: 1px solid #30394c;
+    border-radius: 10px;
+    padding: 0.7rem 0.8rem;
+    background: #0d131d;
+  }
+</style>

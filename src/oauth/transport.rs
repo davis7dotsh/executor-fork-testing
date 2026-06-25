@@ -129,6 +129,7 @@ struct OAuthErrorResponse {
 
 impl OAuthHttpTransport {
     pub fn new(mut policy: OutboundPolicy) -> Self {
+        policy.require_https_or_loopback = true;
         policy.max_request_bytes = policy.max_request_bytes.min(MAX_TOKEN_REQUEST_BYTES);
         policy.max_response_bytes = policy.max_response_bytes.min(MAX_OAUTH_RESPONSE_BYTES);
         policy.max_header_bytes = policy.max_header_bytes.min(MAX_OAUTH_HEADER_BYTES);
@@ -138,6 +139,10 @@ impl OAuthHttpTransport {
             client: HardenedHttpClient::new(policy.clone()),
             policy,
         }
+    }
+
+    pub fn validate_issuer(&self, issuer: &str) -> Result<(), OAuthDiscoveryError> {
+        authorization_server_metadata_url(issuer, &self.policy).map(|_| ())
     }
 
     pub async fn discover_authorization_server(
@@ -783,5 +788,13 @@ mod tests {
             MAX_OAUTH_RESPONSE_BYTES
         );
         assert_eq!(transport.policy.max_redirects, 0);
+        assert!(transport.policy.require_https_or_loopback);
+    }
+
+    #[test]
+    fn insecure_resolved_transport_has_a_stable_sanitized_error() {
+        let error = OAuthTransportError::Transport(OutboundError::InsecureTransport);
+        assert_eq!(error.code(), "insecure_outbound_transport");
+        assert_eq!(error.to_string(), "OAuth HTTP request failed");
     }
 }

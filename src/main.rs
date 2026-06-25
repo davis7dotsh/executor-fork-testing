@@ -13,7 +13,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "executor", about = "The local Executor gateway")]
+#[command(name = "executor", about = "The local Executor gateway", version)]
 struct Cli {
     #[arg(
         long,
@@ -48,6 +48,7 @@ enum Command {
     Tools(cli::ToolsArgs),
     Open,
     Mcp,
+    Service(executor::service::ServiceArgs),
     #[command(hide = true)]
     SandboxWorker(SandboxWorkerArgs),
 }
@@ -105,6 +106,7 @@ async fn main() -> Result<()> {
         Command::Tools(args) => cli::tools(connection, args).await,
         Command::Open => cli::open(&connection),
         Command::Mcp => cli::mcp(connection).await,
+        Command::Service(args) => executor::service::execute(args)?.emit(),
         Command::SandboxWorker(args) => {
             let ipc = take_worker_socket(args.ipc_fd)?;
             executor::runtime::worker_main(ipc, args.generation)
@@ -247,5 +249,22 @@ mod tests {
         assert!(Cli::try_parse_from(["executor", "tools", "sources"]).is_ok());
         assert!(Cli::try_parse_from(["executor", "mcp"]).is_ok());
         assert!(Cli::try_parse_from(["executor", "open"]).is_ok());
+        for action in ["status", "start", "stop", "restart", "remove"] {
+            assert!(Cli::try_parse_from(["executor", "service", action]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["executor", "service", "install", "--no-start"]).is_ok());
+    }
+
+    #[test]
+    fn reports_the_cargo_package_version() {
+        let Err(error) = Cli::try_parse_from(["executor", "--version"]) else {
+            panic!("expected clap to display the version");
+        };
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            format!("executor {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

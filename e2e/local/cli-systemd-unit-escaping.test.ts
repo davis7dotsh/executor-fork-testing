@@ -4,7 +4,7 @@
 import { expect } from "@effect/vitest";
 import { Effect } from "effect";
 
-import { generateSystemdUnit } from "../../apps/cli/src/service";
+import { generateSystemdUnit } from "../../legacy/cli/src/service";
 import { scenario } from "../src/scenario";
 
 scenario(

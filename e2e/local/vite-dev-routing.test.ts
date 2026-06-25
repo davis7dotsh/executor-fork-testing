@@ -1,4 +1,4 @@
-// Local-only: plain `apps/local` Vite dev must route the same local-only HTTP
+// Local-only: plain `legacy/local` Vite dev must route the same local-only HTTP
 // surfaces as production `executor web`. These routes live outside the typed
 // `/api` HttpApi: `/api/health`, `/api/oauth/await/*`, and browser approval's
 // `/api/mcp-sessions/*`.
@@ -19,7 +19,7 @@ import { scenario } from "../src/scenario";
 import { waitForHttp } from "../setup/boot";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-const localAppDir = join(repoRoot, "apps/local");
+const localAppDir = join(repoRoot, "legacy/local");
 
 const APPROVAL_TARGET_TOOL = "executor.coreTools.policies.list";
 const EXECUTE_CODE = `
@@ -221,7 +221,7 @@ scenario(
 
       expect(
         failures,
-        "plain apps/local Vite dev should special-case the same local-only routes as production",
+        "plain legacy/local Vite dev should special-case the same local-only routes as production",
       ).toEqual([]);
     });
   }),

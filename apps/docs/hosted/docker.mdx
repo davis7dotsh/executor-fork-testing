@@ -1,95 +1,55 @@
 ---
-title: Self Hosted Docker
-description: "Run the whole Executor server in one Docker container over a SQLite file: API, MCP, auth, code execution, and the web UI."
+title: Docker self-hosting
+description: "Run the supported Executor Rust server and embedded Svelte dashboard in the published Linux container."
 ---
 
-The self-hosted image is the entire Executor server in a single container: the
-typed API, the MCP server, authentication, QuickJS code execution, and the web
-console, all in one process over a libSQL (SQLite) file. There is no external
-database, worker, or proxy to run.
+The supported Docker image contains the same Rust binary and embedded Svelte
+dashboard as the native release. It supports Linux `amd64` and `arm64`.
 
-## Run it
+## Run the published image
 
-Using the published image:
-
-```bash
-docker run -d \
-  --name executor-selfhost \
-  -p 17888:17888 \
-  -v executor-data:/data \
-  ghcr.io/rhyssullivan/executor-selfhost:latest
-```
-
-Or build from a clone of the [repo](https://github.com/RhysSullivan/executor),
-from `apps/host-selfhost`:
+Pin a release version for repeatable deployments. Replace `v0.1.0` with the
+version you intend to run:
 
 ```bash
-docker compose up -d --build
+docker run --detach \
+  --name executor \
+  --publish 127.0.0.1:4788:4788 \
+  --volume executor-data:/var/lib/executor \
+  ghcr.io/davis7dotsh/executor:v0.1.0
 ```
 
-No configuration is required. Open [http://localhost:17888](http://localhost:17888);
-the first person to create an account becomes the owner. After that, people join
-through single-use invite links you mint from the **Admin** page, and open signup
-is closed.
+Open `http://127.0.0.1:4788`. On first boot, `docker logs executor` contains the
+one-time setup URL. Create the administrator, then create an API token under
+**API tokens**.
 
-## Storage
+The `executor-data` volume contains SQLite state, WAL files when present, and
+the generated `master.key`. Stop the container before backing up the complete
+volume. The database and key are one recovery unit.
 
-Everything that must persist (the SQLite database and the generated encryption
-keys) lives in the data directory, mounted at **`/data`** in the container. Always
-mount a volume there so it survives restarts and upgrades:
+## Build from a checkout
+
+The root Compose file builds the supported root `Dockerfile`:
 
 ```bash
--v executor-data:/data     # named volume (what compose uses)
-# or a host path:
--v /srv/executor:/data
+docker compose up --detach --build
+docker compose logs executor
 ```
 
-Back it up by snapshotting that volume (or copying `/data`, primarily `data.db`).
-`EXECUTOR_DATA_DIR` (default `/data`) sets the directory, and `EXECUTOR_DB_PATH`
-(default `<data dir>/data.db`) sets the database file.
+Compose publishes the service only on host loopback and mounts the
+`executor-data` volume at `/var/lib/executor`.
 
-## Environment variables
+## HTTPS reverse proxy
 
-Everything is optional: a bare run boots a working instance. The defaults below are
-the container defaults.
-
-| Variable                            | Default                         | Purpose                                                                                         |
-| ----------------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `PORT`                              | `17888`                         | HTTP port the server listens on.                                                                |
-| `EXECUTOR_HOST`                     | `0.0.0.0`                       | Bind address. The image binds all interfaces.                                                   |
-| `EXECUTOR_DATA_DIR`                 | `/data`                         | Directory holding the database and generated keys.                                              |
-| `EXECUTOR_DB_PATH`                  | `<data dir>/data.db`            | SQLite database file.                                                                           |
-| `EXECUTOR_WEB_BASE_URL`             | auto (`http://localhost:17888`) | Public URL browsers use. Required behind a domain or TLS (see below).                           |
-| `BETTER_AUTH_SECRET`                | generated, persisted in `/data` | Session secret (32+ chars). Rotating it signs everyone out.                                     |
-| `EXECUTOR_SECRET_KEY`               | generated, persisted in `/data` | Master key encrypting stored secrets. Set it to manage it yourself.                             |
-| `EXECUTOR_BOOTSTRAP_ADMIN_EMAIL`    | unset                           | Pre-create the admin headlessly (with the password below); skips browser first-run.             |
-| `EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD` | unset                           | Password for the bootstrap admin.                                                               |
-| `EXECUTOR_BOOTSTRAP_ADMIN_NAME`     | `Admin`                         | Display name for the bootstrap admin.                                                           |
-| `EXECUTOR_ORG_NAME`                 | `Default`                       | Display name of the single org every user joins.                                                |
-| `EXECUTOR_ORG_SLUG`                 | `default`                       | URL slug for that org.                                                                          |
-| `EXECUTOR_ALLOW_LOCAL_NETWORK`      | `false`                         | Allow sandboxed code to reach loopback / private addresses. Keep off unless you trust the code. |
-
-## Behind a domain or TLS
-
-<Warning>
-  Set `EXECUTOR_WEB_BASE_URL` to the exact public URL you load in the browser (scheme, host, and
-  port). If it does not match, browser logins are rejected with an invalid-origin error.
-</Warning>
+Leave the container port bound to host loopback. Set the exact browser-facing
+origin and terminate TLS in a reverse proxy on the same host:
 
 ```bash
-docker run -d \
-  -p 17888:17888 \
-  -v executor-data:/data \
-  -e EXECUTOR_WEB_BASE_URL=https://executor.example.com \
-  ghcr.io/rhyssullivan/executor-selfhost:latest
+EXECUTOR_PUBLIC_ORIGIN=https://executor.example.com docker compose up --detach
 ```
 
-For a headless deploy (CI or infra-as-code), set `EXECUTOR_BOOTSTRAP_ADMIN_EMAIL`
-and `EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD` to create the admin without the browser
-setup screen.
+Do not expose the raw plaintext port to an untrusted network. A private LAN
+alone does not protect dashboard sessions or MCP Bearer tokens.
 
-## Connect an agent
-
-The server exposes a streamable-HTTP MCP endpoint at `/mcp`. Point your client at
-`http://localhost:17888/mcp` (or your public URL). See [MCP Proxy](/mcp-proxy) for
-how that endpoint exposes your integrations.
+The MCP endpoint is `/mcp`. See [MCP endpoint](/mcp-proxy) for client
+configuration.

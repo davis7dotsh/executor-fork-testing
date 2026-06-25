@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG SOURCE_DATE_EPOCH
+
+FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d AS builder
+
+ARG RUST_TARGET
+ARG RUST_VERSION=1.96.0
+ARG SOURCE_DATE_EPOCH
+ARG TARGETARCH
+ARG UBUNTU_SNAPSHOT=20260623T000000Z
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i -E \
+      "s|^deb |deb [snapshot=${UBUNTU_SNAPSHOT}] |" \
+      /etc/apt/sources.list && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get -o APT::Get::Always-Include-Phased-Updates=true install \
+      --yes --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      pkg-config \
+      xz-utils && \
+    rm -rf \
+      /var/cache/ldconfig/aux-cache \
+      /var/lib/apt/lists/* \
+      /var/log/apt/* \
+      /var/log/dpkg.log
+
+RUN case "$TARGETARCH" in \
+      amd64) \
+        expected_target=x86_64-unknown-linux-gnu; \
+        checksum=c295047583a56238ea06b43f849f4b877fa12bfd4c7103f8d9a74c94c9c4e108 \
+        ;; \
+      arm64) \
+        expected_target=aarch64-unknown-linux-gnu; \
+        checksum=371eadcca97062219cbd8593628eb5d2802bc370515d085fedce1b56b2baed57 \
+        ;; \
+      *) \
+        echo "Unsupported release architecture: $TARGETARCH" >&2; \
+        exit 1 \
+        ;; \
+    esac && \
+    test "$RUST_TARGET" = "$expected_target" && \
+    archive="rust-${RUST_VERSION}-${RUST_TARGET}.tar.xz" && \
+    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --max-filesize 268435456 \
+      --output "/tmp/$archive" \
+      "https://static.rust-lang.org/dist/$archive" && \
+    printf '%s  %s\n' "$checksum" "/tmp/$archive" | sha256sum --check - && \
+    tar -xJf "/tmp/$archive" -C /tmp && \
+    "/tmp/rust-${RUST_VERSION}-${RUST_TARGET}/install.sh" \
+      --prefix=/usr/local \
+      --disable-ldconfig && \
+    rm -rf "/tmp/$archive" "/tmp/rust-${RUST_VERSION}-${RUST_TARGET}"
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY migrations ./migrations
+COPY packaging/launchd/bounded-log.sh ./packaging/launchd/bounded-log.sh
+COPY packaging/launchd/dev.executor.gateway.plist ./packaging/launchd/dev.executor.gateway.plist
+COPY packaging/systemd/executor.env.example ./packaging/systemd/executor.env.example
+COPY packaging/systemd/executor.service ./packaging/systemd/executor.service
+COPY scripts/install-launchd.sh ./scripts/install-launchd.sh
+COPY scripts/install-systemd.sh ./scripts/install-systemd.sh
+COPY scripts/lib/install-systemd-master-key.sh ./scripts/lib/install-systemd-master-key.sh
+COPY src ./src
+COPY --from=release-web / ./web/build
+
+RUN cargo build --locked --release --target "$RUST_TARGET"
+
+FROM scratch AS artifact
+
+ARG RUST_TARGET
+
+COPY --from=builder "/build/target/${RUST_TARGET}/release/executor" /executor

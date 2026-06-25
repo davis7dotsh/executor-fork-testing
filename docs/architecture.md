@@ -77,12 +77,13 @@ and associated data binds ciphertext to its purpose and record identity.
 4. Runtime and approvals: sandboxed TypeScript execution, concurrent tool calls,
    interactive approvals, resume semantics, and CLI parity.
 5. Operations: request logs, redaction, retention, embedded web assets, Docker,
-   Linux and macOS packaging, upgrade safety, e2e recordings, and migration of
-   the old TypeScript products into `legacy/` after parity is proven.
+   Linux and macOS packaging, upgrade safety, e2e recordings, and archival of
+   the old TypeScript products under `legacy/` after parity was proven.
 
-The current TypeScript implementation stays in place until the replacement has
-parity. Moving it early would obscure behavior that still serves as the
-reference contract.
+The prior TypeScript application entry points now live under `legacy/` as
+manual compatibility surfaces. Shared protocol, runtime, SDK, host, app, and
+React packages remain under `packages/` where the native product and package
+compatibility workflows can retain them independently.
 
 ## Source and tool catalog contract
 

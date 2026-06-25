@@ -142,6 +142,14 @@ fn redirects_resolve_relative_locations_and_deny_downgrades() {
         redirect_target(&current, Some(&downgrade), &policy),
         Err(OutboundError::RedirectDowngrade)
     ));
+
+    let secure_cross_origin = HeaderValue::from_static("https://cdn.example.net/openapi.json");
+    assert_eq!(
+        redirect_target(&current, Some(&secure_cross_origin), &policy)
+            .expect("HTTPS redirects remain allowed")
+            .as_str(),
+        "https://cdn.example.net/openapi.json"
+    );
 }
 
 #[test]
@@ -212,6 +220,128 @@ async fn cross_origin_redirects_drop_custom_credentials() {
         .to_ascii_lowercase();
     assert!(!destination_request.contains("x-api-key"));
     assert!(!destination_request.contains("super-secret"));
+}
+
+#[tokio::test]
+async fn custom_url_policy_rejects_a_multi_hop_target_before_request() {
+    let blocked = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("blocked target binds");
+    let blocked_address = blocked.local_addr().expect("blocked target has an address");
+
+    let second = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second redirector binds");
+    let second_address = second
+        .local_addr()
+        .expect("second redirector has an address");
+    let second_task = tokio::spawn(async move {
+        let (mut stream, _) = second.accept().await.expect("second redirector accepts");
+        let _request = read_request(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{blocked_address}/blocked\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("second redirector responds");
+    });
+
+    let first = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("first redirector binds");
+    let first_address = first.local_addr().expect("first redirector has an address");
+    let first_task = tokio::spawn(async move {
+        let (mut stream, _) = first.accept().await.expect("first redirector accepts");
+        let _request = read_request(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{second_address}/next\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("first redirector responds");
+    });
+
+    let client = HardenedHttpClient::new(OutboundPolicy {
+        allow_private_networks: true,
+        ..OutboundPolicy::default()
+    });
+    let error = match client
+        .fetch_spec_with_url_policy(
+            Url::parse(&format!("http://{first_address}/spec")).expect("spec URL parses"),
+            reqwest::header::HeaderMap::new(),
+            |candidate| {
+                if candidate.port_or_known_default() == Some(blocked_address.port()) {
+                    Err(OutboundError::RedirectDowngrade)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the custom policy must reject the final redirect target"),
+    };
+    assert!(matches!(error, OutboundError::RedirectDowngrade));
+    first_task.await.expect("first redirector completes");
+    second_task.await.expect("second redirector completes");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), blocked.accept())
+            .await
+            .is_err(),
+        "the rejected redirect target must receive no request"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_execution_never_follows_a_credential_bearing_redirect() {
+    let destination = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirect destination binds");
+    let destination_address = destination
+        .local_addr()
+        .expect("redirect destination has an address");
+    let redirector = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirector binds");
+    let redirector_address = redirector.local_addr().expect("redirector has an address");
+    let redirector_task = tokio::spawn(async move {
+        let (mut stream, _) = redirector.accept().await.expect("redirector accepts");
+        let request = read_request(&mut stream).await;
+        assert!(request.to_ascii_lowercase().contains("x-api-key: secret"));
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{destination_address}/leak\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("redirector responds");
+    });
+    let client = HardenedHttpClient::new(OutboundPolicy {
+        allow_private_networks: true,
+        ..OutboundPolicy::default()
+    });
+    let mut request = OutboundRequest::new(
+        Method::GET,
+        Url::parse(&format!("http://{redirector_address}/start")).expect("redirector URL parses"),
+    );
+    request
+        .headers
+        .insert("x-api-key", HeaderValue::from_static("secret"));
+    let response = client
+        .execute(request)
+        .await
+        .expect("redirect response is returned without following it");
+    assert_eq!(response.status, reqwest::StatusCode::FOUND);
+    redirector_task.await.expect("redirector completes");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept(),)
+            .await
+            .is_err(),
+        "the credential-bearing redirect target must receive no request"
+    );
 }
 
 #[tokio::test]

@@ -118,7 +118,12 @@ async fn create_gateway_token(app: &ExecutorApp, admin: &Admin) -> String {
         Method::POST,
         "/api/v1/tokens",
         json!({ "name": "approval strictness" }),
-        &admin_headers(admin),
+        &[
+            (header::COOKIE.as_str(), admin.cookie.as_str()),
+            (header::ORIGIN.as_str(), ORIGIN),
+            ("x-executor-csrf", admin.csrf.as_str()),
+            ("idempotency-key", "approval-strictness-token"),
+        ],
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);

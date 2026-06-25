@@ -17,6 +17,9 @@ ignorePaths = [
 name = "wrdn-authz"
 remote = "getsentry/warden-skills"
 paths = [
+  "src/api.rs",
+  "src/api/**/*.rs",
+  "src/oauth/**/*.rs",
   "legacy/cloud/src/auth/**/*.ts",
   "legacy/cloud/src/api/**/*.ts",
   "legacy/cloud/src/routes/**/*.tsx",
@@ -26,9 +29,16 @@ paths = [
 [[skills]]
 name = "wrdn-code-execution"
 remote = "getsentry/warden-skills"
+# Explicit legacy development and test commands can still execute the archived
+# local runtime, so keep its actual source tree in security scan scope.
 paths = [
-  "apps/local/src/server/**/*.ts",
-  "apps/cli/src/**/*.ts",
+  "src/execution.rs",
+  "src/invocation/**/*.rs",
+  "src/mcp/**/*.rs",
+  "src/protocols/**/*.rs",
+  "src/runtime/**/*.rs",
+  "legacy/local/src/**/*.ts",
+  "legacy/cli/src/**/*.ts",
   "packages/core/execution/src/**/*.ts",
   "packages/core/sdk/src/**/*.ts",
   "packages/kernel/**/src/**/*.ts",
@@ -39,10 +49,22 @@ paths = [
 name = "wrdn-data-exfil"
 remote = "getsentry/warden-skills"
 paths = [
+  "src/api.rs",
+  "src/api/**/*.rs",
+  "src/catalog/**/*.rs",
+  "src/database.rs",
+  "src/invocation/**/*.rs",
+  "src/mcp/**/*.rs",
+  "src/oauth/**/*.rs",
+  "src/outbound.rs",
+  "src/protocols/**/*.rs",
+  "src/request_logs.rs",
+  "src/runtime/**/*.rs",
   "legacy/cloud/src/api/**/*.ts",
+  "legacy/cloud/src/auth/**/*.ts",
   "legacy/cloud/src/routes/**/*.tsx",
-  "apps/local/src/server/**/*.ts",
-  "packages/core/storage-*/src/**/*.ts",
+  "legacy/local/src/**/*.ts",
+  "packages/core/api/src/**/*.ts",
   "packages/plugins/**/src/**/*.ts",
   "packages/react/src/api/**/*.tsx",
 ]
@@ -51,19 +73,26 @@ paths = [
 name = "wrdn-pii"
 remote = "getsentry/warden-skills"
 paths = [
+  "src/actor.rs",
+  "src/api.rs",
+  "src/api/**/*.rs",
+  "src/approval/**/*.rs",
+  "src/catalog/**/*.rs",
+  "src/crypto.rs",
+  "src/database.rs",
+  "src/oauth/**/*.rs",
+  "src/request_logs.rs",
   "legacy/cloud/src/**/*.ts",
   "legacy/cloud/src/**/*.tsx",
-  "apps/local/src/**/*.ts",
-  "apps/local/src/**/*.tsx",
-  "packages/core/storage-*/src/**/*.ts",
+  "legacy/local/src/**/*.ts",
 ]
 
 [[skills]]
 name = "wrdn-gha-workflows"
 remote = "getsentry/warden-skills"
-paths = [".github/workflows/**/*.yml", ".github/workflows/**/*.yaml"]
+paths = [".github/workflows/**/*.yml"]
 
-# Local skill — no `remote =`, resolved from `.agents/skills/<name>/SKILL.md`.
+# Local skill: no `remote =`, resolved from `.agents/skills/<name>/SKILL.md`.
 [[skills]]
 name = "wrdn-effect-atom-optimistic"
 paths = [

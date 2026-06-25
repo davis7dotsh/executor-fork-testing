@@ -1,4 +1,11 @@
-use std::{fs, net::SocketAddr, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use axum::{
     Router,
@@ -18,6 +25,7 @@ use tower::ServiceExt;
 
 const ORIGIN: &str = "http://127.0.0.1:4788";
 const PASSWORD: &str = "correct-horse-battery-staple";
+static TOKEN_IDEMPOTENCY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct TestExecutor {
     _directory: TempDir,
@@ -1192,6 +1200,7 @@ async fn token_names_are_counted_by_characters_and_stored_trimmed() {
     executor.setup_admin().await;
     let admin = executor.login().await;
     let unicode_name = "é".repeat(80);
+    let idempotency_key = next_token_idempotency_key();
     let created = send_json(
         executor.router(),
         Method::POST,
@@ -1201,6 +1210,7 @@ async fn token_names_are_counted_by_characters_and_stored_trimmed() {
             (header::COOKIE.as_str(), &admin.cookie),
             (header::ORIGIN.as_str(), ORIGIN),
             ("x-executor-csrf", &admin.csrf),
+            ("idempotency-key", idempotency_key.as_str()),
         ],
     )
     .await;
@@ -1290,6 +1300,7 @@ async fn create_token_request(
     origin: Option<&str>,
     csrf: Option<&str>,
 ) -> Response<Body> {
+    let idempotency_key = next_token_idempotency_key();
     let mut headers = vec![(header::COOKIE.as_str(), admin.cookie.as_str())];
     if let Some(origin) = origin {
         headers.push((header::ORIGIN.as_str(), origin));
@@ -1297,6 +1308,7 @@ async fn create_token_request(
     if let Some(csrf) = csrf {
         headers.push(("x-executor-csrf", csrf));
     }
+    headers.push(("idempotency-key", idempotency_key.as_str()));
     send_json(
         executor.router(),
         Method::POST,
@@ -1305,6 +1317,13 @@ async fn create_token_request(
         &headers,
     )
     .await
+}
+
+fn next_token_idempotency_key() -> String {
+    format!(
+        "control-plane-token-{}",
+        TOKEN_IDEMPOTENCY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 async fn send_json(

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
-use url::Url;
+use url::{Host, Url};
 
 use super::{
     ConfiguredCredential, CredentialMetadata, ProtocolError, ProtocolErrorCategory,
@@ -24,7 +24,7 @@ use crate::{
             DiscoveredMcpTool, DiscoveryBasis, DiscoveryError, DiscoveryPlan, ListChangedCoalescer,
             ToolPage, ToolPageFetcher, bindings_for_source_kind, discover,
         },
-        manager::{McpConnectionManager, WatcherRevisionLease},
+        manager::{McpConnectionManager, SourceRevisionLease, WatcherRevisionLease},
         upstream::{
             http::{
                 DEFAULT_PROTOCOL_VERSION as HTTP_PROTOCOL_VERSION, StreamableHttpConfig,
@@ -50,6 +50,8 @@ const MAX_DISCOVERY_GENERATIONS: usize = 8;
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(120);
 const DISCOVERY_QUIET_PERIOD: Duration = Duration::from_millis(25);
 const STDIO_WATCHER_HEARTBEAT: Duration = Duration::from_secs(1);
+const WATCHER_RECONCILIATION_ATTEMPTS: usize = 3;
+const WATCHER_RECONCILIATION_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(
@@ -232,6 +234,46 @@ struct StoredMcpStdioCredentialV1 {
 pub struct McpAdapter {
     connections: Arc<McpConnectionManager>,
     oauth: Option<OAuthService>,
+    #[cfg(test)]
+    post_commit_pause: Option<Arc<PostCommitPause>>,
+    #[cfg(test)]
+    watcher_unavailable_pause: Option<Arc<WatcherUnavailablePause>>,
+    #[cfg(test)]
+    watcher_install_attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    watcher_capability_load_failures: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    watcher_credential_load_failures: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PostCommitPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+struct WatcherReconciliationFailure {
+    error: ProtocolError,
+    failed_revision: Option<i64>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct WatcherUnavailablePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl WatcherUnavailablePause {
+    pub(super) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(super) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl Default for McpAdapter {
@@ -245,6 +287,16 @@ impl McpAdapter {
         Self {
             connections: Arc::new(McpConnectionManager::new(stdio_templates)),
             oauth: None,
+            #[cfg(test)]
+            post_commit_pause: None,
+            #[cfg(test)]
+            watcher_unavailable_pause: None,
+            #[cfg(test)]
+            watcher_install_attempts: None,
+            #[cfg(test)]
+            watcher_capability_load_failures: None,
+            #[cfg(test)]
+            watcher_credential_load_failures: None,
         }
     }
 
@@ -256,6 +308,16 @@ impl McpAdapter {
         Self {
             connections,
             oauth: None,
+            #[cfg(test)]
+            post_commit_pause: None,
+            #[cfg(test)]
+            watcher_unavailable_pause: None,
+            #[cfg(test)]
+            watcher_install_attempts: None,
+            #[cfg(test)]
+            watcher_capability_load_failures: None,
+            #[cfg(test)]
+            watcher_credential_load_failures: None,
         }
     }
 
@@ -266,6 +328,16 @@ impl McpAdapter {
         Self {
             connections,
             oauth: Some(oauth),
+            #[cfg(test)]
+            post_commit_pause: None,
+            #[cfg(test)]
+            watcher_unavailable_pause: None,
+            #[cfg(test)]
+            watcher_install_attempts: None,
+            #[cfg(test)]
+            watcher_capability_load_failures: None,
+            #[cfg(test)]
+            watcher_credential_load_failures: None,
         }
     }
 
@@ -336,8 +408,14 @@ impl McpAdapter {
                 true,
             ),
         };
-        if !authorization_required {
-            self.install_source_watcher(catalog, &source).await;
+        if !authorization_required
+            && let Err(error) = self.install_source_watcher(catalog, &source).await
+        {
+            tracing::warn!(
+                source_id = source.id,
+                code = error.code,
+                "MCP HTTP source watcher installation failed"
+            );
         }
         Ok(source)
     }
@@ -414,8 +492,12 @@ impl McpAdapter {
                 .await
         }
         .map_err(protocol_catalog_error)?;
-        if discover_now {
-            self.install_source_watcher(catalog, &source).await;
+        if discover_now && let Err(error) = self.install_source_watcher(catalog, &source).await {
+            tracing::warn!(
+                source_id = source.id,
+                code = error.code,
+                "MCP stdio source watcher installation failed"
+            );
         }
         Ok(source)
     }
@@ -428,29 +510,9 @@ impl McpAdapter {
     ) -> Result<CatalogSyncResult, ProtocolError> {
         let _operation = self.connections.begin_operation().map_err(shutting_down)?;
         let source_id = source.id.clone();
-        let source_revision = source.revision;
-        let result = match self.refresh_source_core(catalog, source, audit).await {
-            Ok(result) => result,
-            Err(error) => {
-                if error.code == "oauth_binding_changed" {
-                    return Err(error);
-                }
-                let health_code = if error.code == "authorization_required" {
-                    "authorization_required"
-                } else {
-                    "mcp_refresh_failed"
-                };
-                let _ = catalog
-                    .mark_source_error(&source_id, health_code, source_revision, audit)
-                    .await;
-                return Err(error);
-            }
-        };
-        let current = catalog
-            .source(&source_id)
-            .await
-            .map_err(protocol_catalog_error)?;
-        self.install_source_watcher(catalog, &current).await;
+        let result = self.refresh_source_core(catalog, source, audit).await?;
+        self.finish_source_watcher_reconciliation(catalog, &source_id, result.source_revision)
+            .await?;
         Ok(result)
     }
 
@@ -583,7 +645,7 @@ impl McpAdapter {
             Some(stored.revision),
         )
         .await?;
-        let (stored, _synced, source) = catalog
+        let (stored, _synced, committed_source) = catalog
             .replace_credential_and_sync_catalog(
                 source_id,
                 &credential.payload()?,
@@ -593,12 +655,10 @@ impl McpAdapter {
             )
             .await
             .map_err(protocol_catalog_error)?;
-        self.connections
-            .stop_watcher_and_wait_at_revision(source_id, source.revision)
-            .await;
+        self.finish_source_watcher_reconciliation(catalog, source_id, committed_source.revision)
+            .await?;
         let credential = StoredMcpHttpCredentialV1::decode(&stored)?;
         let metadata = http_credential_metadata(stored.revision, &credential);
-        self.install_source_watcher(catalog, &source).await;
         Ok(metadata)
     }
 
@@ -644,7 +704,7 @@ impl McpAdapter {
                     audit,
                 )
                 .await
-                .map(|(stored, _, source)| (stored, source, true)),
+                .map(|(stored, _, source)| (stored, source)),
             Err(error) => {
                 tracing::info!(
                     source_id,
@@ -660,21 +720,28 @@ impl McpAdapter {
                         audit,
                     )
                     .await
-                    .map(|(stored, source)| (stored, source, false))
             }
         };
-        let (stored, source, install_watcher) = match committed {
+        let (stored, committed_source) = match committed {
             Ok(committed) => committed,
             Err(error) => {
-                self.install_source_watcher(catalog, &source).await;
+                if let Err(recovery_error) = self
+                    .reconcile_source_watcher(catalog, source_id, source.revision)
+                    .await
+                {
+                    tracing::warn!(
+                        source_id,
+                        code = recovery_error.code,
+                        "MCP HTTP watcher rollback recovery failed"
+                    );
+                }
                 return Err(protocol_catalog_error(error));
             }
         };
+        self.finish_source_watcher_reconciliation(catalog, source_id, committed_source.revision)
+            .await?;
         let credential = StoredMcpHttpCredentialV1::decode(&stored)?;
         let metadata = http_credential_metadata(stored.revision, &credential);
-        if install_watcher {
-            self.install_source_watcher(catalog, &source).await;
-        }
         Ok(metadata)
     }
 
@@ -712,7 +779,7 @@ impl McpAdapter {
             Some(stored.revision),
         )
         .await?;
-        let (stored, _synced, source) = catalog
+        let (stored, _synced, committed_source) = catalog
             .replace_credential_and_sync_catalog(
                 source_id,
                 &credential.payload()?,
@@ -722,12 +789,10 @@ impl McpAdapter {
             )
             .await
             .map_err(protocol_catalog_error)?;
-        self.connections
-            .stop_watcher_and_wait_at_revision(source_id, source.revision)
-            .await;
+        self.finish_source_watcher_reconciliation(catalog, source_id, committed_source.revision)
+            .await?;
         let credential = StoredMcpStdioCredentialV1::decode(&stored)?;
         let metadata = stdio_credential_metadata(stored.revision, &credential);
-        self.install_source_watcher(catalog, &source).await;
         Ok(metadata)
     }
 
@@ -787,16 +852,25 @@ impl McpAdapter {
                 let (stored, committed_source) = match cleared {
                     Ok(cleared) => cleared,
                     Err(error) => {
-                        self.install_source_watcher(catalog, source).await;
+                        if let Err(recovery_error) = self
+                            .reconcile_source_watcher(catalog, &source.id, source.revision)
+                            .await
+                        {
+                            tracing::warn!(
+                                source_id = source.id,
+                                code = recovery_error.code,
+                                "MCP stdio watcher rollback recovery failed"
+                            );
+                        }
                         return Err(protocol_catalog_error(error));
                     }
                 };
-                self.connections
-                    .stop_watcher_and_wait_at_revision(
-                        &committed_source.id,
-                        committed_source.revision,
-                    )
-                    .await;
+                self.finish_source_watcher_reconciliation(
+                    catalog,
+                    &committed_source.id,
+                    committed_source.revision,
+                )
+                .await?;
                 let credential = StoredMcpStdioCredentialV1::decode(&stored)?;
                 Ok(stdio_credential_metadata(stored.revision, &credential))
             }
@@ -807,66 +881,49 @@ impl McpAdapter {
         }
     }
 
-    async fn install_source_watcher(&self, catalog: &CatalogStore, source: &SourceRecord) {
+    async fn install_source_watcher(
+        &self,
+        catalog: &CatalogStore,
+        source: &SourceRecord,
+    ) -> Result<bool, ProtocolError> {
+        #[cfg(test)]
+        if let Some(attempts) = &self.watcher_install_attempts {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if source.health_status == SourceHealth::Unknown {
+            return Ok(self
+                .connections
+                .stop_watcher_and_wait_at_revision(&source.id, source.revision)
+                .await);
+        }
+        #[cfg(test)]
+        if consume_test_failure(&self.watcher_capability_load_failures) {
+            return Err(internal_error());
+        }
         match source_supports_list_changed(catalog, &source.id).await {
             Ok(true) => {}
             Ok(false) => {
-                self.connections
-                    .stop_watcher_at_revision(&source.id, source.revision)
-                    .await;
-                return;
+                return Ok(self
+                    .connections
+                    .stop_watcher_and_wait_at_revision(&source.id, source.revision)
+                    .await);
             }
-            Err(error) => {
-                tracing::warn!(
-                    source_id = source.id,
-                    code = error.code,
-                    "MCP watcher capability load failed"
-                );
-                return;
-            }
+            Err(error) => return Err(error),
         }
-        let stored = match required_stored_credential(catalog, &source.id).await {
-            Ok(stored) => stored,
-            Err(error) => {
-                tracing::warn!(
-                    source_id = source.id,
-                    code = error.code,
-                    "MCP watcher credential load failed"
-                );
-                return;
-            }
-        };
+        #[cfg(test)]
+        if consume_test_failure(&self.watcher_credential_load_failures) {
+            return Err(internal_error());
+        }
+        let stored = required_stored_credential(catalog, &source.id).await?;
         let source_id = source.id.clone();
-        let source_revision = source.revision;
         let credential_revision = stored.revision;
         let connections = self.connections.clone();
         let oauth = self.oauth.clone();
         let catalog = catalog.clone();
         let installed = match source.kind {
             SourceKind::McpHttp => {
-                let configuration =
-                    match McpHttpSourceConfigurationV1::decode(&source.configuration) {
-                        Ok(configuration) => configuration,
-                        Err(error) => {
-                            tracing::warn!(
-                                source_id = source.id,
-                                code = error.code,
-                                "MCP HTTP watcher configuration is invalid"
-                            );
-                            return;
-                        }
-                    };
-                let credential = match StoredMcpHttpCredentialV1::decode(&stored) {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        tracing::warn!(
-                            source_id = source.id,
-                            code = error.code,
-                            "MCP HTTP watcher credentials are invalid"
-                        );
-                        return;
-                    }
-                };
+                let configuration = McpHttpSourceConfigurationV1::decode(&source.configuration)?;
+                let credential = StoredMcpHttpCredentialV1::decode(&stored)?;
                 self.connections
                     .replace_watcher(
                         source_id.clone(),
@@ -880,7 +937,6 @@ impl McpAdapter {
                                     source_id,
                                     credential,
                                     allow_private_network: configuration.allow_private_network,
-                                    source_revision,
                                     credential_revision,
                                     revision_lease,
                                 },
@@ -891,37 +947,13 @@ impl McpAdapter {
                     .await
             }
             SourceKind::McpStdio => {
-                let configuration =
-                    match McpStdioSourceConfigurationV1::decode(&source.configuration) {
-                        Ok(configuration) => configuration,
-                        Err(error) => {
-                            tracing::warn!(
-                                source_id = source.id,
-                                code = error.code,
-                                "MCP stdio watcher configuration is invalid"
-                            );
-                            return;
-                        }
-                    };
+                let configuration = McpStdioSourceConfigurationV1::decode(&source.configuration)?;
                 let credential = match StoredMcpStdioCredentialV1::decode(&stored) {
                     Ok(credential) if credential.template_name == configuration.template_name => {
                         credential
                     }
-                    Ok(_) => {
-                        tracing::warn!(
-                            source_id = source.id,
-                            "MCP stdio watcher template state is inconsistent"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            source_id = source.id,
-                            code = error.code,
-                            "MCP stdio watcher credentials are invalid"
-                        );
-                        return;
-                    }
+                    Ok(_) => return Err(corrupt_configuration()),
+                    Err(error) => return Err(error),
                 };
                 self.connections
                     .replace_watcher(
@@ -934,7 +966,6 @@ impl McpAdapter {
                                     catalog,
                                     source_id,
                                     credential,
-                                    source_revision,
                                     credential_revision,
                                     revision_lease,
                                 },
@@ -944,29 +975,194 @@ impl McpAdapter {
                     )
                     .await
             }
-            SourceKind::Openapi | SourceKind::Graphql => return,
+            SourceKind::Openapi | SourceKind::Graphql => {
+                return Err(ProtocolError::corrupt(
+                    "source_protocol_mismatch",
+                    "The stored source does not match the MCP protocol.",
+                ));
+            }
         };
-        if installed.is_err() {
-            tracing::debug!(
-                source_id = source.id,
-                "MCP watcher was not installed during shutdown"
+        match installed {
+            Ok(installed) => Ok(installed),
+            Err(error) => Err(shutting_down(error)),
+        }
+    }
+
+    async fn reconcile_source_watcher(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        minimum_revision: i64,
+    ) -> Result<(), ProtocolError> {
+        let _reconciliation = self.connections.lock_watcher_reconciliation().await;
+        self.reconcile_source_watcher_locked(catalog, source_id, minimum_revision)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn reconcile_source_watcher_locked(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        minimum_revision: i64,
+    ) -> Result<(), WatcherReconciliationFailure> {
+        if self
+            .connections
+            .watcher_revision(source_id)
+            .is_some_and(|revision| revision >= minimum_revision)
+        {
+            match catalog.source(source_id).await {
+                Ok(source)
+                    if self.connections.watcher_revision(source_id) == Some(source.revision) =>
+                {
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(crate::catalog::CatalogError::NotFound { .. }) => {
+                    self.connections
+                        .stop_watcher_and_wait_at_least_revision(source_id, minimum_revision)
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(WatcherReconciliationFailure {
+                        error: protocol_catalog_error(error),
+                        failed_revision: None,
+                    });
+                }
+            }
+        }
+        self.connections
+            .stop_watcher_and_wait_at_least_revision(source_id, minimum_revision)
+            .await;
+        let mut last_failure = None;
+        for attempt in 0..WATCHER_RECONCILIATION_ATTEMPTS {
+            let source = match catalog.source(source_id).await {
+                Ok(source) => source,
+                Err(crate::catalog::CatalogError::NotFound { .. }) => return Ok(()),
+                Err(error) => {
+                    last_failure = Some(WatcherReconciliationFailure {
+                        error: protocol_catalog_error(error),
+                        failed_revision: None,
+                    });
+                    if attempt + 1 < WATCHER_RECONCILIATION_ATTEMPTS {
+                        tokio::time::sleep(WATCHER_RECONCILIATION_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+            };
+            if source.revision < minimum_revision {
+                last_failure = Some(WatcherReconciliationFailure {
+                    error: stale_watcher_reconciliation(),
+                    failed_revision: None,
+                });
+                if attempt + 1 < WATCHER_RECONCILIATION_ATTEMPTS {
+                    tokio::time::sleep(WATCHER_RECONCILIATION_RETRY_DELAY).await;
+                }
+                continue;
+            }
+            let observed_revision = source.revision;
+            self.connections
+                .stop_watcher_and_wait_at_least_revision(source_id, observed_revision)
+                .await;
+            match self.install_source_watcher(catalog, &source).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    last_failure = Some(WatcherReconciliationFailure {
+                        error: stale_watcher_reconciliation(),
+                        failed_revision: None,
+                    });
+                }
+                Err(error) => {
+                    last_failure = Some(WatcherReconciliationFailure {
+                        error,
+                        failed_revision: Some(observed_revision),
+                    });
+                }
+            }
+            if attempt + 1 < WATCHER_RECONCILIATION_ATTEMPTS {
+                tokio::time::sleep(WATCHER_RECONCILIATION_RETRY_DELAY).await;
+            }
+        }
+        Err(
+            last_failure.unwrap_or_else(|| WatcherReconciliationFailure {
+                error: stale_watcher_reconciliation(),
+                failed_revision: None,
+            }),
+        )
+    }
+
+    pub(super) async fn finish_source_watcher_reconciliation(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        committed_revision: i64,
+    ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        if let Some(pause) = &self.post_commit_pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+        self.reconcile_source_watcher(catalog, source_id, committed_revision)
+            .await
+    }
+
+    pub(super) async fn ensure_source_creation_watcher(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+    ) {
+        let source = match catalog.source(source_id).await {
+            Ok(source) => source,
+            Err(crate::catalog::CatalogError::NotFound { .. }) => return,
+            Err(error) => {
+                tracing::warn!(
+                    source_id,
+                    error = %error,
+                    "MCP source-create watcher reload failed"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.ensure_source_watcher(catalog, &source).await {
+            tracing::warn!(
+                source_id,
+                code = error.code,
+                "MCP source-create watcher recovery failed"
             );
         }
     }
 
-    async fn ensure_source_watcher(&self, catalog: &CatalogStore, source: &SourceRecord) {
-        if self.connections.has_watcher(&source.id) {
-            if matches!(
-                source_supports_list_changed(catalog, &source.id).await,
-                Ok(false)
-            ) {
-                self.connections
-                    .stop_watcher_at_revision(&source.id, source.revision)
-                    .await;
-            }
-            return;
+    async fn ensure_source_watcher(
+        &self,
+        catalog: &CatalogStore,
+        source: &SourceRecord,
+    ) -> Result<(), ProtocolError> {
+        if source.health_status == SourceHealth::Unknown {
+            self.connections
+                .stop_watcher_and_wait_at_least_revision(&source.id, source.revision)
+                .await;
+            return Ok(());
         }
-        self.install_source_watcher(catalog, source).await;
+        if self.connections.has_watcher(&source.id) {
+            match source_supports_list_changed(catalog, &source.id).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    self.connections
+                        .stop_watcher_and_wait_at_revision(&source.id, source.revision)
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.connections
+                        .stop_watcher_and_wait_at_least_revision(&source.id, source.revision)
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
+        self.reconcile_source_watcher(catalog, &source.id, source.revision)
+            .await
     }
 
     pub async fn restore_watchers(&self, catalog: &CatalogStore) -> Result<(), ProtocolError> {
@@ -976,14 +1172,126 @@ impl McpAdapter {
             .map_err(protocol_catalog_error)?;
         for source in sources {
             if matches!(source.kind, SourceKind::McpHttp | SourceKind::McpStdio) {
-                self.ensure_source_watcher(catalog, &source).await;
+                self.ensure_source_watcher(catalog, &source).await?;
             }
         }
         Ok(())
     }
 
-    pub async fn restore_source_watcher(&self, catalog: &CatalogStore, source: &SourceRecord) {
-        self.ensure_source_watcher(catalog, source).await;
+    pub async fn recover_source_watcher_after_failed_delete(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        minimum_revision: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<(), ProtocolError> {
+        let _reconciliation = self.connections.lock_watcher_reconciliation().await;
+        match self
+            .reconcile_source_watcher_locked(catalog, source_id, minimum_revision)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                if let Some(failed_revision) = failure.failed_revision {
+                    self.persist_watcher_unavailable_at_revision(
+                        catalog,
+                        source_id,
+                        failed_revision,
+                        audit,
+                    )
+                    .await;
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    async fn persist_watcher_unavailable_at_revision(
+        &self,
+        catalog: &CatalogStore,
+        source_id: &str,
+        failed_revision: i64,
+        audit: AuditContext<'_>,
+    ) {
+        #[cfg(test)]
+        if let Some(pause) = &self.watcher_unavailable_pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+        let source = match catalog.source(source_id).await {
+            Ok(source) if source.revision == failed_revision => source,
+            Ok(_) | Err(crate::catalog::CatalogError::NotFound { .. }) => return,
+            Err(error) => {
+                tracing::warn!(
+                    source_id,
+                    error = %error,
+                    "MCP watcher unavailability could not be revalidated"
+                );
+                return;
+            }
+        };
+        if self.connections.has_watcher(source_id) {
+            return;
+        }
+        let Some(revisions) = self
+            .connections
+            .lock_source_revisions([(source.id.clone(), failed_revision)])
+            .await
+        else {
+            return;
+        };
+        match catalog
+            .mark_source_error(source_id, "mcp_watcher_unavailable", failed_revision, audit)
+            .await
+        {
+            Ok(updated) => {
+                if !revisions.advance(&std::collections::HashMap::from([(
+                    updated.id.clone(),
+                    updated.revision,
+                )])) {
+                    tracing::error!(
+                        source_id,
+                        "MCP watcher revision did not match unavailable health persistence"
+                    );
+                }
+                self.connections
+                    .stop_watcher_and_wait_at_least_revision(&updated.id, updated.revision)
+                    .await;
+            }
+            Err(
+                crate::catalog::CatalogError::RevisionConflict { .. }
+                | crate::catalog::CatalogError::NotFound { .. },
+            ) => {}
+            Err(error) => {
+                tracing::warn!(
+                    source_id,
+                    error = %error,
+                    "MCP watcher unavailability could not be persisted"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_watcher_capability_loads(
+        &mut self,
+        failures: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.watcher_capability_load_failures = Some(failures);
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_watcher_unavailable_persistence(&mut self) -> Arc<WatcherUnavailablePause> {
+        let pause = Arc::new(WatcherUnavailablePause::default());
+        self.watcher_unavailable_pause = Some(pause.clone());
+        pause
+    }
+
+    pub(super) async fn lock_source_deletion(
+        &self,
+        source_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.connections.lock_source_deletion(source_id).await
     }
 
     pub async fn retire_source_watcher(&self, source_id: &str) {
@@ -992,6 +1300,15 @@ impl McpAdapter {
 
     pub async fn unretire_source_watcher(&self, source_id: &str) {
         self.connections.unretire_source(source_id).await;
+    }
+
+    pub(super) async fn lock_source_revisions(
+        &self,
+        observed_revisions: impl IntoIterator<Item = (String, i64)>,
+    ) -> Option<SourceRevisionLease> {
+        self.connections
+            .lock_source_revisions(observed_revisions)
+            .await
     }
 
     pub(super) async fn oauth_binding_observation(
@@ -1273,7 +1590,6 @@ struct HttpWatcherContext {
     source_id: String,
     credential: StoredMcpHttpCredentialV1,
     allow_private_network: bool,
-    source_revision: i64,
     credential_revision: i64,
     revision_lease: WatcherRevisionLease,
 }
@@ -1289,14 +1605,14 @@ async fn run_http_watcher(
         source_id,
         credential,
         allow_private_network,
-        mut source_revision,
         credential_revision,
         revision_lease,
     } = context;
     let mut retry_delay = Duration::from_secs(1);
-    let revisions = Arc::new(std::sync::atomic::AtomicI64::new(source_revision));
     loop {
-        source_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+        let Some(source_revision) = revision_lease.current_revision() else {
+            return;
+        };
         let operation = match connections.begin_operation() {
             Ok(operation) => operation,
             Err(_) => return,
@@ -1318,13 +1634,8 @@ async fn run_http_watcher(
                 );
                 let authorization_required = error.code == "authorization_required";
                 if authorization_required {
-                    mark_watcher_authorization_required(
-                        &catalog,
-                        &source_id,
-                        &revision_lease,
-                        &revisions,
-                    )
-                    .await;
+                    mark_watcher_authorization_required(&catalog, &source_id, &revision_lease)
+                        .await;
                     drop(operation);
                     if wait_for_http_authorization_change(
                         oauth.as_ref(),
@@ -1363,13 +1674,8 @@ async fn run_http_watcher(
             Err(error) => {
                 tracing::warn!(source_id, "MCP HTTP watcher initialization failed");
                 if credential.credential.is_none() && http_authorization_denied(&error) {
-                    mark_watcher_authorization_required(
-                        &catalog,
-                        &source_id,
-                        &revision_lease,
-                        &revisions,
-                    )
-                    .await;
+                    mark_watcher_authorization_required(&catalog, &source_id, &revision_lease)
+                        .await;
                     drop(operation);
                     if wait_for_http_authorization_change(
                         oauth.as_ref(),
@@ -1425,7 +1731,6 @@ async fn run_http_watcher(
                     plan,
                     oauth_expectation.clone(),
                     &revision_lease,
-                    &revisions,
                 )
                 .await
             });
@@ -1460,12 +1765,10 @@ async fn run_http_watcher(
                     reconnect = true;
                 }
                 let (synced, supports_list_changed) = reconciled.into_inner();
-                source_revision = synced.source_revision;
-                revisions.store(source_revision, std::sync::atomic::Ordering::Release);
                 retry_delay = Duration::from_secs(1);
                 if !supports_list_changed {
                     connections
-                        .stop_watcher_at_revision(&source_id, source_revision)
+                        .stop_watcher_at_revision(&source_id, synced.source_revision)
                         .await;
                     if !listener_finished {
                         abort_and_join(&mut listener).await;
@@ -1482,13 +1785,8 @@ async fn run_http_watcher(
                 );
                 let authorization_required = error.code == "authorization_required";
                 if authorization_required {
-                    mark_watcher_authorization_required(
-                        &catalog,
-                        &source_id,
-                        &revision_lease,
-                        &revisions,
-                    )
-                    .await;
+                    mark_watcher_authorization_required(&catalog, &source_id, &revision_lease)
+                        .await;
                 }
                 abort_and_join(&mut listener).await;
                 let _ = transport.terminate().await;
@@ -1564,7 +1862,6 @@ async fn run_http_watcher(
                                     &catalog,
                                     &source_id,
                                     &revision_lease,
-                                    &revisions,
                                 )
                                 .await;
                                 authorization_blocked = true;
@@ -1588,7 +1885,6 @@ async fn run_http_watcher(
                                     oauth_expectation.clone(),
                                     connections.clone(),
                                     revision_lease.clone(),
-                                    revisions.clone(),
                                 )
                             });
                             tokio::pin!(refresh);
@@ -1623,7 +1919,6 @@ async fn run_http_watcher(
                                                 &catalog,
                                                 &source_id,
                                                 &revision_lease,
-                                                &revisions,
                                             )
                                             .await;
                                             authorization_blocked = true;
@@ -1675,7 +1970,6 @@ async fn run_http_watcher(
                                                     oauth_expectation.clone(),
                                                     connections.clone(),
                                                     revision_lease.clone(),
-                                                    revisions.clone(),
                                                 )
                                             });
                                             tokio::pin!(retried);
@@ -1718,7 +2012,6 @@ async fn run_http_watcher(
                                                                     &catalog,
                                                                     &source_id,
                                                                     &revision_lease,
-                                                                    &revisions,
                                                                 )
                                                                 .await;
                                                                 authorization_blocked = true;
@@ -1778,9 +2071,10 @@ async fn mark_watcher_authorization_required(
     catalog: &CatalogStore,
     source_id: &str,
     revision_lease: &WatcherRevisionLease,
-    revisions: &std::sync::atomic::AtomicI64,
 ) {
-    let expected_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+    let Some(expected_revision) = revision_lease.current_revision() else {
+        return;
+    };
     let Some(revision_guard) = revision_lease.lock_revision(expected_revision).await else {
         return;
     };
@@ -1803,9 +2097,7 @@ async fn mark_watcher_authorization_required(
             return;
         }
     };
-    if revision_guard.advance(source.revision) {
-        revisions.store(source.revision, std::sync::atomic::Ordering::Release);
-    }
+    let _ = revision_guard.advance(source.revision);
 }
 
 async fn wait_for_http_authorization_change(
@@ -1847,7 +2139,6 @@ struct StdioWatcherContext {
     catalog: CatalogStore,
     source_id: String,
     credential: StoredMcpStdioCredentialV1,
-    source_revision: i64,
     credential_revision: i64,
     revision_lease: WatcherRevisionLease,
 }
@@ -1861,14 +2152,14 @@ async fn run_stdio_watcher(
         catalog,
         source_id,
         credential,
-        mut source_revision,
         credential_revision,
         revision_lease,
     } = context;
     let mut retry_delay = Duration::from_secs(1);
-    let revisions = Arc::new(std::sync::atomic::AtomicI64::new(source_revision));
     loop {
-        source_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+        let Some(source_revision) = revision_lease.current_revision() else {
+            return;
+        };
         let operation = match connections.begin_operation() {
             Ok(operation) => operation,
             Err(_) => return,
@@ -1930,15 +2221,7 @@ async fn run_stdio_watcher(
         match watcher_reconcile_or_cancel(&mut canceled, || {
             reconcile_watcher_session(async {
                 let plan = discover_stdio_session(&client, &mut changed, basis.clone()).await?;
-                commit_watcher_discovery(
-                    &catalog,
-                    &source_id,
-                    plan,
-                    None,
-                    &revision_lease,
-                    &revisions,
-                )
-                .await
+                commit_watcher_discovery(&catalog, &source_id, plan, None, &revision_lease).await
             })
         })
         .await
@@ -1949,12 +2232,10 @@ async fn run_stdio_watcher(
             }
             Some(Ok(reconciled)) => {
                 let (synced, supports_list_changed) = reconciled.into_inner();
-                source_revision = synced.source_revision;
-                revisions.store(source_revision, std::sync::atomic::Ordering::Release);
                 retry_delay = Duration::from_secs(1);
                 if !supports_list_changed {
                     connections
-                        .stop_watcher_at_revision(&source_id, source_revision)
+                        .stop_watcher_at_revision(&source_id, synced.source_revision)
                         .await;
                     client.shutdown().await;
                     return;
@@ -2008,7 +2289,6 @@ async fn run_stdio_watcher(
                                         basis.clone(),
                                         connections.clone(),
                                         revision_lease.clone(),
-                                        revisions.clone(),
                                     )
                                 });
                                 tokio::pin!(refresh);
@@ -2059,7 +2339,6 @@ async fn run_stdio_watcher(
                                             basis.clone(),
                                             connections.clone(),
                                             revision_lease.clone(),
-                                            revisions.clone(),
                                         )
                                     });
                                     tokio::pin!(retried);
@@ -2124,9 +2403,10 @@ async fn refresh_http_watcher_session(
     oauth_expectation: Option<OAuthBindingExpectation>,
     connections: Arc<McpConnectionManager>,
     revision_lease: WatcherRevisionLease,
-    revisions: Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<(), ProtocolError> {
-    basis.expected_source_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+    basis.expected_source_revision = revision_lease
+        .current_revision()
+        .ok_or_else(stale_watcher_reconciliation)?;
     let mut changed = transport.subscribe_tool_list_changed();
     let authorization_required_on_denial = oauth_expectation.is_some();
     let plan = discover_http_session(
@@ -2142,15 +2422,14 @@ async fn refresh_http_watcher_session(
         plan,
         oauth_expectation,
         &revision_lease,
-        &revisions,
     )
     .await?;
     if !supports_list_changed {
+        let source_revision = revision_lease
+            .current_revision()
+            .ok_or_else(stale_watcher_reconciliation)?;
         connections
-            .stop_watcher_at_revision(
-                &source_id,
-                revisions.load(std::sync::atomic::Ordering::Acquire),
-            )
+            .stop_watcher_at_revision(&source_id, source_revision)
             .await;
     }
     Ok(())
@@ -2163,28 +2442,22 @@ async fn refresh_stdio_watcher_session(
     mut basis: DiscoveryBasis,
     connections: Arc<McpConnectionManager>,
     revision_lease: WatcherRevisionLease,
-    revisions: Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<(), ProtocolError> {
-    basis.expected_source_revision = revisions.load(std::sync::atomic::Ordering::Acquire);
+    basis.expected_source_revision = revision_lease
+        .current_revision()
+        .ok_or_else(stale_watcher_reconciliation)?;
     let client = client.lock().await;
     let client = client.as_ref().ok_or_else(stale_watcher_reconciliation)?;
     let mut changed = client.subscribe_tool_list_changed();
     let plan = discover_stdio_session(client, &mut changed, basis).await?;
-    let (_, supports_list_changed) = commit_watcher_discovery(
-        &catalog,
-        &source_id,
-        plan,
-        None,
-        &revision_lease,
-        &revisions,
-    )
-    .await?;
+    let (_, supports_list_changed) =
+        commit_watcher_discovery(&catalog, &source_id, plan, None, &revision_lease).await?;
     if !supports_list_changed {
+        let source_revision = revision_lease
+            .current_revision()
+            .ok_or_else(stale_watcher_reconciliation)?;
         connections
-            .stop_watcher_at_revision(
-                &source_id,
-                revisions.load(std::sync::atomic::Ordering::Acquire),
-            )
+            .stop_watcher_at_revision(&source_id, source_revision)
             .await;
     }
     Ok(())
@@ -2235,7 +2508,6 @@ async fn commit_watcher_discovery(
     plan: DiscoveryPlan,
     oauth_expectation: Option<OAuthBindingExpectation>,
     revision_lease: &WatcherRevisionLease,
-    revisions: &std::sync::atomic::AtomicI64,
 ) -> Result<(CatalogSyncResult, bool), ProtocolError> {
     let expected_revision = plan.basis.expected_source_revision;
     let supports_list_changed = plan.basis.tools_list_changed;
@@ -2270,7 +2542,6 @@ async fn commit_watcher_discovery(
     if !revision_guard.advance(result.source_revision) {
         return Err(stale_watcher_reconciliation());
     }
-    revisions.store(result.source_revision, std::sync::atomic::Ordering::Release);
     Ok((result, supports_list_changed))
 }
 
@@ -2927,7 +3198,8 @@ fn http_transport_config(
     allow_private_network: bool,
 ) -> Result<StreamableHttpConfig, ProtocolError> {
     validate_http_credential(stored.credential.as_ref())?;
-    let mut config = StreamableHttpConfig::new(stored.endpoint.clone());
+    let endpoint = validate_endpoint(&stored.endpoint)?;
+    let mut config = StreamableHttpConfig::new(endpoint.to_string());
     config.allow_private_networks = allow_private_network;
     if let Some(credential) = &stored.credential {
         config.headers = credential.headers()?;
@@ -3096,7 +3368,22 @@ fn validate_endpoint(endpoint: &str) -> Result<Url, ProtocolError> {
     {
         return Err(invalid_endpoint());
     }
+    if url.scheme() == "http" && !loopback_endpoint(&url) {
+        return Err(invalid_endpoint());
+    }
     Ok(url)
+}
+
+fn loopback_endpoint(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(hostname)) => {
+            hostname.eq_ignore_ascii_case("localhost")
+                || hostname.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 fn display_endpoint(endpoint: &Url) -> String {
@@ -3360,6 +3647,7 @@ fn discovery_protocol_error(error: DiscoveryError) -> ProtocolError {
 
 fn http_configuration_error(error: StreamableHttpError) -> ProtocolError {
     match error {
+        StreamableHttpError::InsecureEndpoint => invalid_endpoint(),
         StreamableHttpError::Outbound(error) => super::protocol_outbound_error(error),
         _ => invalid_credentials("The MCP HTTP credential configuration is invalid."),
     }
@@ -3367,6 +3655,7 @@ fn http_configuration_error(error: StreamableHttpError) -> ProtocolError {
 
 fn http_protocol_error(error: StreamableHttpError) -> ProtocolError {
     match error {
+        StreamableHttpError::InsecureEndpoint => invalid_endpoint(),
         StreamableHttpError::Outbound(error) => super::protocol_outbound_error(error),
         StreamableHttpError::ProtocolVersionMismatch => ProtocolError::new(
             ProtocolErrorCategory::Upstream,
@@ -3467,7 +3756,7 @@ fn invalid_endpoint() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCategory::InvalidInput,
         "invalid_mcp_endpoint",
-        "The MCP endpoint must be an absolute HTTP or HTTPS URL without user info or a fragment.",
+        "The MCP endpoint must use HTTPS, or loopback HTTP, without user info or a fragment.",
     )
 }
 
@@ -3543,8 +3832,24 @@ fn internal_error() -> ProtocolError {
 }
 
 #[cfg(test)]
+fn consume_test_failure(counter: &Option<Arc<std::sync::atomic::AtomicUsize>>) -> bool {
+    counter.as_ref().is_some_and(|counter| {
+        counter
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+    })
+}
+
+#[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, convert::Infallible};
+    use std::{
+        collections::{HashMap, VecDeque},
+        convert::Infallible,
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -3554,7 +3859,10 @@ mod tests {
     use super::*;
     use crate::{
         AppConfig, ExecutorApp,
-        catalog::{CreateSource, CredentialPayload, ListToolsFilter, StoredCredential},
+        catalog::{
+            AuditContext, CreateSource, CredentialPayload, InitialCatalogSnapshot, ListToolsFilter,
+            SourceRecord, StoredCredential, ToolMode,
+        },
         crypto::Keyring,
         oauth::{
             model::{OAuthClientAuthentication, OAuthConnectionConfig, OAuthSecretSet},
@@ -3616,7 +3924,11 @@ mod tests {
         }
     }
 
-    async fn reconciliation_plan(expected_source_revision: i64, name: &str) -> DiscoveryPlan {
+    async fn reconciliation_plan_with_list_changed(
+        expected_source_revision: i64,
+        name: &str,
+        tools_list_changed: bool,
+    ) -> DiscoveryPlan {
         let mut fetcher = ReconciliationFetcher {
             pages: VecDeque::from([ToolPage {
                 tools: vec![reconciliation_tool(name)],
@@ -3626,9 +3938,221 @@ mod tests {
             session: "plan",
             generation: 1,
         };
-        discover(&mut fetcher, reconciliation_basis(expected_source_revision))
+        let mut basis = reconciliation_basis(expected_source_revision);
+        basis.capabilities = json!({ "tools": { "listChanged": tools_list_changed } });
+        basis.tools_list_changed = tools_list_changed;
+        discover(&mut fetcher, basis)
             .await
             .expect("test discovery succeeds")
+    }
+
+    async fn reconciliation_plan(expected_source_revision: i64, name: &str) -> DiscoveryPlan {
+        reconciliation_plan_with_list_changed(expected_source_revision, name, true).await
+    }
+
+    fn race_manager(kind: SourceKind) -> Arc<McpConnectionManager> {
+        let templates = if kind == SourceKind::McpStdio {
+            StdioTemplateRegistry::new(vec![crate::mcp::upstream::stdio::StdioTemplate {
+                name: "race-fixture".to_owned(),
+                executable: std::path::PathBuf::from("/bin/sh"),
+                cwd: None,
+                arguments: vec!["-c".to_owned(), "exit 1".to_owned()],
+                environment: BTreeMap::new(),
+                secret_environment: vec!["API_TOKEN".to_owned()],
+            }])
+            .expect("race stdio template validates")
+        } else {
+            StdioTemplateRegistry::default()
+        };
+        Arc::new(McpConnectionManager::new(templates))
+    }
+
+    async fn create_watcher_race_source(catalog: &CatalogStore, kind: SourceKind) -> SourceRecord {
+        let mut plan = reconciliation_plan(0, "initial").await;
+        let (configuration, credential) = match kind {
+            SourceKind::McpHttp => (
+                encode_configuration(&McpHttpSourceConfigurationV1 {
+                    endpoint: "http://127.0.0.1:1/mcp".to_owned(),
+                    allow_private_network: true,
+                    negotiated_protocol_version: HTTP_PROTOCOL_VERSION.to_owned(),
+                })
+                .expect("HTTP configuration encodes"),
+                StoredMcpHttpCredentialV1 {
+                    endpoint: "http://127.0.0.1:1/mcp".to_owned(),
+                    credential: Some(McpHttpCredential::Bearer {
+                        token: "old-http-token".to_owned(),
+                    }),
+                }
+                .payload()
+                .expect("HTTP credential encodes"),
+            ),
+            SourceKind::McpStdio => {
+                plan = bindings_for_stdio(plan);
+                (
+                    encode_configuration(&McpStdioSourceConfigurationV1 {
+                        template_name: "race-fixture".to_owned(),
+                        negotiated_protocol_version: Some(HTTP_PROTOCOL_VERSION.to_owned()),
+                    })
+                    .expect("stdio configuration encodes"),
+                    StoredMcpStdioCredentialV1 {
+                        template_name: "race-fixture".to_owned(),
+                        secret_values: BTreeMap::from([(
+                            "API_TOKEN".to_owned(),
+                            "old-stdio-token".to_owned(),
+                        )]),
+                    }
+                    .payload()
+                    .expect("stdio credential encodes"),
+                )
+            }
+            SourceKind::Openapi | SourceKind::Graphql => {
+                unreachable!("watcher race fixtures require MCP")
+            }
+        };
+        catalog
+            .create_source_with_catalog(
+                CreateSource {
+                    kind,
+                    preferred_slug: format!("{}-watcher-race", kind.as_str()),
+                    display_name: "Watcher race".to_owned(),
+                    description: None,
+                    configuration,
+                },
+                &credential,
+                plan.initial_catalog_snapshot(),
+                plan.bindings,
+                AuditContext::system(Some("watcher-race-create")),
+            )
+            .await
+            .expect("watcher race source creates")
+            .0
+    }
+
+    async fn install_old_race_watcher(
+        manager: &McpConnectionManager,
+        source: &SourceRecord,
+    ) -> WatcherRevisionLease {
+        let (lease_sender, lease_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            manager
+                .replace_watcher(
+                    source.id.clone(),
+                    source.revision,
+                    move |mut canceled, lease| async move {
+                        lease_sender.send(lease).ok();
+                        let _ = (&mut canceled).await;
+                    },
+                )
+                .await
+                .expect("old race watcher installs")
+        );
+        lease_receiver
+            .await
+            .expect("old race watcher exposes lease")
+    }
+
+    struct OldSecretWatcherSentinel {
+        canceled: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        in_use: std::sync::atomic::AtomicBool,
+    }
+
+    async fn install_old_secret_watcher(
+        manager: &McpConnectionManager,
+        source: &SourceRecord,
+    ) -> (WatcherRevisionLease, Arc<OldSecretWatcherSentinel>) {
+        let sentinel = Arc::new(OldSecretWatcherSentinel {
+            canceled: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            in_use: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (lease_sender, lease_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            manager
+                .replace_watcher(source.id.clone(), source.revision, {
+                    let sentinel = sentinel.clone();
+                    move |mut canceled, lease| async move {
+                        lease_sender.send(lease).ok();
+                        let _ = (&mut canceled).await;
+                        sentinel.canceled.notify_one();
+                        sentinel.release.notified().await;
+                        sentinel
+                            .in_use
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+                .await
+                .expect("old-secret watcher installs")
+        );
+        let lease = lease_receiver
+            .await
+            .expect("old-secret watcher exposes lease");
+        (lease, sentinel)
+    }
+
+    async fn commit_replacement_fixture(
+        catalog: &CatalogStore,
+        source: &SourceRecord,
+    ) -> SourceRecord {
+        let mut plan = reconciliation_plan(source.revision, "replacement").await;
+        let credential = match source.kind {
+            SourceKind::McpHttp => StoredMcpHttpCredentialV1 {
+                endpoint: "http://127.0.0.1:1/mcp".to_owned(),
+                credential: Some(McpHttpCredential::Bearer {
+                    token: "new-http-token".to_owned(),
+                }),
+            }
+            .payload()
+            .expect("replacement HTTP credential encodes"),
+            SourceKind::McpStdio => {
+                plan = bindings_for_stdio(plan);
+                StoredMcpStdioCredentialV1 {
+                    template_name: "race-fixture".to_owned(),
+                    secret_values: BTreeMap::from([(
+                        "API_TOKEN".to_owned(),
+                        "new-stdio-token".to_owned(),
+                    )]),
+                }
+                .payload()
+                .expect("replacement stdio credential encodes")
+            }
+            SourceKind::Openapi | SourceKind::Graphql => {
+                unreachable!("watcher race fixtures require MCP")
+            }
+        };
+        catalog
+            .replace_credential_and_sync_catalog(
+                &source.id,
+                &credential,
+                plan.catalog_snapshot(),
+                plan.bindings,
+                AuditContext::system(Some("watcher-race-replace")),
+            )
+            .await
+            .expect("replacement commits")
+            .2
+    }
+
+    async fn commit_mode_during_post_commit_pause(
+        manager: &McpConnectionManager,
+        catalog: &CatalogStore,
+        source: &SourceRecord,
+    ) -> SourceRecord {
+        let lease = manager
+            .lock_source_revisions([(source.id.clone(), source.revision)])
+            .await
+            .expect("post-commit catalog revision leases");
+        let updated = catalog
+            .set_source_mode(
+                &source.id,
+                Some(ToolMode::Ask),
+                source.revision,
+                AuditContext::system(Some("watcher-race-mode")),
+            )
+            .await
+            .expect("post-commit mode mutation commits");
+        assert!(lease.advance(&HashMap::from([(updated.id.clone(), updated.revision,)])));
+        updated
     }
 
     #[test]
@@ -3660,6 +4184,128 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn plaintext_nonloopback_create_rejects_static_and_anonymous_without_a_request() {
+        let listener = TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("zero-request listener binds");
+        let endpoint = format!(
+            "http://0.0.0.0:{}/mcp",
+            listener
+                .local_addr()
+                .expect("zero-request listener has an address")
+                .port()
+        );
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let adapter = McpAdapter::default();
+
+        for allow_private_network in [false, true] {
+            for credential in [
+                None,
+                Some(McpHttpCredential::Bearer {
+                    token: "must-not-dispatch".to_owned(),
+                }),
+            ] {
+                let error = adapter
+                    .create_http_source(
+                        app.catalog(),
+                        CreateMcpHttpSource {
+                            display_name: "Plaintext rejection".to_owned(),
+                            preferred_slug: None,
+                            description: None,
+                            endpoint: endpoint.clone(),
+                            allow_private_network,
+                            credential,
+                        },
+                        AuditContext::system(Some("plaintext-create-rejection")),
+                    )
+                    .await
+                    .expect_err("non-loopback plaintext create is rejected");
+                assert_eq!(error.code, "invalid_mcp_endpoint");
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err(),
+            "rejected source creation must not reach the endpoint"
+        );
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_nonloopback_refresh_rejects_legacy_state_without_a_request() {
+        let listener = TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("refresh zero-request listener binds");
+        let endpoint = format!(
+            "http://0.0.0.0:{}/mcp",
+            listener
+                .local_addr()
+                .expect("refresh listener has an address")
+                .port()
+        );
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let (source, _) = app
+            .catalog()
+            .create_source_with_catalog(
+                CreateSource {
+                    kind: SourceKind::McpHttp,
+                    preferred_slug: "legacy-plaintext-mcp".to_owned(),
+                    display_name: "Legacy plaintext MCP".to_owned(),
+                    description: None,
+                    configuration: json!({
+                        "endpoint": endpoint.clone(),
+                        "allowPrivateNetwork": true,
+                        "negotiatedProtocolVersion": HTTP_PROTOCOL_VERSION,
+                    })
+                    .as_object()
+                    .expect("legacy configuration is an object")
+                    .clone(),
+                },
+                &CredentialPayload {
+                    schema_version: MCP_CREDENTIAL_SCHEMA_VERSION,
+                    payload: json!({
+                        "endpoint": endpoint,
+                        "credential": {
+                            "type": "bearer",
+                            "token": "must-not-dispatch"
+                        }
+                    }),
+                },
+                InitialCatalogSnapshot {
+                    artifacts: Vec::new(),
+                    tools: Vec::new(),
+                },
+                Vec::new(),
+                AuditContext::system(Some("legacy-plaintext-create")),
+            )
+            .await
+            .expect("legacy source fixture is stored");
+        let error = McpAdapter::default()
+            .refresh_source(
+                app.catalog(),
+                source,
+                AuditContext::system(Some("legacy-plaintext-refresh")),
+            )
+            .await
+            .expect_err("legacy plaintext refresh is rejected");
+        assert_eq!(error.code, "invalid_source_configuration");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err(),
+            "rejected refresh must not reach the endpoint"
+        );
+        app.shutdown().await;
+    }
+
     #[test]
     fn public_http_configuration_removes_query_secrets() {
         let endpoint = validate_endpoint("https://example.com/mcp?api_key=secret")
@@ -3670,6 +4316,68 @@ mod tests {
             credential: None,
         };
         assert!(stored.endpoint.contains("api_key=secret"));
+    }
+
+    #[test]
+    fn plaintext_http_is_rejected_before_transport_except_for_loopback() {
+        assert_eq!(
+            http_configuration_error(StreamableHttpError::InsecureEndpoint).code,
+            "invalid_mcp_endpoint"
+        );
+        assert_eq!(
+            http_protocol_error(StreamableHttpError::InsecureEndpoint).code,
+            "invalid_mcp_endpoint"
+        );
+        for endpoint in [
+            "http://example.com/mcp",
+            "http://10.0.0.5/mcp",
+            "http://192.168.1.5/mcp",
+            "http://169.254.1.2/mcp",
+            "http://[fc00::1]/mcp",
+        ] {
+            assert_eq!(
+                validate_endpoint(endpoint)
+                    .expect_err("non-loopback plaintext endpoint is rejected")
+                    .code,
+                "invalid_mcp_endpoint"
+            );
+            for allow_private_network in [false, true] {
+                for credential in [
+                    None,
+                    Some(McpHttpCredential::Bearer {
+                        token: "must-not-dispatch".to_owned(),
+                    }),
+                ] {
+                    let stored = StoredMcpHttpCredentialV1 {
+                        endpoint: endpoint.to_owned(),
+                        credential,
+                    };
+                    let error = match http_transport_config(&stored, allow_private_network) {
+                        Ok(_) => panic!("plaintext transport must be rejected before construction"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.code, "invalid_mcp_endpoint");
+                }
+            }
+        }
+
+        for endpoint in [
+            "http://localhost:3000/mcp",
+            "http://worker.localhost:3000/mcp",
+            "http://127.0.0.1:3000/mcp",
+            "http://[::1]:3000/mcp",
+            "https://example.com/mcp",
+            "https://10.0.0.5/mcp",
+        ] {
+            let stored = StoredMcpHttpCredentialV1 {
+                endpoint: endpoint.to_owned(),
+                credential: Some(McpHttpCredential::Bearer {
+                    token: "allowed-transport".to_owned(),
+                }),
+            };
+            http_transport_config(&stored, true)
+                .expect("HTTPS and loopback HTTP transport configurations remain valid");
+        }
     }
 
     #[test]
@@ -3956,6 +4664,13 @@ mod tests {
         let master_key = [42_u8; 32];
         let master_key_file = directory.path().join("fixture-master.key");
         std::fs::write(&master_key_file, master_key).expect("fixture master key is written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&master_key_file, std::fs::Permissions::from_mode(0o600))
+                .expect("fixture master key permissions are restricted");
+        }
         let app = ExecutorApp::open(
             AppConfig::new(directory.path().join("data"))
                 .with_master_key_file(Some(master_key_file)),
@@ -4092,6 +4807,53 @@ mod tests {
         };
         assert_eq!(anonymous.code, "oauth_binding_changed");
 
+        let zero_request_listener = TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("managed OAuth zero-request listener binds");
+        let insecure_managed = StoredMcpHttpCredentialV1 {
+            endpoint: format!(
+                "http://0.0.0.0:{}/mcp",
+                zero_request_listener
+                    .local_addr()
+                    .expect("managed OAuth listener has an address")
+                    .port()
+            ),
+            credential: None,
+        };
+        for allow_private_network in [false, true] {
+            let error = match http_transport_config_for_source(
+                Some(&oauth),
+                &source.id,
+                &insecure_managed,
+                allow_private_network,
+            )
+            .await
+            {
+                Ok(_) => panic!("managed OAuth must not configure plaintext public transport"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "invalid_mcp_endpoint");
+        }
+        let error = match http_transport_config_for_binding(
+            Some(&oauth),
+            &source.id,
+            &insecure_managed,
+            true,
+            Some(&stale_binding),
+        )
+        .await
+        {
+            Ok(_) => panic!("plaintext rejection must precede managed OAuth resolution"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_mcp_endpoint");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), zero_request_listener.accept())
+                .await
+                .is_err(),
+            "managed OAuth rejection must not reach the plaintext endpoint"
+        );
+
         let static_stored = StoredMcpHttpCredentialV1 {
             endpoint: stored.endpoint,
             credential: Some(McpHttpCredential::Bearer {
@@ -4120,6 +4882,7 @@ mod tests {
                 connection_id: "connection".to_owned(),
                 credential_key: "default".to_owned(),
                 config_revision: 4,
+                granted_scopes: vec![],
             },
             secret_revision: 7,
         };
@@ -4214,6 +4977,34 @@ mod tests {
         };
         assert!(credential.endpoint.contains("secret=query"));
         assert!(credential.credential.is_some());
+
+        let insecure_changed_endpoint = StoredCredential {
+            revision: 2,
+            credential: StoredMcpHttpCredentialV1 {
+                endpoint: "http://example.com/mcp".to_owned(),
+                credential: Some(McpHttpCredential::Bearer {
+                    token: "must-not-dispatch".to_owned(),
+                }),
+            }
+            .payload()
+            .expect("changed credential encodes"),
+        };
+        let error = match adapter.prepare_invocation(
+            "source-id",
+            SourceKind::McpHttp,
+            &McpToolBindingV1 {
+                version: 1,
+                tool_name: "ping".to_owned(),
+            },
+            &configuration,
+            Some(&insecure_changed_endpoint),
+            &json!({}),
+            McpOAuthBindingObservation::Static,
+        ) {
+            Ok(_) => panic!("changed plaintext public endpoint must fail before invocation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_source_credentials");
     }
 
     #[test]
@@ -4418,12 +5209,9 @@ mod tests {
             .await
             .expect("concurrent catalog update commits");
         let stale = reconciliation_plan(source.revision, "stale").await;
-        let revisions = std::sync::atomic::AtomicI64::new(source.revision);
-
-        let error =
-            commit_watcher_discovery(app.catalog(), &source.id, stale, None, &lease, &revisions)
-                .await
-                .expect_err("stale watcher CAS is rejected");
+        let error = commit_watcher_discovery(app.catalog(), &source.id, stale, None, &lease)
+            .await
+            .expect_err("stale watcher CAS is rejected");
         assert_eq!(error.code, "revision_conflict");
         assert_eq!(
             app.catalog()
@@ -4509,18 +5297,10 @@ mod tests {
                 .expect("replacement watcher installs")
         );
         let stale_plan = reconciliation_plan(source.revision, "stale-generation").await;
-        let revisions = std::sync::atomic::AtomicI64::new(source.revision);
-
-        let error = commit_watcher_discovery(
-            app.catalog(),
-            &source.id,
-            stale_plan,
-            None,
-            &stale_lease,
-            &revisions,
-        )
-        .await
-        .expect_err("replaced watcher cannot publish at the current revision");
+        let error =
+            commit_watcher_discovery(app.catalog(), &source.id, stale_plan, None, &stale_lease)
+                .await
+                .expect_err("replaced watcher cannot publish at the current revision");
         assert_eq!(error.code, "stale_watcher_reconciliation");
         assert_eq!(
             app.catalog()
@@ -4548,6 +5328,484 @@ mod tests {
                 .any(|tool| tool.stable_key == "stale-generation")
         );
 
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    async fn credential_replacement_post_commit_race(kind: SourceKind) {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(kind);
+        let source = create_watcher_race_source(app.catalog(), kind).await;
+        let old_watcher = install_old_race_watcher(&manager, &source).await;
+        let committed = commit_replacement_fixture(app.catalog(), &source).await;
+        assert_eq!(committed.revision, source.revision + 1);
+
+        let pause = Arc::new(PostCommitPause::default());
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.post_commit_pause = Some(pause.clone());
+        let committed_revision = committed.revision;
+        let finishing = tokio::spawn({
+            let adapter = adapter.clone();
+            let catalog = app.catalog().clone();
+            let source_id = source.id.clone();
+            async move {
+                adapter
+                    .finish_source_watcher_reconciliation(&catalog, &source_id, committed_revision)
+                    .await
+                    .expect("replacement watcher reconciliation succeeds");
+            }
+        });
+        pause.reached.notified().await;
+
+        let current =
+            commit_mode_during_post_commit_pause(&manager, app.catalog(), &committed).await;
+        assert_eq!(current.revision, committed.revision + 1);
+        assert_eq!(old_watcher.current_revision(), None);
+        assert_eq!(manager.watcher_revision(&source.id), Some(source.revision));
+
+        pause.release.notify_one();
+        finishing.await.expect("post-commit reconciliation joins");
+        assert_eq!(manager.watcher_revision(&source.id), Some(current.revision));
+        assert_eq!(old_watcher.current_revision(), None);
+
+        let stored = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("replacement credential reads")
+            .expect("replacement credential exists");
+        match kind {
+            SourceKind::McpHttp => {
+                let stored = StoredMcpHttpCredentialV1::decode(&stored)
+                    .expect("replacement HTTP credential decodes");
+                assert!(matches!(
+                    stored.credential,
+                    Some(McpHttpCredential::Bearer { token }) if token == "new-http-token"
+                ));
+            }
+            SourceKind::McpStdio => {
+                let stored = StoredMcpStdioCredentialV1::decode(&stored)
+                    .expect("replacement stdio credential decodes");
+                assert_eq!(
+                    stored.secret_values.get("API_TOKEN").map(String::as_str),
+                    Some("new-stdio-token")
+                );
+            }
+            SourceKind::Openapi | SourceKind::Graphql => unreachable!(),
+        }
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    async fn credential_reconciliation_load_failure_recovers_without_old_secret(
+        kind: SourceKind,
+        fail_capabilities: bool,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(kind);
+        let source = create_watcher_race_source(app.catalog(), kind).await;
+        let (old_watcher, sentinel) = install_old_secret_watcher(&manager, &source).await;
+        let committed = commit_replacement_fixture(app.catalog(), &source).await;
+        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let install_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.watcher_install_attempts = Some(install_attempts.clone());
+        if fail_capabilities {
+            adapter.watcher_capability_load_failures = Some(failures.clone());
+        } else {
+            adapter.watcher_credential_load_failures = Some(failures.clone());
+        }
+        let committed_revision = committed.revision;
+
+        let finishing = tokio::spawn({
+            let adapter = adapter.clone();
+            let catalog = app.catalog().clone();
+            let source_id = source.id.clone();
+            async move {
+                adapter
+                    .finish_source_watcher_reconciliation(&catalog, &source_id, committed_revision)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), sentinel.canceled.notified())
+            .await
+            .expect("old-secret watcher is canceled promptly");
+        assert!(sentinel.in_use.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!finishing.is_finished());
+        sentinel.release.notify_one();
+
+        finishing
+            .await
+            .expect("credential reconciliation task joins")
+            .expect("transient watcher load failure recovers");
+        assert!(!sentinel.in_use.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(old_watcher.current_revision(), None);
+        assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            install_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            manager.watcher_revision(&source.id),
+            Some(committed_revision)
+        );
+
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_credential_reconciliation_fails_closed_then_recovers_capability_load() {
+        credential_reconciliation_load_failure_recovers_without_old_secret(
+            SourceKind::McpHttp,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stdio_credential_reconciliation_fails_closed_then_recovers_credential_load() {
+        credential_reconciliation_load_failure_recovers_without_old_secret(
+            SourceKind::McpStdio,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn persistent_post_commit_load_failure_returns_error_without_old_secret_watcher() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(SourceKind::McpHttp);
+        let source = create_watcher_race_source(app.catalog(), SourceKind::McpHttp).await;
+        let (_old_watcher, sentinel) = install_old_secret_watcher(&manager, &source).await;
+        let committed = commit_replacement_fixture(app.catalog(), &source).await;
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.watcher_capability_load_failures = Some(Arc::new(
+            std::sync::atomic::AtomicUsize::new(WATCHER_RECONCILIATION_ATTEMPTS),
+        ));
+
+        let finishing = tokio::spawn({
+            let adapter = adapter.clone();
+            let catalog = app.catalog().clone();
+            let source_id = source.id.clone();
+            async move {
+                adapter
+                    .finish_source_watcher_reconciliation(&catalog, &source_id, committed.revision)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), sentinel.canceled.notified())
+            .await
+            .expect("old-secret watcher is canceled promptly");
+        assert!(!finishing.is_finished());
+        sentinel.release.notify_one();
+
+        let error = finishing
+            .await
+            .expect("credential reconciliation task joins")
+            .expect_err("persistent watcher load failure is reported");
+        assert_eq!(error.code, "internal_error");
+        assert!(!sentinel.in_use.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!manager.has_watcher(&source.id));
+
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    async fn source_creation_finish_preserves_or_recovers_watcher(kind: SourceKind) {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(kind);
+        let source = create_watcher_race_source(app.catalog(), kind).await;
+        let watcher_canceled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let canceled_flag = watcher_canceled.clone();
+        assert!(
+            manager
+                .replace_watcher(
+                    source.id.clone(),
+                    source.revision,
+                    move |mut canceled, _lease| async move {
+                        let _ = (&mut canceled).await;
+                        canceled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await
+                .expect("ready source watcher installs")
+        );
+
+        let install_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.watcher_install_attempts = Some(install_attempts.clone());
+        adapter
+            .ensure_source_creation_watcher(app.catalog(), &source.id)
+            .await;
+        assert_eq!(
+            install_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "finishing a ready create must preserve its current watcher"
+        );
+        assert!(!watcher_canceled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(manager.watcher_revision(&source.id), Some(source.revision));
+
+        assert!(
+            manager
+                .stop_watcher_and_wait_at_revision(&source.id, source.revision)
+                .await
+        );
+        assert!(watcher_canceled.load(std::sync::atomic::Ordering::SeqCst));
+        adapter
+            .ensure_source_creation_watcher(app.catalog(), &source.id)
+            .await;
+        assert_eq!(
+            install_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "recovery must make exactly one watcher installation attempt"
+        );
+
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_source_creation_finish_preserves_ready_watcher_and_recovers_missing() {
+        source_creation_finish_preserves_or_recovers_watcher(SourceKind::McpHttp).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_source_creation_finish_preserves_ready_watcher_and_recovers_missing() {
+        source_creation_finish_preserves_or_recovers_watcher(SourceKind::McpStdio).await;
+    }
+
+    #[tokio::test]
+    async fn http_credential_replacement_reloads_after_a_paused_post_commit_mode_race() {
+        credential_replacement_post_commit_race(SourceKind::McpHttp).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_credential_replacement_reloads_after_a_paused_post_commit_mode_race() {
+        credential_replacement_post_commit_race(SourceKind::McpStdio).await;
+    }
+
+    #[tokio::test]
+    async fn http_clear_fallback_stops_a_stale_old_credential_watcher_after_commit() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(SourceKind::McpHttp);
+        let source = create_watcher_race_source(app.catalog(), SourceKind::McpHttp).await;
+        let old_watcher = install_old_race_watcher(&manager, &source).await;
+        let expected_credential_revision = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("HTTP credential reads")
+            .expect("HTTP credential exists")
+            .revision;
+
+        let pause = Arc::new(PostCommitPause::default());
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.post_commit_pause = Some(pause.clone());
+        let clearing = tokio::spawn({
+            let adapter = adapter.clone();
+            let catalog = app.catalog().clone();
+            let source_id = source.id.clone();
+            async move {
+                adapter
+                    .replace_http_credentials(
+                        &catalog,
+                        &source_id,
+                        expected_credential_revision,
+                        ReplaceMcpHttpCredential { credential: None },
+                        AuditContext::system(Some("watcher-race-http-clear")),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("HTTP clear reaches its post-commit fence");
+
+        assert_eq!(old_watcher.current_revision(), None);
+        assert!(!manager.has_watcher(&source.id));
+        let stale_watcher = install_old_race_watcher(&manager, &source).await;
+        assert_eq!(stale_watcher.current_revision(), Some(source.revision));
+
+        pause.release.notify_one();
+        let metadata = tokio::time::timeout(Duration::from_secs(5), clearing)
+            .await
+            .expect("HTTP clear finishes promptly")
+            .expect("HTTP clear task joins")
+            .expect("HTTP clear commits");
+        assert!(metadata.configured_schemes.is_empty());
+        assert!(!manager.has_watcher(&source.id));
+        assert_eq!(stale_watcher.current_revision(), None);
+        let current = app
+            .catalog()
+            .source(&source.id)
+            .await
+            .expect("cleared HTTP source reads");
+        assert_eq!(current.health_status, SourceHealth::Unknown);
+        assert!(current.revision > source.revision);
+        let stored = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("cleared HTTP credential reads")
+            .expect("cleared HTTP credential exists");
+        assert!(
+            StoredMcpHttpCredentialV1::decode(&stored)
+                .expect("cleared HTTP credential decodes")
+                .credential
+                .is_none()
+        );
+
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clearing_required_stdio_secrets_keeps_the_committed_revision_without_a_watcher() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(SourceKind::McpStdio);
+        let source = create_watcher_race_source(app.catalog(), SourceKind::McpStdio).await;
+        let old_watcher = install_old_race_watcher(&manager, &source).await;
+        let expected_credential_revision = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("stdio credential reads")
+            .expect("stdio credential exists")
+            .revision;
+        let adapter = McpAdapter::with_connection_manager(manager.clone());
+
+        let metadata = adapter
+            .clear_credentials(
+                app.catalog(),
+                &source,
+                expected_credential_revision,
+                AuditContext::system(Some("watcher-race-stdio-clear")),
+            )
+            .await
+            .expect("stdio credential clear commits");
+        assert!(metadata.configured_schemes.is_empty());
+        assert!(!manager.has_watcher(&source.id));
+        assert_eq!(old_watcher.current_revision(), None);
+
+        let current = app
+            .catalog()
+            .source(&source.id)
+            .await
+            .expect("cleared stdio source reads");
+        assert_eq!(current.health_status, SourceHealth::Unknown);
+        assert!(current.revision > source.revision);
+        let stored = app
+            .catalog()
+            .credential(&source.id)
+            .await
+            .expect("cleared stdio credential reads")
+            .expect("cleared stdio credential exists");
+        assert!(
+            StoredMcpStdioCredentialV1::decode(&stored)
+                .expect("cleared stdio credential decodes")
+                .secret_values
+                .is_empty()
+        );
+
+        adapter
+            .reconcile_source_watcher(app.catalog(), &source.id, current.revision)
+            .await
+            .expect("cleared stdio watcher remains absent");
+        assert!(!manager.has_watcher(&source.id));
+
+        manager.shutdown().await;
+        app.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_capability_removal_stops_stale_watcher_after_post_commit_mode_race() {
+        let directory = tempfile::tempdir().expect("temporary data directory exists");
+        let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+            .await
+            .expect("test app opens");
+        let manager = race_manager(SourceKind::McpHttp);
+        let source = create_watcher_race_source(app.catalog(), SourceKind::McpHttp).await;
+        let (old_watcher, sentinel) = install_old_secret_watcher(&manager, &source).await;
+
+        let removed =
+            reconciliation_plan_with_list_changed(source.revision, "refreshed", false).await;
+        let sync = app
+            .catalog()
+            .sync_catalog_with_bindings(
+                &source.id,
+                removed.catalog_snapshot(),
+                removed.bindings,
+                AuditContext::system(Some("watcher-race-refresh")),
+            )
+            .await
+            .expect("capability removal refresh commits");
+        let committed = app
+            .catalog()
+            .source(&source.id)
+            .await
+            .expect("refreshed source reads");
+        assert_eq!(committed.revision, sync.source_revision);
+
+        let pause = Arc::new(PostCommitPause::default());
+        let mut adapter = McpAdapter::with_connection_manager(manager.clone());
+        adapter.post_commit_pause = Some(pause.clone());
+        let committed_revision = committed.revision;
+        let finishing = tokio::spawn({
+            let adapter = adapter.clone();
+            let catalog = app.catalog().clone();
+            let source_id = source.id.clone();
+            async move {
+                adapter
+                    .finish_source_watcher_reconciliation(&catalog, &source_id, committed_revision)
+                    .await
+                    .expect("capability removal watcher reconciliation succeeds");
+            }
+        });
+        pause.reached.notified().await;
+
+        let current =
+            commit_mode_during_post_commit_pause(&manager, app.catalog(), &committed).await;
+        assert_eq!(old_watcher.current_revision(), None);
+        assert_eq!(manager.watcher_revision(&source.id), Some(source.revision));
+
+        pause.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), sentinel.canceled.notified())
+            .await
+            .expect("capability removal cancels the old-secret watcher promptly");
+        assert!(sentinel.in_use.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!finishing.is_finished());
+        sentinel.release.notify_one();
+        finishing.await.expect("post-commit reconciliation joins");
+        assert!(!sentinel.in_use.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!manager.has_watcher(&source.id));
+        assert_eq!(old_watcher.current_revision(), None);
+        assert_eq!(
+            app.catalog()
+                .source(&source.id)
+                .await
+                .expect("current source reads")
+                .revision,
+            current.revision
+        );
         manager.shutdown().await;
         app.shutdown().await;
     }
@@ -4647,7 +5905,6 @@ mod tests {
             .await
             .expect("watcher installs");
         let lease = lease_receiver.await.expect("watcher lease is available");
-        let revisions = std::sync::atomic::AtomicI64::new(source.revision);
         for status in [
             reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::FORBIDDEN,
@@ -4677,7 +5934,7 @@ mod tests {
             "authorization_required"
         );
 
-        mark_watcher_authorization_required(app.catalog(), &source.id, &lease, &revisions).await;
+        mark_watcher_authorization_required(app.catalog(), &source.id, &lease).await;
 
         let current = app
             .catalog()
@@ -4689,10 +5946,7 @@ mod tests {
             current.health_error_code.as_deref(),
             Some("authorization_required")
         );
-        assert_eq!(
-            revisions.load(std::sync::atomic::Ordering::Acquire),
-            current.revision
-        );
+        assert_eq!(lease.current_revision(), Some(current.revision));
         assert!(lease.lock_revision(current.revision).await.is_some());
         manager.shutdown().await;
         app.shutdown().await;

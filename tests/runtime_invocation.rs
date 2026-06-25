@@ -22,6 +22,7 @@ use executor::{
         RequestSurface, SourceKind, StagedArtifact, StagedTool, StagedToolBinding, ToolBinding,
         ToolMode,
     },
+    invocation::{ToolCall, ToolCallSubmission},
     openapi::{OpenApiBinding, OpenApiSecurityAlternative},
     runtime::{
         ExecutionCancellation, ExecutionRequest, HostToolDispatcher, InvocationContext,
@@ -472,6 +473,32 @@ async fn dropped_runtime_waiter_still_cancels_pending_approval() {
             .await
     });
     let approval = pending(&app, execution_id, 1).await.remove(0);
+    let held_delivery = app
+        .tool_calls()
+        .submit(ToolCall {
+            request_id: "held-dropped-waiter-delivery".to_owned(),
+            actor: ToolActor::api_token("runtime-owner", Some("Runtime owner".to_owned())),
+            surface: RequestSurface::Gateway,
+            execution_id: execution_id.to_owned(),
+            call_id: "1".to_owned(),
+            worker_generation: approval.worker_generation,
+            path: "runtime.cancel".to_owned(),
+            arguments: json!({}),
+        })
+        .await
+        .expect("the correlated delivery should be reusable");
+    let ToolCallSubmission::ApprovalRequired(held_delivery) = held_delivery else {
+        panic!("the correlated delivery should remain pending");
+    };
+    assert_eq!(held_delivery.id, approval.id);
+    let pin_refs = sqlx::query_scalar::<_, i64>(
+        "SELECT ref_count FROM approval_delivery_pins WHERE approval_id = ?",
+    )
+    .bind(&approval.id)
+    .fetch_one(app.pool())
+    .await
+    .expect("both pending deliveries should be pinned");
+    assert_eq!(pin_refs, 2);
     execution.abort();
     assert!(
         execution
@@ -497,24 +524,40 @@ async fn dropped_runtime_waiter_still_cancels_pending_approval() {
     })
     .await
     .expect("detached actor should complete approval cleanup");
+    let pins = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM approval_delivery_pins WHERE approval_id = ?",
+    )
+    .bind(&approval.id)
+    .fetch_one(app.pool())
+    .await
+    .expect("dropped waiter delivery pin should read");
+    assert_eq!(
+        pins, 0,
+        "lost-execution cancellation must release pins atomically while another ticket is alive"
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let pins = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM approval_delivery_pins WHERE approval_id = ?",
+            let logged = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM request_logs \
+                 WHERE approval_id = ? AND error_code = 'approval_canceled')",
             )
             .bind(&approval.id)
             .fetch_one(app.pool())
             .await
-            .expect("dropped waiter delivery pin should read");
-            if pins == 0 {
+            .expect("canceled approval log should read");
+            if logged != 0 {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("dropped waiter delivery pin should be released");
+    .expect("dropped waiter cancellation should remain durably logged");
+    drop(held_delivery);
     upstream_task.abort();
+    let _ = upstream_task.await;
+    app.begin_shutdown();
+    drop(app);
 }
 
 #[tokio::test]
@@ -977,6 +1020,7 @@ async fn execute_api_authenticates_before_body_and_enforces_source_and_time_limi
             (header::COOKIE.as_str(), &cookies),
             (header::ORIGIN.as_str(), "http://127.0.0.1:4788"),
             ("x-executor-csrf", csrf),
+            ("idempotency-key", "runtime-api-token"),
         ],
     )
     .await;

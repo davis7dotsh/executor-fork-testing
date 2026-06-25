@@ -17,7 +17,7 @@ import {
   removeDaemonRecord,
   writeDaemonPointer,
   writeDaemonRecord,
-} from "../apps/cli/src/daemon-state";
+} from "../legacy/cli/src/daemon-state";
 
 const fileSystemError = (method: string, cause: unknown) =>
   PlatformError.systemError({
@@ -79,7 +79,7 @@ describe("daemon state", () => {
     expect(canonicalDaemonHost("localhost")).toBe("localhost");
     expect(canonicalDaemonHost("127.0.0.1")).toBe("localhost");
     expect(canonicalDaemonHost("::1")).toBe("localhost");
-    expect(canonicalDaemonHost("0.0.0.0")).toBe("localhost");
+    expect(canonicalDaemonHost("0.0.0.0")).toBe("0.0.0.0");
     expect(canonicalDaemonHost("api.example.com")).toBe("api.example.com");
   });
 

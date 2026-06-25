@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: executor:local
+    image: "${EXECUTOR_IMAGE:-executor:local}"
     command:
       - server
       - --bind

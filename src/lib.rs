@@ -29,6 +29,7 @@ pub mod outbound;
 pub(crate) mod protocols;
 mod request_logs;
 pub mod runtime;
+pub mod service;
 mod tasks;
 pub mod web_assets;
 

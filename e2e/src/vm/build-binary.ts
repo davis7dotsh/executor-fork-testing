@@ -1,6 +1,6 @@
 // Build the compiled `executor` for a guest os/arch. `service install` refuses
 // to run from a dev (.ts) entrypoint, so the VM targets need a real binary —
-// produced via the `--target` flag on apps/cli/src/build.ts.
+// produced via the `--target` flag on legacy/cli/src/build.ts.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -15,7 +15,7 @@ const PLATFORM_TAG: Record<VmOs, string> = { macos: "darwin", linux: "linux", wi
 
 // e2e/src/vm/build-binary.ts → repo root.
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
-const CLI_DIR = path.join(REPO_ROOT, "apps", "cli");
+const CLI_DIR = path.join(REPO_ROOT, "legacy", "cli");
 
 /**
  * Build the `executor` binary for a guest and return its `bin` directory

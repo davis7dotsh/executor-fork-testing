@@ -13,13 +13,16 @@
     type GraphqlAuthDraft,
     type GraphqlSourceInput,
   } from "$lib/graphql-source-state";
-
   let {
     create,
     oncreated,
+    onbusychange,
+    disabled = false,
   }: {
     create: (input: GraphqlSourceInput, signal: AbortSignal) => Promise<ApiResult<Source>>;
-    oncreated: (source: Source) => void;
+    oncreated?: (source: Source) => void;
+    onbusychange?: (busy: boolean) => void;
+    disabled?: boolean;
   } = $props();
 
   const auth = useAuthState();
@@ -39,6 +42,7 @@
   );
   let activeController: AbortController | null = null;
   let lifetime = 0;
+  let reportedBusy = false;
 
   $effect(() => {
     lifetime += 1;
@@ -47,7 +51,14 @@
       activeController?.abort();
       activeController = null;
       credentialDraft = clearGraphqlSecret(credentialDraft);
+      if (reportedBusy) onbusychange?.(false);
     };
+  });
+
+  $effect(() => {
+    if (busy === reportedBusy) return;
+    reportedBusy = busy;
+    onbusychange?.(busy);
   });
 
   function changeAuthType() {
@@ -63,7 +74,13 @@
     event.preventDefault();
     const currentCredential = credential;
     const currentEndpoint = normalizedEndpoint;
-    if (busy || localOptInMissing || currentCredential === undefined || currentEndpoint === null) {
+    if (
+      busy ||
+      disabled ||
+      localOptInMissing ||
+      currentCredential === undefined ||
+      currentEndpoint === null
+    ) {
       return;
     }
 
@@ -74,7 +91,7 @@
     busy = true;
     error = null;
     credentialDraft = clearGraphqlSecret(credentialDraft);
-    const settled = await create(
+    const result = await create(
       {
         kind: "graphql",
         displayName: displayName.trim(),
@@ -86,34 +103,30 @@
       },
       controller.signal,
     ).then(
-      (result) => ({ ok: true, result }) as const,
-      () => ({ ok: false }) as const,
+      (response) => response,
+      () => ({ ok: false, error: unexpectedRequestError() }) as const,
     );
     if (owner !== lifetime || activeController !== controller || controller.signal.aborted) return;
+
     activeController = null;
     busy = false;
 
-    if (!settled.ok) {
-      error = unexpectedRequestError();
-      await focusError();
-      return;
-    }
-    if (!settled.result.ok) {
-      if (!auth?.recoverFromApiError(settled.result.error)) {
-        error = settled.result.error;
+    if (!result.ok) {
+      if (!auth?.recoverFromApiError(result.error)) {
+        error = result.error;
         await focusError();
       }
       return;
     }
 
-    const source = settled.result.value;
+    const source = result.value;
     endpoint = "";
     displayName = "";
     preferredSlug = "";
     description = "";
     allowPrivateNetwork = false;
     credentialDraft = emptyGraphqlAuthDraft();
-    oncreated(source);
+    oncreated?.(source);
   }
 
   async function focusError() {
@@ -123,7 +136,7 @@
 </script>
 
 <form class="graphql-form" onsubmit={connect} aria-labelledby="graphql-form-title">
-  <fieldset disabled={busy}>
+  <fieldset disabled={busy || disabled}>
     <legend id="graphql-form-title">GraphQL API</legend>
     <p>Connect an introspection-enabled GraphQL endpoint and import its queries and mutations.</p>
     <label>
@@ -238,7 +251,11 @@
   <button
     class="primary"
     type="submit"
-    disabled={busy || localOptInMissing || normalizedEndpoint === null || credential === undefined}
+    disabled={busy ||
+      disabled ||
+      localOptInMissing ||
+      normalizedEndpoint === null ||
+      credential === undefined}
   >
     {busy ? "Connecting..." : "Connect source"}
   </button>

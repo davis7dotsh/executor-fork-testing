@@ -4,6 +4,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use reqwest::{
     Method, StatusCode,
     header::{
@@ -30,6 +33,7 @@ const ORACLE_METADATA_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x00c1, 0, 0, 0, 0,
 #[derive(Clone, Debug)]
 pub struct OutboundPolicy {
     pub allow_private_networks: bool,
+    pub require_https_or_loopback: bool,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_header_bytes: usize,
@@ -42,6 +46,7 @@ impl Default for OutboundPolicy {
     fn default() -> Self {
         Self {
             allow_private_networks: false,
+            require_https_or_loopback: false,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
@@ -71,6 +76,8 @@ pub enum OutboundError {
     FragmentNotAllowed,
     #[error("the outbound URL must contain a host")]
     MissingHost,
+    #[error("plaintext outbound transport is allowed only for loopback addresses")]
+    InsecureTransport,
     #[error("the outbound URL has no usable port")]
     MissingPort,
     #[error("the outbound host resolves to a private address")]
@@ -121,6 +128,7 @@ impl OutboundError {
             Self::CredentialsNotAllowed => "outbound_credentials_not_allowed",
             Self::FragmentNotAllowed => "outbound_fragment_not_allowed",
             Self::MissingHost | Self::MissingPort => "invalid_outbound_host",
+            Self::InsecureTransport => "insecure_outbound_transport",
             Self::PrivateAddress => "private_network_denied",
             Self::ForbiddenAddress => "forbidden_network_target",
             Self::DnsResolution => "dns_resolution_failed",
@@ -227,6 +235,8 @@ impl OutboundStreamResponse {
 #[derive(Clone, Debug)]
 pub struct HardenedHttpClient {
     policy: OutboundPolicy,
+    #[cfg(test)]
+    test_dns_resolutions: HashMap<String, Vec<IpAddr>>,
 }
 
 pub fn parse_url(input: &str, policy: &OutboundPolicy) -> Result<Url, OutboundError> {
@@ -237,7 +247,22 @@ pub fn parse_url(input: &str, policy: &OutboundPolicy) -> Result<Url, OutboundEr
 
 impl HardenedHttpClient {
     pub fn new(policy: OutboundPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            #[cfg(test)]
+            test_dns_resolutions: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_dns_resolution(
+        mut self,
+        hostname: impl Into<String>,
+        addresses: Vec<IpAddr>,
+    ) -> Self {
+        self.test_dns_resolutions
+            .insert(hostname.into().to_ascii_lowercase(), addresses);
+        self
     }
 
     pub async fn execute(
@@ -299,9 +324,22 @@ impl HardenedHttpClient {
         url: Url,
         headers: HeaderMap,
     ) -> Result<OutboundResponse, OutboundError> {
+        self.fetch_spec_with_url_policy(url, headers, |_| Ok(()))
+            .await
+    }
+
+    pub async fn fetch_spec_with_url_policy<F>(
+        &self,
+        url: Url,
+        headers: HeaderMap,
+        validate_url_policy: F,
+    ) -> Result<OutboundResponse, OutboundError>
+    where
+        F: Fn(&Url) -> Result<(), OutboundError>,
+    {
         tokio::time::timeout(
             self.policy.request_timeout,
-            self.fetch_spec_with_redirects(url, headers),
+            self.fetch_spec_with_redirects(url, headers, &validate_url_policy),
         )
         .await
         .map_err(|_| OutboundError::Timeout)?
@@ -311,6 +349,7 @@ impl HardenedHttpClient {
         &self,
         url: Url,
         headers: HeaderMap,
+        validate_url_policy: &impl Fn(&Url) -> Result<(), OutboundError>,
     ) -> Result<OutboundResponse, OutboundError> {
         validate_headers(&headers, self.policy.max_header_bytes)?;
         let mut current = url;
@@ -318,6 +357,7 @@ impl HardenedHttpClient {
         let mut visited = HashSet::new();
 
         for redirect_count in 0..=self.policy.max_redirects {
+            validate_url_policy(&current)?;
             validate_url(&current, &self.policy)?;
             if !visited.insert(current.as_str().to_owned()) {
                 return Err(OutboundError::RedirectLoop);
@@ -343,6 +383,8 @@ impl HardenedHttpClient {
                 return Err(OutboundError::TooManyRedirects);
             }
 
+            let unchecked_next = joined_redirect_target(&current, response.headers.get(LOCATION))?;
+            validate_url_policy(&unchecked_next)?;
             let next = redirect_target(&current, response.headers.get(LOCATION), &self.policy)?;
             if !same_origin(&current, &next) {
                 strip_cross_origin_headers(&mut headers);
@@ -377,7 +419,13 @@ impl HardenedHttpClient {
         allow_declared_oversize: bool,
     ) -> Result<OutboundStreamResponse, OutboundError> {
         validate_request(&request, &self.policy)?;
-        let resolved = resolve_target(&request.url, &self.policy).await?;
+        let resolved = resolve_target(
+            &request.url,
+            &self.policy,
+            #[cfg(test)]
+            &self.test_dns_resolutions,
+        )
+        .await?;
         if !request.headers.contains_key(ACCEPT_ENCODING) {
             request.headers.insert(
                 ACCEPT_ENCODING,
@@ -437,6 +485,7 @@ struct ResolvedTarget {
 async fn resolve_target(
     url: &Url,
     policy: &OutboundPolicy,
+    #[cfg(test)] test_dns_resolutions: &HashMap<String, Vec<IpAddr>>,
 ) -> Result<ResolvedTarget, OutboundError> {
     validate_url(url, policy)?;
     let port = url
@@ -445,21 +494,38 @@ async fn resolve_target(
     match url.host().ok_or(OutboundError::MissingHost)? {
         Host::Ipv4(address) => {
             validate_address(IpAddr::V4(address), policy)?;
-            Ok(ResolvedTarget {
+            let resolved = ResolvedTarget {
                 hostname: None,
                 addresses: vec![SocketAddr::new(IpAddr::V4(address), port)],
-            })
+            };
+            validate_resolved_transport(url, &resolved.addresses, policy)?;
+            Ok(resolved)
         }
         Host::Ipv6(address) => {
             let address = canonical_ip(IpAddr::V6(address));
             validate_address(address, policy)?;
-            Ok(ResolvedTarget {
+            let resolved = ResolvedTarget {
                 hostname: None,
                 addresses: vec![SocketAddr::new(address, port)],
-            })
+            };
+            validate_resolved_transport(url, &resolved.addresses, policy)?;
+            Ok(resolved)
         }
         Host::Domain(hostname) => {
-            let mut addresses = tokio::time::timeout(
+            #[cfg(test)]
+            if let Some(addresses) = test_dns_resolutions.get(hostname) {
+                return resolved_domain_target(
+                    url,
+                    hostname,
+                    port,
+                    addresses
+                        .iter()
+                        .map(|address| SocketAddr::new(*address, port))
+                        .collect(),
+                    policy,
+                );
+            }
+            let addresses = tokio::time::timeout(
                 policy.connect_timeout,
                 tokio::net::lookup_host((hostname, port)),
             )
@@ -469,22 +535,57 @@ async fn resolve_target(
             .map(|address| SocketAddr::new(canonical_ip(address.ip()), address.port()))
             .take(MAX_DNS_ADDRESSES + 1)
             .collect::<Vec<_>>();
-            if addresses.len() > MAX_DNS_ADDRESSES {
-                return Err(OutboundError::DnsResolution);
-            }
-            addresses.sort_unstable();
-            addresses.dedup();
-            if addresses.is_empty() {
-                return Err(OutboundError::DnsResolution);
-            }
-            for address in &addresses {
-                validate_address(address.ip(), policy)?;
-            }
-            Ok(ResolvedTarget {
-                hostname: Some(hostname.to_owned()),
-                addresses,
-            })
+            resolved_domain_target(url, hostname, port, addresses, policy)
         }
+    }
+}
+
+fn resolved_domain_target(
+    url: &Url,
+    hostname: &str,
+    port: u16,
+    addresses: Vec<SocketAddr>,
+    policy: &OutboundPolicy,
+) -> Result<ResolvedTarget, OutboundError> {
+    let mut addresses = addresses
+        .into_iter()
+        .map(|address| SocketAddr::new(canonical_ip(address.ip()), port))
+        .take(MAX_DNS_ADDRESSES + 1)
+        .collect::<Vec<_>>();
+    if addresses.len() > MAX_DNS_ADDRESSES {
+        return Err(OutboundError::DnsResolution);
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(OutboundError::DnsResolution);
+    }
+    for address in &addresses {
+        validate_address(address.ip(), policy)?;
+    }
+    validate_resolved_transport(url, &addresses, policy)?;
+    Ok(ResolvedTarget {
+        hostname: Some(hostname.to_owned()),
+        addresses,
+    })
+}
+
+fn validate_resolved_transport(
+    url: &Url,
+    addresses: &[SocketAddr],
+    policy: &OutboundPolicy,
+) -> Result<(), OutboundError> {
+    if !policy.require_https_or_loopback || url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() == "http"
+        && addresses
+            .iter()
+            .all(|address| canonical_ip(address.ip()).is_loopback())
+    {
+        Ok(())
+    } else {
+        Err(OutboundError::InsecureTransport)
     }
 }
 
@@ -622,17 +723,24 @@ pub fn redirect_target(
     location: Option<&reqwest::header::HeaderValue>,
     policy: &OutboundPolicy,
 ) -> Result<Url, OutboundError> {
-    let location = location
-        .and_then(|value| value.to_str().ok())
-        .ok_or(OutboundError::InvalidRedirect)?;
-    let next = current
-        .join(location)
-        .map_err(|_| OutboundError::InvalidRedirect)?;
+    let next = joined_redirect_target(current, location)?;
     validate_url(&next, policy)?;
     if current.scheme() == "https" && next.scheme() != "https" {
         return Err(OutboundError::RedirectDowngrade);
     }
     Ok(next)
+}
+
+fn joined_redirect_target(
+    current: &Url,
+    location: Option<&reqwest::header::HeaderValue>,
+) -> Result<Url, OutboundError> {
+    let location = location
+        .and_then(|value| value.to_str().ok())
+        .ok_or(OutboundError::InvalidRedirect)?;
+    current
+        .join(location)
+        .map_err(|_| OutboundError::InvalidRedirect)
 }
 
 fn validate_request(
@@ -745,5 +853,67 @@ fn map_reqwest_error(error: reqwest::Error) -> OutboundError {
         OutboundError::Connection
     } else {
         OutboundError::Request
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dns_override_still_runs_resolved_transport_policy() {
+        let client = HardenedHttpClient::new(OutboundPolicy {
+            allow_private_networks: true,
+            require_https_or_loopback: true,
+            ..OutboundPolicy::default()
+        })
+        .with_test_dns_resolution(
+            "poison.localhost",
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+        );
+        let request = OutboundRequest::new(
+            Method::GET,
+            Url::parse("http://poison.localhost:8080/spec").expect("test URL parses"),
+        );
+
+        assert!(matches!(
+            client.execute(request).await,
+            Err(OutboundError::InsecureTransport)
+        ));
+    }
+
+    #[test]
+    fn resolved_plaintext_transport_requires_every_pinned_address_to_be_loopback() {
+        let policy = OutboundPolicy {
+            allow_private_networks: true,
+            require_https_or_loopback: true,
+            ..OutboundPolicy::default()
+        };
+        let http = Url::parse("http://localhost:8080/spec").expect("HTTP URL parses");
+        let loopback = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
+        ];
+        assert!(validate_resolved_transport(&http, &loopback, &policy).is_ok());
+
+        for poisoned in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080),
+        ] {
+            assert!(matches!(
+                validate_resolved_transport(&http, &[poisoned], &policy),
+                Err(OutboundError::InsecureTransport)
+            ));
+        }
+
+        let https = Url::parse("https://api.example.test/spec").expect("HTTPS URL parses");
+        assert!(
+            validate_resolved_transport(
+                &https,
+                &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443,)],
+                &policy,
+            )
+            .is_ok()
+        );
     }
 }

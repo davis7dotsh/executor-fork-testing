@@ -142,6 +142,16 @@ fn cookies(response: &axum::response::Response) -> String {
         .join("; ")
 }
 
+fn assert_json_content_type(response: &axum::response::Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+}
+
 async fn setup(app: &ExecutorApp) -> Admin {
     let setup_token = app
         .setup_token()
@@ -387,7 +397,12 @@ async fn preview_import_and_invoke_enforce_planes_modes_and_body_limits() {
         Method::POST,
         "/api/v1/tokens",
         json!({ "name": "test" }),
-        &admin_headers(&admin),
+        &[
+            (header::COOKIE.as_str(), admin.cookie.as_str()),
+            (header::ORIGIN.as_str(), ORIGIN),
+            ("x-executor-csrf", admin.csrf.as_str()),
+            ("idempotency-key", "openapi-preview-token"),
+        ],
     )
     .await;
     assert_eq!(token_response.status(), StatusCode::CREATED);
@@ -731,12 +746,58 @@ async fn openapi_credentials_reject_unknown_schema_versions() {
         "unsupported_credential_schema"
     );
 
+    let replace = send(
+        app.router(),
+        Method::PUT,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!({
+            "expectedRevision": 1,
+            "credential": { "schemes": {
+                "ApiKey": { "type": "api_key", "value": "must-not-store" }
+            }}
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(replace.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body(replace).await["error"]["code"],
+        "unsupported_credential_schema"
+    );
+
+    let clear = send(
+        app.router(),
+        Method::DELETE,
+        &format!("/api/v1/sources/{source_id}/credentials?expectedRevision=1"),
+        json!(null),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(clear.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body(clear).await["error"]["code"],
+        "unsupported_credential_schema"
+    );
+    let unchanged = app
+        .catalog()
+        .credential(&source_id)
+        .await
+        .expect("credential should remain readable")
+        .expect("credential should remain stored");
+    assert_eq!(unchanged.revision, 1);
+    assert_eq!(unchanged.credential.schema_version, 2);
+
     let token_response = send(
         app.router(),
         Method::POST,
         "/api/v1/tokens",
         json!({ "name": "credential-schema" }),
-        &admin_headers(&admin),
+        &[
+            (header::COOKIE.as_str(), admin.cookie.as_str()),
+            (header::ORIGIN.as_str(), ORIGIN),
+            ("x-executor-csrf", admin.csrf.as_str()),
+            ("idempotency-key", "openapi-credential-schema-token"),
+        ],
     )
     .await;
     let token = body(token_response).await["token"]
@@ -919,6 +980,8 @@ async fn source_requests_reject_typos_before_mutating_catalog_or_credentials() {
     )
     .await;
     assert_eq!(delete_typo.status(), StatusCode::BAD_REQUEST);
+    assert_json_content_type(&delete_typo);
+    assert_eq!(body(delete_typo).await["error"]["code"], "invalid_query");
 
     let metadata = send(
         app.router(),
@@ -932,4 +995,162 @@ async fn source_requests_reject_typos_before_mutating_catalog_or_credentials() {
     let metadata = body(metadata).await;
     assert_eq!(metadata["revision"], 0);
     assert_eq!(metadata["configuredSchemes"], json!([]));
+}
+
+#[tokio::test]
+async fn credential_delete_queries_use_sanitized_json_errors_and_strict_revisions() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let app = ExecutorApp::open(AppConfig::new(directory.path().to_path_buf()))
+        .await
+        .expect("Executor should open");
+    let admin = setup(&app).await;
+    let specification = json!({
+        "openapi": "3.1.0",
+        "info": { "title": "Credential delete", "version": "1" },
+        "servers": [{ "url": "https://example.com" }],
+        "components": {
+            "securitySchemes": {
+                "ApiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+            }
+        },
+        "paths": {}
+    });
+    let created = send(
+        app.router(),
+        Method::POST,
+        "/api/v1/sources",
+        json!({
+            "kind": "openapi",
+            "displayName": "Credential delete",
+            "preferredSlug": "credential-delete",
+            "spec": { "type": "inline", "content": specification.to_string() }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let source_id = body(created).await["id"]
+        .as_str()
+        .expect("created source should have an ID")
+        .to_owned();
+
+    let configured = send(
+        app.router(),
+        Method::PUT,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!({
+            "expectedRevision": 0,
+            "credential": {
+                "schemes": {
+                    "ApiKey": { "type": "api_key", "value": "delete-query-secret" }
+                }
+            }
+        }),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(configured.status(), StatusCode::OK);
+    assert_eq!(body(configured).await["revision"], 1);
+
+    let invalid_queries = [
+        (
+            "malformed percent encoding",
+            "expectedRevision=%E0%A4%A",
+            "%E0%A4%A",
+        ),
+        (
+            "duplicate source parameter",
+            "sourceId=duplicate-source-secret&sourceId=other&expectedRevision=1",
+            "duplicate-source-secret",
+        ),
+        (
+            "duplicate revision parameter",
+            "expectedRevision=1&expectedRevision=1",
+            "expectedRevision",
+        ),
+        (
+            "unknown parameter",
+            "expectedRevision=1&unexpected=unknown-query-secret",
+            "unknown-query-secret",
+        ),
+        (
+            "missing revision value",
+            "expectedRevision=",
+            "expectedRevision",
+        ),
+        ("missing revision parameter", "", "expectedRevision"),
+    ];
+    for (case, query, forbidden_fragment) in invalid_queries {
+        let separator = if query.is_empty() { "" } else { "?" };
+        let response = send(
+            app.router(),
+            Method::DELETE,
+            &format!("/api/v1/sources/{source_id}/credentials{separator}{query}"),
+            json!(null),
+            &admin_headers(&admin),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        assert_json_content_type(&response);
+        let response = body(response).await;
+        assert_eq!(response["error"]["code"], "invalid_query", "{case}");
+        assert_eq!(
+            response["error"]["message"], "The query parameters are invalid.",
+            "{case}"
+        );
+        assert!(
+            response["error"]["requestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "{case}"
+        );
+        assert!(
+            !response.to_string().contains(forbidden_fragment),
+            "{case} must not echo query input"
+        );
+    }
+
+    let unchanged = send(
+        app.router(),
+        Method::GET,
+        &format!("/api/v1/sources/{source_id}/credentials"),
+        json!(null),
+        &[(header::COOKIE.as_str(), admin.cookie.as_str())],
+    )
+    .await;
+    assert_eq!(unchanged.status(), StatusCode::OK);
+    let unchanged = body(unchanged).await;
+    assert_eq!(unchanged["revision"], 1);
+    assert_eq!(
+        unchanged["configuredSchemes"],
+        json!([{ "name": "ApiKey", "credentialType": "api_key" }])
+    );
+
+    let conflict = send(
+        app.router(),
+        Method::DELETE,
+        &format!("/api/v1/sources/{source_id}/credentials?expectedRevision=0"),
+        json!(null),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_json_content_type(&conflict);
+    assert_eq!(body(conflict).await["error"]["code"], "revision_conflict");
+
+    let cleared = send(
+        app.router(),
+        Method::DELETE,
+        &format!("/api/v1/sources/{source_id}/credentials?expectedRevision=1"),
+        json!(null),
+        &admin_headers(&admin),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_json_content_type(&cleared);
+    let cleared = body(cleared).await;
+    assert_eq!(cleared["revision"], 2);
+    assert_eq!(cleared["configuredSchemes"], json!([]));
+    assert!(!cleared.to_string().contains("delete-query-secret"));
+    app.shutdown().await;
 }

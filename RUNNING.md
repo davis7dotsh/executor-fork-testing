@@ -1,8 +1,8 @@
 # Running the Rust and Svelte rewrite
 
 This file describes the active local and self-hosted product. The archived
-cloud and Electron entry points are under `legacy/` and are not part of the
-default workflow.
+TypeScript application entry points are under `legacy/` and are not part of
+the default workflow.
 
 ## Fresh checkout
 
@@ -15,6 +15,13 @@ bun run bootstrap
 Bootstrap runs the workspace install and prepare hooks, then installs
 Playwright Chromium. It is safe to rerun. The workspace currently declares Bun
 1.3.11 and the native release workflow uses Rust 1.96.0.
+
+`Cargo.toml` is the only native product version source. Confirm the active
+checkout before packaging with:
+
+```sh
+cargo run -- --version
+```
 
 ## Production-like local run
 
@@ -161,8 +168,26 @@ secrets, passwords, and one-time API tokens never become artifacts.
 
 ## Service and container runs
 
-Do not invent service paths or flags from this file. Use the maintained
-operator guides:
+The release binary embeds its hardened systemd and launchd installation assets.
+On Linux, system service changes require root:
+
+```sh
+sudo "$(command -v executor)" service install
+executor service status
+sudo executor service restart
+sudo executor service stop
+sudo executor service start
+sudo executor service remove
+```
+
+On macOS, run the same commands without `sudo`. The LaunchAgent belongs to the
+logged-in user. `service install --no-start` writes the managed files while
+leaving the service stopped. `service status` prints exactly `active` or
+`inactive`; inactive exits with status 3.
+
+These commands mutate real operating-system service state. Do not use them for
+ordinary development checkouts or tests. Use the maintained operator guides
+for paths, permissions, backup requirements, and removal behavior:
 
 - [`docs/docker.md`](docs/docker.md)
 - [`docs/systemd.md`](docs/systemd.md)
@@ -171,11 +196,12 @@ operator guides:
 
 ## Legacy opt-ins
 
-Default dev, test, lint, typecheck, and format paths exclude the archived cloud
-and desktop products. Work on them only through the explicit scripts:
+Default dev, test, lint, typecheck, and format paths exclude all six archived
+application packages. Work on them only through the explicit scripts:
 
 ```sh
 bun run legacy:dev
+bun run legacy:dev:cli -- --help
 bun run legacy:test
 bun run legacy:typecheck
 bun run legacy:typecheck:slow
@@ -184,3 +210,10 @@ bun run legacy:test:e2e:desktop
 ```
 
 See [`legacy/README.md`](legacy/README.md) for the boundary.
+
+Publishing is also opt-in. `release.yml` is the sole native product release
+entrypoint and requires explicit dry-run or publish mode, a semver tag, and an
+exact full commit SHA. The separate TypeScript workflow publishes only
+explicitly confirmed `@executor-js/*` library versions under immutable
+compatibility tags. Legacy CLI and desktop publishing are retired. See
+[`RELEASING.md`](RELEASING.md) for the checked release sequence.

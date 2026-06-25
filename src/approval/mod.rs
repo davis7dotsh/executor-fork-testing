@@ -1174,13 +1174,13 @@ impl ApprovalStore {
 
     async fn cancel_execution(&self, execution_id: &str) -> Result<u64, ApprovalError> {
         validate_identifier("execution ID", execution_id, 128)?;
-        self.cancel_where("execution_id", execution_id).await
+        self.cancel_where("execution_id", execution_id, true).await
     }
 
     #[cfg(test)]
     async fn cancel_token(&self, actor_api_token_id: &str) -> Result<u64, ApprovalError> {
         validate_identifier("owner token ID", actor_api_token_id, 128)?;
-        self.cancel_where("actor_api_token_id", actor_api_token_id)
+        self.cancel_where("actor_api_token_id", actor_api_token_id, false)
             .await
     }
 
@@ -1335,11 +1335,27 @@ impl ApprovalStore {
         Ok(record)
     }
 
-    async fn cancel_where(&self, column: &'static str, value: &str) -> Result<u64, ApprovalError> {
+    async fn cancel_where(
+        &self,
+        column: &'static str,
+        value: &str,
+        release_delivery_pins: bool,
+    ) -> Result<u64, ApprovalError> {
         let observed_now = self.advance_clock().await?;
         let mut transaction = self.pool.begin().await?;
         let now = effective_now_in(&mut transaction, observed_now).await?;
         expire_pending_in(&mut transaction, now).await?;
+        if release_delivery_pins {
+            sqlx::query(&format!(
+                "DELETE FROM approval_delivery_pins WHERE approval_id IN ( \
+                     SELECT id FROM approvals WHERE {column} = ? \
+                     AND status IN ('pending', 'approved') \
+                 )"
+            ))
+            .bind(value)
+            .execute(&mut *transaction)
+            .await?;
+        }
         let result = sqlx::query(&format!(
             "UPDATE approvals SET status = 'canceled', revision = revision + 1, \
              updated_at = ?, completed_at = ? WHERE {column} = ? \

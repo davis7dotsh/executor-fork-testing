@@ -646,6 +646,12 @@ impl StdioClient {
                 None,
             )
             .await?;
+        if result
+            .get("structuredContent")
+            .is_some_and(|structured_content| !structured_content.is_object())
+        {
+            return Err(StdioTransportError::Decode);
+        }
         let result: CallToolResult =
             serde_json::from_value(result).map_err(|_| StdioTransportError::Decode)?;
         if result.content.iter().any(|content| !content.is_object()) {
@@ -1296,11 +1302,15 @@ async fn handle_server_message(
     }
     if object.contains_key("method") {
         if let Some(id) = object.get("id") {
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": "Method not found" }
-            });
+            let response = if object.get("method").and_then(Value::as_str) == Some("ping") {
+                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "Method not found" }
+                })
+            };
             let payload = encode_message(&response, limits.max_message_bytes)?;
             process.write(payload, None, None)?;
         } else if object.get("method").and_then(Value::as_str)
@@ -2025,6 +2035,82 @@ done
             .await
             .expect("tool call succeeds");
         assert!(!result.is_error);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn answers_server_ping_requests_with_an_empty_result() {
+        let directory = TempDir::new().expect("temporary directory creates");
+        let executable = script(
+            &directory,
+            "ping-server",
+            r#"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":"server-ping","method":"ping"}'
+read first
+read second
+wire="$first$second"
+case "$wire" in
+  *'"id":"server-ping"'*'"result":{}'*'"method":"tools/list"'* | *'"method":"tools/list"'*'"id":"server-ping"'*'"result":{}'*) ;;
+  *) exit 9 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+while IFS= read -r line; do :; done
+"#,
+        );
+        let client = StdioClient::connect(template(executable), StdioTransportLimits::default())
+            .await
+            .expect("client connects");
+        initialize_client(&client).await;
+
+        let tools = client
+            .list_tools(None)
+            .await
+            .expect("list succeeds after the server ping");
+        assert!(tools.tools.is_empty());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn call_tool_requires_object_structured_content() {
+        let directory = TempDir::new().expect("temporary directory creates");
+        let executable = script(
+            &directory,
+            "structured-content-server",
+            r#"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}'
+read line
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"content":[],"structuredContent":{"status":"ok"},"isError":false}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":11,"result":{"content":[],"structuredContent":"not-an-object"}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":12,"result":{"content":[],"structuredContent":[]}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":13,"result":{"content":[],"structuredContent":null}}'
+while IFS= read -r line; do :; done
+"#,
+        );
+        let client = StdioClient::connect(template(executable), StdioTransportLimits::default())
+            .await
+            .expect("client connects");
+        initialize_client(&client).await;
+
+        let valid = client
+            .call_tool("valid", json!({}), 10)
+            .await
+            .expect("object structured content is valid");
+        assert_eq!(valid.structured_content, Some(json!({ "status": "ok" })));
+        assert!(!valid.is_error);
+        for request_id in 11..=13 {
+            assert!(matches!(
+                client.call_tool("invalid", json!({}), request_id).await,
+                Err(StdioTransportError::Decode)
+            ));
+        }
         client.shutdown().await;
     }
 

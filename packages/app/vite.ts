@@ -14,7 +14,7 @@ interface AppPluginOptions {
    * Absolute path to the `executor.config.ts` whose plugin list should
    * feed `virtual:executor/plugins-client`. The Vite root for this app
    * is `packages/app/` which has no executor.config, so consumers must
-   * point this at their own (typically `apps/local/executor.config.ts`).
+   * point this at their own (typically `legacy/local/executor.config.ts`).
    *
    * If omitted, no plugin UIs get bundled — the renderer still works
    * for built-in pages but Sources / Connections / etc. plugin pages
@@ -28,7 +28,7 @@ interface AppPluginOptions {
 /**
  * Vite plugin bundle for the executor React app.
  *
- * Layered into apps/local's vite config (web build) and legacy/desktop's
+ * Layered into legacy/local's vite config (web build) and legacy/desktop's
  * electron.vite renderer config. Consumers must pass `executorConfigPath`
  * so plugin client bundles get included — see option docs above.
  *

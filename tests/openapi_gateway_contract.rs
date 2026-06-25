@@ -26,6 +26,7 @@ use tokio::{
 use tower::ServiceExt;
 
 const ORIGIN: &str = "http://127.0.0.1:4788";
+static TOKEN_IDEMPOTENCY_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
 struct Admin {
     cookie: String,
@@ -192,12 +193,18 @@ fn admin_headers(admin: &Admin) -> [(&str, &str); 3] {
 }
 
 async fn create_gateway_token(app: &ExecutorApp, admin: &Admin) -> String {
+    let idempotency_key = format!(
+        "openapi-contract-token-{}",
+        TOKEN_IDEMPOTENCY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut headers = admin_headers(admin).to_vec();
+    headers.push(("idempotency-key", idempotency_key.as_str()));
     let response = send(
         app.router(),
         Method::POST,
         "/api/v1/tokens",
         json!({ "name": "OpenAPI contract" }),
-        &admin_headers(admin),
+        &headers,
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);

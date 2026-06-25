@@ -3,11 +3,17 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
     oneshot,
 };
 use tokio::task::JoinHandle;
+
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use crate::{
     catalog::{CatalogError, CatalogStore, NewRequestLog},
@@ -24,6 +30,33 @@ pub(crate) struct RequestLogSink {
     telemetry: Arc<RequestLogTelemetry>,
     consumer: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     shutdown: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    #[cfg(test)]
+    write_pause: Arc<std::sync::Mutex<Option<Arc<RequestLogWritePause>>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RequestLogWritePause {
+    reached: Notify,
+    release: Notify,
+    finished: Notify,
+    succeeded: AtomicBool,
+}
+
+#[cfg(test)]
+impl RequestLogWritePause {
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    pub(crate) async fn finished(&self) -> bool {
+        self.finished.notified().await;
+        self.succeeded.load(Ordering::Acquire)
+    }
 }
 
 struct QueuedRequestLog {
@@ -61,11 +94,15 @@ impl RequestLogSink {
         let (sender, receiver) = mpsc::channel(capacity);
         let (shutdown, shutdown_requested) = oneshot::channel();
         let telemetry = Arc::new(RequestLogTelemetry::default());
+        #[cfg(test)]
+        let write_pause = Arc::new(std::sync::Mutex::new(None));
         let consumer = tokio::spawn(consume(
             receiver,
             catalog,
             telemetry.clone(),
             shutdown_requested,
+            #[cfg(test)]
+            write_pause.clone(),
         ));
         Self {
             sender,
@@ -73,7 +110,19 @@ impl RequestLogSink {
             telemetry,
             consumer: Arc::new(std::sync::Mutex::new(Some(consumer))),
             shutdown: Arc::new(std::sync::Mutex::new(Some(shutdown))),
+            #[cfg(test)]
+            write_pause,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_write(&self) -> Arc<RequestLogWritePause> {
+        let pause = Arc::new(RequestLogWritePause::default());
+        *self
+            .write_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pause.clone());
+        pause
     }
 
     pub(crate) fn try_record(&self, log: NewRequestLog) -> bool {
@@ -108,17 +157,6 @@ impl RequestLogSink {
             return false;
         }
         completed.await.unwrap_or(false)
-    }
-
-    pub(crate) fn abort(&self) {
-        if let Some(consumer) = self
-            .consumer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            consumer.abort();
-        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -208,6 +246,7 @@ async fn consume(
     catalog: CatalogStore,
     telemetry: Arc<RequestLogTelemetry>,
     mut shutdown: oneshot::Receiver<()>,
+    #[cfg(test)] write_pause: Arc<std::sync::Mutex<Option<Arc<RequestLogWritePause>>>>,
 ) {
     let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
     let mut draining = false;
@@ -241,6 +280,16 @@ async fn consume(
                 _database_guard,
                 completion,
             } = queued;
+            #[cfg(test)]
+            let pause = write_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(pause) = pause.as_ref() {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
             let request_id = log.request_id.clone();
             let succeeded = match catalog.record_request(log).await {
                 Ok(()) => {
@@ -256,6 +305,11 @@ async fn consume(
                     }
                 }
             };
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.succeeded.store(succeeded, Ordering::Release);
+                pause.finished.notify_one();
+            }
             if let Some(completion) = completion {
                 let _ = completion.send(succeeded);
             }
@@ -332,6 +386,7 @@ mod tests {
             telemetry,
             consumer: Arc::new(std::sync::Mutex::new(None)),
             shutdown: Arc::new(std::sync::Mutex::new(None)),
+            write_pause: Arc::new(std::sync::Mutex::new(None)),
         };
 
         assert!(sink.try_record(request_log("queued")));

@@ -1,4 +1,4 @@
-// The Cloudflare self-host app (apps/host-cloudflare) as a target: the REAL
+// The Cloudflare self-host app (legacy/host-cloudflare) as a target: the REAL
 // worker on workerd via Miniflare (wrangler `unstable_dev`) with a local D1 +
 // R2, booted in setup/cloudflare.globalsetup.ts. Dev-auth is on, so every
 // request is the fixed dev admin — no per-identity login and no MCP OAuth (the

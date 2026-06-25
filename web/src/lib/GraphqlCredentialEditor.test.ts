@@ -150,6 +150,43 @@ describe("GraphQL credential editor", () => {
     expect(save).not.toHaveBeenCalled();
   });
 
+  it("reports only credential writes as mutations and clears the fence on unmount", async () => {
+    const response = deferred<ApiResult<OpenApiCredentialMetadata>>();
+    const request = { signal: null as AbortSignal | null };
+    const load = vi.fn(async () => ({ ok: true, value: metadata(4) }) as const);
+    const save = vi.fn(
+      (
+        _sourceId: string,
+        _revision: number,
+        _credential: GraphqlCredential,
+        signal: AbortSignal,
+      ) => {
+        request.signal = signal;
+        return response.promise;
+      },
+    );
+    const onmutationchange = vi.fn();
+    const mounted = render(GraphqlCredentialEditor, {
+      source: sourceFixture(),
+      load,
+      save,
+      onmutationchange,
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Manage credentials" }));
+    const token = await screen.findByLabelText("Bearer token");
+    expect(onmutationchange).not.toHaveBeenCalled();
+    await fireEvent.input(token, { target: { value: "pending-secret" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
+    await waitFor(() => expect(onmutationchange).toHaveBeenLastCalledWith(true));
+
+    mounted.unmount();
+    expect(request.signal?.aborted).toBe(true);
+    expect(onmutationchange).toHaveBeenLastCalledWith(false);
+    response.resolve({ ok: true, value: metadata(5) });
+    await response.promise;
+  });
+
   it("aborts an old metadata load and rejects it after the source changes", async () => {
     const first = deferred<ApiResult<OpenApiCredentialMetadata>>();
     const second = deferred<ApiResult<OpenApiCredentialMetadata>>();

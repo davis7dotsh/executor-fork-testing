@@ -13,30 +13,51 @@
     type TokenMetadata,
   } from "$lib/api";
   import { copyText } from "$lib/clipboard";
-  import { canCreateToken, shouldBlockTokenExit, tokenListView } from "$lib/token-page-state";
+  import {
+    canCreateToken,
+    isTokenRecoveryAuthNavigation,
+    shouldBlockTokenExit,
+    tokenExitBlockReason,
+    tokenListView,
+  } from "$lib/token-page-state";
+  import {
+    browserTokenCreateEnvironment,
+    createTokenCreateCoordinator,
+    emptyTokenCreateState,
+    type TokenCreateEnvironment,
+  } from "$lib/token-create-lifecycle";
   import { focusRevealedToken } from "$lib/token-reveal-focus";
+
+  let {
+    tokenCreateEnvironment = browserTokenCreateEnvironment(),
+  }: { tokenCreateEnvironment?: TokenCreateEnvironment } = $props();
 
   const auth = useAuthState();
   const activeControllers = new Set<AbortController>();
   let name = $state("");
   let tokens = $state<TokenMetadata[]>([]);
-  let revealed = $state<CreatedToken | null>(null);
+  let revealed = $state.raw<CreatedToken | null>(null);
   let tokenField = $state<HTMLInputElement>();
   let pendingRevoke = $state<TokenMetadata | null>(null);
   let revokeDialog = $state<HTMLDialogElement>();
   let loading = $state(true);
   let hasLoaded = $state(false);
-  let creating = $state(false);
   let revoking = $state(false);
+  let tokenCreateState = $state(emptyTokenCreateState());
   let listError = $state<ApiError | null>(null);
   let mutationError = $state<ApiError | null>(null);
   let revokeError = $state<ApiError | null>(null);
   let copyStatus = $state<"idle" | "copied" | "failed">("idle");
-  let navigationBlocked = $state(false);
+  let exitBlocked = $state(false);
   let listGeneration = 0;
   let lifetime = 0;
+  let creating = $derived(tokenCreateState.phase === "dispatching");
+  let hasPendingCreate = $derived(tokenCreateState.phase !== "idle");
   let hasUnsavedToken = $derived(revealed !== null);
-  let canCreate = $derived(canCreateToken({ name, creating, hasUnsavedToken }));
+  let canCreate = $derived(canCreateToken({ name, creating, hasPendingCreate, hasUnsavedToken }));
+  let exitBlockReason = $derived(
+    tokenExitBlockReason({ creating, hasPendingCreate, hasUnsavedToken }),
+  );
   let listView = $derived(
     tokenListView({
       loading,
@@ -52,19 +73,40 @@
         ? "Automatic copy failed. Select the token and copy it manually."
         : "The token is ready to copy.",
   );
+  const tokenCreateCoordinator = createTokenCreateCoordinator({
+    environment: {
+      getStorage: () => tokenCreateEnvironment.getStorage(),
+      fillRandom: (bytes) => tokenCreateEnvironment.fillRandom(bytes),
+    },
+    create: (tokenName, key, signal) => createToken(tokenName, key, undefined, signal),
+    onstatechange: (next) => {
+      tokenCreateState = next;
+    },
+    onrevealed: revealCreatedToken,
+  });
 
-  beforeNavigate(({ cancel }) => {
-    if (!shouldBlockTokenExit({ creating, hasUnsavedToken })) return;
-    navigationBlocked = true;
+  beforeNavigate(({ cancel, to }) => {
+    if (exitBlockReason === null) return;
+    if (
+      isTokenRecoveryAuthNavigation({
+        authenticated: auth.authenticated,
+        destinationPath: to?.url.pathname ?? null,
+      })
+    ) {
+      return;
+    }
+    exitBlocked = true;
     cancel();
   });
 
   onMount(() => {
     lifetime += 1;
     void refresh();
+    void recoverPendingToken();
     return () => {
       lifetime += 1;
       listGeneration += 1;
+      tokenCreateCoordinator.dispose();
       for (const controller of activeControllers) controller.abort();
       activeControllers.clear();
     };
@@ -107,30 +149,52 @@
     if (!canCreate) return;
 
     const owner = lifetime;
-    const controller = startRequest();
-    creating = true;
     mutationError = null;
     copyStatus = "idle";
-    navigationBlocked = false;
-    const result = await createToken(name.trim(), undefined, controller.signal);
-    activeControllers.delete(controller);
+    exitBlocked = false;
+    const result = await tokenCreateCoordinator.start(name);
     if (owner !== lifetime) return;
 
-    if (result.ok) {
-      const createdToken = result.value;
-      revealed = createdToken;
-      name = "";
-      await focusRevealedToken({
-        token: createdToken,
-        currentToken: () => revealed,
-        field: () => tokenField,
-        isCurrentLifetime: () => owner === lifetime,
-      });
-      if (owner !== lifetime || revealed !== createdToken) return;
-    } else if (!auth.recoverFromApiError(result.error)) {
-      mutationError = result.error;
+    handleCreateFailure(result);
+  }
+
+  async function recoverPendingToken() {
+    const owner = lifetime;
+    const result = await tokenCreateCoordinator.recoverStored();
+    if (owner !== lifetime || result === null) return;
+    handleCreateFailure(result);
+  }
+
+  async function retryPendingToken() {
+    const owner = lifetime;
+    mutationError = null;
+    const result = await tokenCreateCoordinator.retry();
+    if (owner !== lifetime || result === null) return;
+    handleCreateFailure(result);
+  }
+
+  function handleCreateFailure(result: Awaited<ReturnType<typeof tokenCreateCoordinator.start>>) {
+    if (result.ok) return;
+    if (auth.recoverFromApiError(result.error)) {
+      mutationError = null;
+      return;
     }
-    creating = false;
+    mutationError = result.error;
+  }
+
+  function revealCreatedToken(createdToken: CreatedToken) {
+    const owner = lifetime;
+    if (owner === 0) return;
+    revealed = createdToken;
+    name = "";
+    mutationError = null;
+    copyStatus = "idle";
+    void focusRevealedToken({
+      token: createdToken,
+      currentToken: () => revealed,
+      field: () => tokenField,
+      isCurrentLifetime: () => owner === lifetime,
+    });
   }
 
   async function copyRevealed() {
@@ -172,9 +236,14 @@
   }
 
   function dismissReveal() {
+    const acknowledged = tokenCreateCoordinator.acknowledge();
+    if (!acknowledged.ok) {
+      mutationError = acknowledged.error;
+      return;
+    }
     revealed = null;
     copyStatus = "idle";
-    navigationBlocked = false;
+    exitBlocked = false;
     if (!auth.authenticated) {
       void goto("/login", { replaceState: true });
       return;
@@ -183,9 +252,15 @@
   }
 
   function guardBeforeUnload(event: BeforeUnloadEvent) {
-    if (!shouldBlockTokenExit({ creating, hasUnsavedToken })) return;
+    if (!shouldBlockTokenExit({ creating, hasPendingCreate, hasUnsavedToken })) return;
     event.preventDefault();
     event.returnValue = "";
+  }
+
+  function beforeSignOut() {
+    if (exitBlockReason === null) return true;
+    exitBlocked = true;
+    return false;
   }
 
   function startRequest() {
@@ -204,7 +279,18 @@
 <DashboardShell
   title="API tokens"
   description="Issue gateway credentials without giving agents dashboard access."
+  {beforeSignOut}
 >
+  {#if exitBlocked && exitBlockReason !== null}
+    <p class="notice warning" role="status">
+      {exitBlockReason === "creating"
+        ? "Wait for token creation to finish before leaving this page or signing out."
+        : exitBlockReason === "unsaved-token"
+          ? "Save the token and choose “I saved it” before leaving this page or signing out."
+          : "Recover the pending token request before leaving this page or signing out."}
+    </p>
+  {/if}
+
   <div class="token-layout">
     <section class="surface token-form">
       <p class="eyebrow">New credential</p>
@@ -221,13 +307,18 @@
           autocomplete="off"
           required
           maxlength="80"
-          disabled={creating || hasUnsavedToken}
-          aria-describedby={hasUnsavedToken ? "token-create-help" : undefined}
+          disabled={creating || hasPendingCreate || hasUnsavedToken}
+          aria-describedby={hasPendingCreate || hasUnsavedToken ? "token-create-help" : undefined}
         />
         {#if hasUnsavedToken}
           <small id="token-create-help">Save the revealed token before creating another.</small>
+        {:else if hasPendingCreate}
+          <small id="token-create-help">Finish recovering the pending token request first.</small>
         {/if}
         {#if mutationError !== null}<ErrorNotice error={mutationError} />{/if}
+        {#if tokenCreateState.phase === "blocked" && tokenCreateState.canRetry}
+          <button type="button" onclick={retryPendingToken}>Retry pending token request</button>
+        {/if}
         <button class="primary" type="submit" disabled={!canCreate}>
           {creating ? "Creating token..." : "Create token"}
         </button>
@@ -251,7 +342,8 @@
           onfocus={(event) => event.currentTarget.select()}
         />
         <p id="token-secret-help">
-          Executor stores only a keyed digest. This secret cannot be recovered later.
+          Executor stores only keyed digests. This tab can recover the same secret until you choose
+          “I saved it”.
         </p>
         <div class="button-row">
           <button class="primary" type="button" onclick={copyRevealed}>Copy token</button>
@@ -260,11 +352,6 @@
         <p id="copy-status" class="copy-status" role="status" aria-live="polite">
           {copyMessage}
         </p>
-        {#if navigationBlocked}
-          <p class="notice warning" role="status">
-            Save the token and choose “I saved it” before leaving this page.
-          </p>
-        {/if}
       </section>
     {/if}
   </div>

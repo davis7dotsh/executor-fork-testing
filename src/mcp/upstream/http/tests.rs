@@ -207,6 +207,70 @@ async fn call_tool_accepts_sse_and_rejects_server_requests() {
 }
 
 #[tokio::test]
+async fn call_tool_rejects_malformed_success_results() {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+    })
+    .to_string();
+    let valid = json!({
+        "content": [],
+        "structuredContent": { "status": "ok" },
+        "isError": false
+    });
+    let malformed = [
+        json!({ "content": "not-an-array" }),
+        json!({ "content": [{ "text": "missing content type" }] }),
+        json!({ "unexpected": true }),
+        json!({ "content": [], "structuredContent": "not-an-object" }),
+        json!({ "content": [], "structuredContent": [] }),
+        json!({ "content": [], "structuredContent": null }),
+    ];
+    let mut responses = vec![
+        response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            &initialize,
+        ),
+        response("202 Accepted", &[], ""),
+        response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": valid.clone() }).to_string(),
+        ),
+    ];
+    responses.extend(malformed.iter().enumerate().map(|(index, result)| {
+        response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            &json!({ "jsonrpc": "2.0", "id": index + 2, "result": result }).to_string(),
+        )
+    }));
+    let server = TestServer::start(responses).await;
+    let transport = make_transport(server.endpoint.clone());
+    transport
+        .initialize()
+        .await
+        .expect("initialization succeeds");
+
+    let result = transport
+        .call_tool("valid", json!({}), json!(1))
+        .await
+        .expect("object structured content is valid");
+    assert_eq!(result, valid);
+    for (index, _) in malformed.iter().enumerate() {
+        assert!(matches!(
+            transport
+                .call_tool("invalid", json!({}), json!(index + 2))
+                .await,
+            Err(StreamableHttpError::InvalidResponse)
+        ));
+    }
+    server.finish().await;
+}
+
+#[tokio::test]
 async fn changed_and_expired_sessions_fail_closed() {
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -270,6 +334,52 @@ async fn changed_and_expired_sessions_fail_closed() {
     ));
     assert_eq!(transport.session_id().await, None);
     expired.finish().await;
+}
+
+#[tokio::test]
+async fn initialization_header_conflicts_delete_the_issued_session_once() {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+    })
+    .to_string();
+    for notification_headers in [
+        vec![("Mcp-Session-Id", "session-b")],
+        vec![
+            ("Mcp-Session-Id", "session-a"),
+            ("Mcp-Session-Id", "session-a"),
+        ],
+    ] {
+        let server = TestServer::start(vec![
+            response(
+                "200 OK",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", "session-a"),
+                ],
+                &initialize,
+            ),
+            response("202 Accepted", &notification_headers, ""),
+            response("204 No Content", &[], ""),
+        ])
+        .await;
+        let transport = make_transport(server.endpoint.clone());
+
+        assert!(matches!(
+            transport.initialize().await,
+            Err(StreamableHttpError::SessionChanged | StreamableHttpError::InvalidSessionId)
+        ));
+        assert_eq!(transport.session_id().await, None);
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("DELETE /mcp HTTP/1.1"));
+        assert!(
+            requests[2]
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: session-a")
+        );
+    }
 }
 
 #[tokio::test]
@@ -357,6 +467,103 @@ async fn termination_invalidates_before_waiting_for_delete_response() {
 }
 
 #[tokio::test]
+async fn aborted_termination_keeps_cleanup_owned_until_delete_finishes() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener binds");
+    let endpoint = format!(
+        "http://{}/mcp",
+        listener.local_addr().expect("listener has an address")
+    );
+    let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+    let (release_delete_tx, release_delete_rx) = tokio::sync::oneshot::channel();
+    let (retry_seen_tx, mut retry_seen_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut delete, _) = listener.accept().await.expect("DELETE accepts");
+        let mut request = vec![0_u8; 8192];
+        let read = delete.read(&mut request).await.expect("DELETE reads");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("DELETE /mcp HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: abort-owned")
+        );
+        delete_started_tx.send(()).expect("DELETE start signals");
+        let delete_response = tokio::spawn(async move {
+            release_delete_rx.await.expect("DELETE release signals");
+            delete
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("DELETE response writes after caller cancellation");
+        });
+
+        let (mut retry, _) = listener.accept().await.expect("retry initialize accepts");
+        retry_seen_tx.send(()).expect("retry signal sends");
+        let mut request = vec![0_u8; 8192];
+        let read = retry
+            .read(&mut request)
+            .await
+            .expect("retry initialize reads");
+        assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /mcp HTTP/1.1"));
+        retry
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("retry error response writes");
+        delete_response.await.expect("DELETE responder joins");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "caller cancellation must not duplicate DELETE"
+        );
+    });
+    let transport = make_transport(endpoint);
+    {
+        let mut state = transport.lock_state();
+        state.initialized = true;
+        state.session_id = Some("abort-owned".to_owned());
+        state.negotiated_protocol_version = Some(rmcp::model::ProtocolVersion::V_2025_11_25);
+    }
+    let terminating = {
+        let transport = transport.clone();
+        tokio::spawn(async move { transport.terminate().await })
+    };
+    delete_started_rx.await.expect("DELETE reaches server");
+    terminating.abort();
+    assert!(
+        terminating
+            .await
+            .expect_err("terminate task is aborted")
+            .is_cancelled()
+    );
+    let retry = {
+        let transport = transport.clone();
+        tokio::spawn(async move { transport.initialize().await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut retry_seen_rx)
+            .await
+            .is_err(),
+        "initialize stays gated while the owned DELETE is pending"
+    );
+    release_delete_tx.send(()).expect("DELETE releases");
+    tokio::time::timeout(std::time::Duration::from_secs(1), retry_seen_rx)
+        .await
+        .expect("initialize reaches server after DELETE")
+        .expect("retry signal arrives");
+    assert!(matches!(
+        retry.await.expect("retry task joins"),
+        Err(StreamableHttpError::HttpStatus(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ))
+    ));
+    server.await.expect("cancellation server joins");
+}
+
+#[tokio::test]
 async fn protocol_mismatch_discards_the_server_session() {
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -364,14 +571,17 @@ async fn protocol_mismatch_discards_the_server_session() {
         "result": { "protocolVersion": "2025-03-26", "capabilities": {} }
     })
     .to_string();
-    let server = TestServer::start(vec![response(
-        "200 OK",
-        &[
-            ("Content-Type", "application/json"),
-            ("Mcp-Session-Id", "unusable"),
-        ],
-        &initialize,
-    )])
+    let server = TestServer::start(vec![
+        response(
+            "200 OK",
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", "unusable"),
+            ],
+            &initialize,
+        ),
+        response("204 No Content", &[], ""),
+    ])
     .await;
     let transport = make_transport(server.endpoint.clone());
 
@@ -384,7 +594,14 @@ async fn protocol_mismatch_discards_the_server_session() {
         transport.list_tools(None, json!(1)).await,
         Err(StreamableHttpError::NotInitialized)
     ));
-    server.finish().await;
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("DELETE /mcp HTTP/1.1"));
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("mcp-session-id: unusable")
+    );
 }
 
 #[tokio::test]
@@ -397,6 +614,7 @@ async fn aborted_initialize_discards_provisional_session_state() {
         listener.local_addr().expect("listener has an address")
     );
     let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+    let (delete_tx, delete_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("initialize is accepted");
         let mut request = vec![0_u8; 8192];
@@ -410,7 +628,19 @@ async fn aborted_initialize_discards_provisional_session_state() {
             .expect("initialize headers write");
         stream.flush().await.expect("initialize headers flush");
         headers_tx.send(()).expect("header signal sends");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let (mut cleanup, _) = listener.accept().await.expect("cleanup DELETE is accepted");
+        let mut request = vec![0_u8; 8192];
+        let read = cleanup
+            .read(&mut request)
+            .await
+            .expect("cleanup DELETE is read");
+        cleanup
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("cleanup DELETE response writes");
+        delete_tx
+            .send(String::from_utf8_lossy(&request[..read]).into_owned())
+            .expect("cleanup request signal sends");
     });
     let transport = make_transport(endpoint);
     let initializing = {
@@ -418,16 +648,287 @@ async fn aborted_initialize_discards_provisional_session_state() {
         tokio::spawn(async move { transport.initialize().await })
     };
     headers_rx.await.expect("initialize headers arrive");
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while transport.session_id().await.as_deref() != Some("provisional") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provisional session is recorded");
     initializing.abort();
     let _ = initializing.await;
 
-    let state = transport.lock_state();
-    assert!(!state.initialized);
-    assert_eq!(state.session_id, None);
-    assert_eq!(state.negotiated_protocol_version, None);
-    drop(state);
-    server.abort();
+    let delete = tokio::time::timeout(std::time::Duration::from_secs(1), delete_rx)
+        .await
+        .expect("cleanup DELETE arrives")
+        .expect("cleanup request is captured");
+    assert!(delete.starts_with("DELETE /mcp HTTP/1.1"));
+    assert!(
+        delete
+            .to_ascii_lowercase()
+            .contains("mcp-session-id: provisional")
+    );
+
+    {
+        let state = transport.lock_state();
+        assert!(!state.initialized);
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.negotiated_protocol_version, None);
+    }
+    transport
+        .terminate()
+        .await
+        .expect("already cleaned transport terminates without another DELETE");
+    server.await.expect("cleanup server completes");
+}
+
+#[tokio::test]
+async fn failed_initializations_do_not_accumulate_server_sessions() {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "protocolVersion": "2025-03-26", "capabilities": {} }
+    })
+    .to_string();
+    let mut responses = Vec::new();
+    for index in 0..3 {
+        responses.push(response(
+            "200 OK",
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &format!("ledger-{index}")),
+            ],
+            &initialize,
+        ));
+        responses.push(response("204 No Content", &[], ""));
+    }
+    let server = TestServer::start(responses).await;
+    let transport = make_transport(server.endpoint.clone());
+
+    for _ in 0..3 {
+        assert!(matches!(
+            transport.initialize().await,
+            Err(StreamableHttpError::ProtocolVersionMismatch)
+        ));
+    }
+
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 6);
+    for (index, pair) in requests.chunks_exact(2).enumerate() {
+        assert!(pair[0].starts_with("POST /mcp HTTP/1.1"));
+        assert!(pair[1].starts_with("DELETE /mcp HTTP/1.1"));
+        assert!(
+            pair[1]
+                .to_ascii_lowercase()
+                .contains(&format!("mcp-session-id: ledger-{index}"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn initialization_retry_waits_for_the_previous_session_delete() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener binds");
+    let endpoint = format!(
+        "http://{}/mcp",
+        listener.local_addr().expect("listener has an address")
+    );
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "protocolVersion": "2025-03-26", "capabilities": {} }
+    })
+    .to_string();
+    let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+    let (release_delete_tx, release_delete_rx) = tokio::sync::oneshot::channel();
+    let (retry_seen_tx, mut retry_seen_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut delete, _) = listener.accept().await.expect("first DELETE accepts");
+        let mut request = vec![0_u8; 8192];
+        let read = delete.read(&mut request).await.expect("first DELETE reads");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("DELETE /mcp HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: ledger-first")
+        );
+        delete_started_tx.send(()).expect("DELETE start signals");
+        let delete_response = tokio::spawn(async move {
+            release_delete_rx.await.expect("DELETE release signals");
+            delete
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("first DELETE response writes");
+        });
+
+        {
+            let (mut stream, _) = listener.accept().await.expect("retry initialize accepts");
+            retry_seen_tx.send(()).expect("retry signal sends");
+            let mut request = vec![0_u8; 8192];
+            let read = stream
+                .read(&mut request)
+                .await
+                .expect("retry initialize reads");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST /mcp HTTP/1.1"));
+            stream
+                .write_all(
+                    response(
+                        "200 OK",
+                        &[
+                            ("Content-Type", "application/json"),
+                            ("Mcp-Session-Id", "ledger-second"),
+                        ],
+                        &initialize,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("retry initialize response writes");
+        }
+        delete_response.await.expect("first DELETE responder joins");
+
+        let (mut cleanup, _) = listener.accept().await.expect("second DELETE accepts");
+        let mut request = vec![0_u8; 8192];
+        let read = cleanup
+            .read(&mut request)
+            .await
+            .expect("second DELETE reads");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("DELETE /mcp HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("mcp-session-id: ledger-second")
+        );
+        cleanup
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("second DELETE response writes");
+    });
+    let transport = make_transport(endpoint);
+    let generation = {
+        let mut state = transport.lock_state();
+        state.initialized = true;
+        state.session_id = Some("ledger-first".to_owned());
+        state.negotiated_protocol_version = Some(rmcp::model::ProtocolVersion::V_2025_11_25);
+        state.generation
+    };
+    let interleave = Arc::new(super::InitializationCleanupInterleave::default());
+    *transport
+        .initialization_cleanup_interleave
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(interleave.clone());
+    let retry = {
+        let transport = transport.clone();
+        tokio::spawn(async move { transport.initialize().await })
+    };
+    interleave.drained.notified().await;
+    let changed_headers = [(super::MCP_SESSION_ID, "listener-changed".parse().unwrap())]
+        .into_iter()
+        .collect();
+    assert!(matches!(
+        transport
+            .accept_response_session_or_reset(&changed_headers, generation, false)
+            .await,
+        Err(StreamableHttpError::SessionChanged)
+    ));
+    delete_started_rx.await.expect("first DELETE starts");
+    interleave.resume.notify_one();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut retry_seen_rx)
+            .await
+            .is_err(),
+        "retry must not allocate a session while DELETE is pending"
+    );
+    release_delete_tx.send(()).expect("first DELETE releases");
+    tokio::time::timeout(std::time::Duration::from_secs(1), retry_seen_rx)
+        .await
+        .expect("retry reaches server after DELETE")
+        .expect("retry signal arrives");
+    assert!(matches!(
+        retry.await.expect("retry task joins"),
+        Err(StreamableHttpError::ProtocolVersionMismatch)
+    ));
+    server.await.expect("session ledger server joins");
+}
+
+#[tokio::test]
+async fn listener_invalidation_and_terminate_share_one_delete_owner() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener binds");
+    let endpoint = format!(
+        "http://{}/mcp",
+        listener.local_addr().expect("listener has an address")
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("DELETE accepts");
+        let mut request = vec![0_u8; 8192];
+        let read = stream.read(&mut request).await.expect("DELETE reads");
+        let request = String::from_utf8_lossy(&request[..read]).into_owned();
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("DELETE response writes");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "only one path may issue DELETE"
+        );
+        request
+    });
+    let transport = make_transport(endpoint);
+    let generation = {
+        let mut state = transport.lock_state();
+        state.initialized = true;
+        state.session_id = Some("shared-owner".to_owned());
+        state.negotiated_protocol_version = Some(rmcp::model::ProtocolVersion::V_2025_11_25);
+        state.generation
+    };
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let listener_invalidation = {
+        let transport = transport.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            let headers = [(super::MCP_SESSION_ID, "changed".parse().unwrap())]
+                .into_iter()
+                .collect();
+            start.wait().await;
+            transport
+                .accept_response_session_or_reset(&headers, generation, false)
+                .await
+        })
+    };
+    let termination = {
+        let transport = transport.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            transport.terminate().await
+        })
+    };
+    start.wait().await;
+
+    assert!(matches!(
+        listener_invalidation
+            .await
+            .expect("listener invalidation joins"),
+        Err(StreamableHttpError::SessionChanged | StreamableHttpError::SessionInvalidated)
+    ));
+    termination
+        .await
+        .expect("termination joins")
+        .expect("termination succeeds");
+    let request = server.await.expect("DELETE server joins");
+    assert!(request.starts_with("DELETE /mcp HTTP/1.1"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("mcp-session-id: shared-owner")
+    );
 }
 
 #[tokio::test]
@@ -788,6 +1289,258 @@ fn public_networks_are_the_default_and_protocol_headers_are_reserved() {
         StreamableHttpTransport::new(config),
         Err(StreamableHttpError::ReservedHeader)
     ));
+}
+
+#[test]
+fn only_https_and_loopback_http_endpoints_pass_transport_policy() {
+    for endpoint in [
+        "https://example.com/mcp",
+        "https://10.0.0.1/mcp",
+        "http://127.0.0.1:1/mcp",
+        "http://[::1]:1/mcp",
+        "http://localhost:1/mcp",
+        "http://service.localhost:1/mcp",
+        "http://LOCALHOST.:1/mcp",
+    ] {
+        let mut config = StreamableHttpConfig::new(endpoint);
+        config.allow_private_networks = true;
+        assert!(
+            StreamableHttpTransport::new(config).is_ok(),
+            "{endpoint} should be allowed"
+        );
+    }
+
+    for endpoint in [
+        "http://example.com/mcp",
+        "http://10.0.0.1/mcp",
+        "http://0.0.0.0/mcp",
+    ] {
+        let mut config = StreamableHttpConfig::new(endpoint);
+        config.allow_private_networks = true;
+        assert!(matches!(
+            StreamableHttpTransport::new(config),
+            Err(StreamableHttpError::InsecureEndpoint)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn insecure_static_credentials_are_rejected_without_a_request() {
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .await
+        .expect("test listener binds");
+    let endpoint = format!(
+        "http://0.0.0.0:{}/mcp",
+        listener
+            .local_addr()
+            .expect("listener has an address")
+            .port()
+    );
+    let mut config = StreamableHttpConfig::new(endpoint);
+    config.allow_private_networks = true;
+    config.headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer static-secret".parse().unwrap(),
+    );
+
+    assert!(matches!(
+        StreamableHttpTransport::new(config),
+        Err(StreamableHttpError::InsecureEndpoint)
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "insecure configuration must make zero requests"
+    );
+}
+
+#[tokio::test]
+async fn endpoint_recheck_blocks_managed_credentials_before_init_and_dispatch() {
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .await
+        .expect("test listener binds");
+    let insecure_endpoint = format!(
+        "http://0.0.0.0:{}/mcp",
+        listener
+            .local_addr()
+            .expect("listener has an address")
+            .port()
+    );
+    let mut transport = make_transport("http://127.0.0.1:1/mcp".to_owned());
+    transport.endpoint = insecure_endpoint.parse().expect("test endpoint parses");
+    transport.headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer managed-secret".parse().unwrap(),
+    );
+
+    assert!(matches!(
+        transport.initialize().await,
+        Err(StreamableHttpError::InsecureEndpoint)
+    ));
+    {
+        let mut state = transport.lock_state();
+        state.initialized = true;
+        state.negotiated_protocol_version = Some(rmcp::model::ProtocolVersion::V_2025_11_25);
+    }
+    assert!(matches!(
+        transport.call_tool("blocked", json!({}), json!(1)).await,
+        Err(StreamableHttpError::InsecureEndpoint)
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "endpoint rechecks must make zero requests"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_localhost_resolution_blocks_static_and_managed_credentials() {
+    let route = std::net::UdpSocket::bind("0.0.0.0:0").expect("route probe binds");
+    route
+        .connect("192.0.2.1:9")
+        .expect("route probe selects an interface");
+    let target_ip = route.local_addr().expect("route has an address").ip();
+    assert!(!target_ip.is_loopback());
+    let target = TcpListener::bind(std::net::SocketAddr::new(target_ip, 0))
+        .await
+        .expect("non-loopback target binds");
+    let endpoint = format!(
+        "http://poison.localhost:{}/mcp",
+        target.local_addr().expect("target has an address").port()
+    );
+    let poisoned_addresses = vec![target_ip, "8.8.8.8".parse().expect("public IP parses")];
+
+    let mut static_config = StreamableHttpConfig::new(endpoint.clone());
+    static_config.allow_private_networks = true;
+    static_config.headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer static-secret".parse().unwrap(),
+    );
+    let mut static_transport = StreamableHttpTransport::new(static_config)
+        .expect("localhost-like URL is syntactically valid");
+    static_transport.client = static_transport
+        .client
+        .clone()
+        .with_test_dns_resolution("poison.localhost", poisoned_addresses.clone());
+    assert!(matches!(
+        static_transport.initialize().await,
+        Err(StreamableHttpError::Outbound(
+            crate::outbound::OutboundError::InsecureTransport
+        ))
+    ));
+
+    let mut managed_config = StreamableHttpConfig::new(endpoint);
+    managed_config.allow_private_networks = true;
+    managed_config.headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer managed-secret".parse().unwrap(),
+    );
+    let mut managed_transport = StreamableHttpTransport::new(managed_config)
+        .expect("localhost-like managed URL is syntactically valid");
+    managed_transport.client = managed_transport
+        .client
+        .clone()
+        .with_test_dns_resolution("poison.localhost", poisoned_addresses);
+    {
+        let mut state = managed_transport.lock_state();
+        state.initialized = true;
+        state.negotiated_protocol_version = Some(rmcp::model::ProtocolVersion::V_2025_11_25);
+    }
+    assert!(matches!(
+        managed_transport
+            .call_tool("blocked", json!({}), json!(1))
+            .await,
+        Err(StreamableHttpError::Outbound(
+            crate::outbound::OutboundError::InsecureTransport
+        ))
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+            .await
+            .is_err(),
+        "poisoned localhost target must receive zero credentialed requests"
+    );
+}
+
+#[tokio::test]
+async fn localhost_name_resolving_to_loopback_remains_allowed() {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+    })
+    .to_string();
+    let server = TestServer::start(vec![
+        response(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            &initialize,
+        ),
+        response("202 Accepted", &[], ""),
+    ])
+    .await;
+    let port = url::Url::parse(&server.endpoint)
+        .expect("server endpoint parses")
+        .port()
+        .expect("server endpoint has a port");
+    let mut config = StreamableHttpConfig::new(format!("http://safe.localhost:{port}/mcp"));
+    config.allow_private_networks = true;
+    let mut transport =
+        StreamableHttpTransport::new(config).expect("localhost-like endpoint is valid");
+    transport.client = transport.client.clone().with_test_dns_resolution(
+        "safe.localhost",
+        vec!["127.0.0.1".parse().expect("loopback IP parses")],
+    );
+
+    transport
+        .initialize()
+        .await
+        .expect("resolved loopback HTTP initializes");
+    assert_eq!(server.finish().await.len(), 2);
+}
+
+#[tokio::test]
+async fn credentialed_redirects_are_not_followed() {
+    let redirect_target = TcpListener::bind("0.0.0.0:0")
+        .await
+        .expect("redirect target binds");
+    let location = format!(
+        "http://0.0.0.0:{}/credential-sink",
+        redirect_target
+            .local_addr()
+            .expect("redirect target has an address")
+            .port()
+    );
+    let server =
+        TestServer::start(vec![response("302 Found", &[("Location", &location)], "")]).await;
+    let mut transport = make_transport(server.endpoint.clone());
+    transport.headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer redirect-secret".parse().unwrap(),
+    );
+
+    assert!(matches!(
+        transport.initialize().await,
+        Err(StreamableHttpError::HttpStatus(reqwest::StatusCode::FOUND))
+    ));
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer redirect-secret")
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            redirect_target.accept()
+        )
+        .await
+        .is_err(),
+        "redirect target must receive zero requests"
+    );
 }
 
 #[test]

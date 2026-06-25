@@ -6,17 +6,42 @@ systemd. It runs as a dedicated unprivileged `executor` account and listens on
 
 ## Install
 
-Build or download the Executor binary, then run the installer from a source
-checkout:
+Install or download the Executor release binary, then run its embedded service
+installer:
 
 ```sh
-sudo scripts/install-systemd.sh --binary /path/to/executor
+sudo "$(command -v executor)" service install
 ```
 
+Using the resolved path matters on first install because `sudo` commonly omits
+the user's `$HOME/.executor/bin` directory from its secure PATH. After the
+managed copy exists at `/usr/local/bin/executor`, ordinary `sudo executor ...`
+commands work.
+
+The release binary contains the hardened installer, unit, environment template,
+and master-key helper. A source checkout is not required.
+
 Use `--no-start` to inspect or customize the installed files before the first
-boot. The installer is safe to run again during an upgrade. It replaces the
-binary and unit but never replaces the master key, environment file, or MCP
-stdio template registry.
+boot. If Executor is already running, the installer stops it before inspecting
+managed directories or files. `--no-start` deliberately leaves that service
+stopped.
+
+The installer is safe to run again during an upgrade. It replaces the binary
+and unit but never replaces the master key, environment file, or MCP stdio
+template registry. An existing master key must already be a non-symlinked,
+32-byte regular file owned by `executor:executor` with mode `0600` and exactly
+one hard link. A valid key is preserved byte-for-byte. A new key is generated
+inside a private root-only staging directory on the same filesystem. It gets
+its final ownership and mode there before an exact-destination hard link
+atomically publishes it at `master.key`.
+
+If installation or the readiness check fails after the service lifecycle is
+under its control, the installer leaves the service stopped. If systemd cannot
+stop it, the installer reports that explicitly instead of claiming a safe
+state. A private recovery marker distinguishes an interrupted managed-file
+replacement from unrelated files, so a manifest-publication failure can be
+fixed and safely retried. Rerun the installer after correcting the reported
+problem; do not start a partially installed service manually.
 
 The installed paths are:
 
@@ -26,14 +51,41 @@ The installed paths are:
 | `/etc/systemd/system/executor.service`   | systemd unit                     | `root:root`, `0644`         |
 | `/etc/executor/executor.env`             | Non-secret service configuration | `root:executor`, `0640`     |
 | `/etc/executor/mcp-stdio-templates.json` | Approved local MCP commands      | `root:executor`, `0640`     |
+| `/etc/executor/service-install.manifest` | Managed-file ownership hashes    | `root:root`, `0600`         |
 | `/var/lib/executor`                      | SQLite state and protected data  | `executor:executor`, `0700` |
 | `/var/lib/executor/master.key`           | Raw 32-byte instance master key  | `executor:executor`, `0600` |
 
-Back up the SQLite database and `master.key` together. For a simple filesystem
-backup, stop the service and copy the complete `/var/lib/executor` directory,
-then start it again. Losing the key makes encrypted credentials and initialized
+For an external secret-manager key configured with
+`EXECUTOR_MASTER_KEY_FILE`, a root-owned `root:executor` file with mode `0440`
+or `0640` is also supported. Executor opens the file before accepting that
+shape, so the service account must actually have access through its groups.
+Symbolic links, non-regular files, extra hard links, other owners, and broader
+permissions are rejected.
+
+For the first boot with an external key, install without starting, place the
+key, configure its path, then start Executor:
+
+```sh
+sudo "$(command -v executor)" service install --no-start
+sudo install --owner root --group executor --mode 0640 \
+  /secure/source/executor-master.key /etc/executor/external-master.key
+sudoedit /etc/executor/executor.env
+# Set EXECUTOR_MASTER_KEY_FILE=/etc/executor/external-master.key
+sudo executor service start
+```
+
+The unit leaves `--master-key-file` unset, so this environment setting selects
+the external file. Without it, Executor uses `/var/lib/executor/master.key`.
+The example uses persistent protected configuration storage, so the key remains
+available after reboot. A secret manager may use an ephemeral runtime path only
+when its boot-time provisioning unit is ordered before `executor.service`.
+
+Back up the SQLite database and its selected key together. For the default key,
+stop the service and copy the complete `/var/lib/executor` directory, then start
+it again. Include an external key in that same stopped recovery snapshot when
+configured. Losing the selected key makes encrypted credentials and initialized
 instance state unrecoverable. Replacing the key while keeping the database
-makes startup fail closed. The installer refuses to invent a key for an
+makes startup fail closed. The installer refuses to invent a default key for an
 existing database.
 
 ## First boot and operation
@@ -48,11 +100,17 @@ Complete setup in a browser, then create API tokens in the dashboard. Routine
 service commands are:
 
 ```sh
-sudo systemctl status executor.service
-sudo systemctl restart executor.service
-sudo systemctl stop executor.service
+executor service status
+sudo executor service restart
+sudo executor service stop
+sudo executor service start
 sudo journalctl -u executor.service -f
 ```
+
+`service status` does not require root. It prints exactly `active` or
+`inactive`, exits 0 for active, and exits 3 for inactive. Operational failures
+exit 1. All mutating Linux service commands require `sudo` and fail before
+running systemctl when invoked without it.
 
 `systemctl stop` sends `SIGTERM`. Executor stops accepting work, cancels owned
 waits, drains upstream MCP processes and background tasks, closes SQLite, and
@@ -131,16 +189,22 @@ review those memberships as part of every template approval.
 
 ## Upgrade or remove
 
-To upgrade, rerun the installer with the replacement binary. The service is
-restarted only after the new binary and unit are installed.
+To upgrade, run `sudo "$(command -v executor)" service install` from the
+replacement binary. The service is stopped before managed state is inspected
+and started only after the new binary and unit are installed and the master key
+passes validation.
 
-To remove the service while preserving data:
+To remove the unit and managed binary while preserving `/etc/executor`,
+`/var/lib/executor`, and the service account:
 
 ```sh
-sudo systemctl disable --now executor.service
-sudo rm /etc/systemd/system/executor.service
-sudo systemctl daemon-reload
+sudo executor service remove
 ```
+
+The ownership manifest records hashes for the installed binary and unit.
+Lifecycle mutations fail before touching systemd if either file was replaced
+outside `service install`. Removal deletes the manifest but preserves all other
+configuration and state.
 
 Remove `/etc/executor`, `/var/lib/executor`, and the `executor` account only
 after making and verifying any required backup.

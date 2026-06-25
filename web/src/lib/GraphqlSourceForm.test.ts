@@ -153,6 +153,35 @@ describe("GraphQL source form", () => {
     expect(created).not.toHaveBeenCalled();
   });
 
+  it("keeps busy until the coordinator settles and focuses a recovery failure", async () => {
+    const response = deferred<ApiResult<Source>>();
+    const create = vi.fn(() => response.promise);
+    const busy = vi.fn();
+    render(GraphqlSourceForm, {
+      create,
+      onbusychange: busy,
+      oncreated: vi.fn(),
+    });
+    await fillRequiredFields();
+    await fireEvent.click(screen.getByRole("button", { name: "Connect source" }));
+
+    await waitFor(() => expect(busy).toHaveBeenLastCalledWith(true));
+    response.resolve({
+      ok: false,
+      error: new ApiError({
+        code: "source_create_recovery_pending",
+        displayMessage: "Source recovery is pending.",
+        requestId: null,
+        status: 0,
+      }),
+    });
+    await response.promise;
+    await waitFor(() => expect(busy).toHaveBeenLastCalledWith(false));
+    expect(screen.getByText("Source recovery is pending.")).toBeDefined();
+    expect(document.activeElement).toBe(document.getElementById("graphql-source-error"));
+    expect(create).toHaveBeenCalledOnce();
+  });
+
   it("clears secrets and focuses a rejected request", async () => {
     const create = vi.fn(
       async () =>

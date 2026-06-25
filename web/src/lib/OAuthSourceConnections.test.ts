@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import OAuthSourceConnections from "./OAuthSourceConnections.svelte";
 import type {
+  OAuthConnectionList,
   OAuthConnectionOperations,
   OAuthConnectionSummary,
   OAuthOperationResult,
@@ -56,8 +57,16 @@ function success<Value>(value: Value): OAuthOperationResult<Value> {
   return { ok: true, value };
 }
 
+function deferred<Value>() {
+  let resolve = (_value: Value) => {};
+  const promise = new Promise<Value>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 function operations() {
-  const list = {
+  const list: OAuthConnectionList = {
     connections: [connection()],
     availableCredentials: [
       {
@@ -172,5 +181,188 @@ describe("OAuth source connections", () => {
     expect(
       screen.getByRole<HTMLButtonElement>("button", { name: "Delete configuration" }).disabled,
     ).toBe(false);
+  });
+
+  it("keeps the prior list visible after a callback reload fails and consumes it after retry", async () => {
+    const api = operations();
+    const checked = vi.fn();
+    api.load
+      .mockResolvedValueOnce(
+        success({
+          connections: [],
+          availableCredentials: [],
+        }),
+      )
+      .mockResolvedValueOnce({
+        ok: false,
+        error: {
+          code: "network_error",
+          displayMessage: "Managed OAuth refresh failed.",
+          requestId: "oauth-reload",
+          status: 503,
+        },
+      })
+      .mockResolvedValue(
+        success({
+          connections: [connection()],
+          availableCredentials: [],
+        }),
+      );
+    const mounted = render(OAuthSourceConnections, {
+      source: source(),
+      operations: api,
+      oncallbackchecked: checked,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledOnce());
+
+    await mounted.rerender({
+      source: source(),
+      operations: api,
+      callbackRefreshKey: "success:connection-1",
+      oncallbackchecked: checked,
+    });
+
+    const staleError = await screen.findByRole("alert");
+    expect(staleError.textContent).toContain("Managed OAuth refresh failed.");
+    expect(staleError.textContent).toContain("Showing the last loaded managed OAuth options.");
+    expect(checked).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Retry managed OAuth" }));
+    await waitFor(() => expect(checked).toHaveBeenCalledOnce());
+    expect(checked).toHaveBeenCalledWith(true);
+    expect(screen.queryByText("Managed OAuth refresh failed.")).toBeNull();
+    expect(screen.getByText(/OAuth authorization completed/)).toBeDefined();
+  });
+
+  it("ignores a late callback reload failure after a newer load succeeds", async () => {
+    const api = operations();
+    const oldLoad = deferred<OAuthOperationResult<OAuthConnectionList>>();
+    const newLoad = deferred<OAuthOperationResult<OAuthConnectionList>>();
+    api.load
+      .mockResolvedValueOnce(
+        success({
+          connections: [],
+          availableCredentials: [],
+        }),
+      )
+      .mockImplementationOnce(() => oldLoad.promise)
+      .mockImplementationOnce(() => newLoad.promise)
+      .mockResolvedValue(
+        success({
+          connections: [connection()],
+          availableCredentials: [],
+        }),
+      );
+    const checked = vi.fn();
+    const mounted = render(OAuthSourceConnections, {
+      source: source(),
+      operations: api,
+      oncallbackchecked: checked,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledOnce());
+
+    await mounted.rerender({
+      source: source(),
+      operations: api,
+      callbackRefreshKey: "failed:connection-1",
+      oncallbackchecked: checked,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(2));
+    await mounted.rerender({
+      source: source(),
+      operations: api,
+      callbackRefreshKey: "success:connection-1",
+      oncallbackchecked: checked,
+    });
+    await waitFor(() => expect(api.load).toHaveBeenCalledTimes(3));
+    newLoad.resolve(
+      success({
+        connections: [connection()],
+        availableCredentials: [],
+      }),
+    );
+    await waitFor(() => expect(checked).toHaveBeenCalledOnce());
+
+    oldLoad.resolve({
+      ok: false,
+      error: {
+        code: "network_error",
+        displayMessage: "Late old failure.",
+        requestId: null,
+        status: 503,
+      },
+    });
+    await oldLoad.promise;
+    await Promise.resolve();
+    expect(screen.queryByText("Late old failure.")).toBeNull();
+    expect(screen.getByText(/OAuth authorization completed/)).toBeDefined();
+  });
+
+  it("uses collision-free panel IDs and keeps error focus inside the active credential panel", async () => {
+    const api = operations();
+    api.load.mockResolvedValue(
+      success({
+        connections: [
+          connection({
+            id: "dot-connection",
+            credentialKey: "client.id",
+            callbackUrl: "https://executor.example.test/callback/dot",
+            clientAuthMethod: "client_secret_basic",
+            hasClientSecret: true,
+          }),
+          connection({
+            id: "dash-connection",
+            credentialKey: "client-id",
+            callbackUrl: "https://executor.example.test/callback/dash",
+            clientAuthMethod: "client_secret_basic",
+            hasClientSecret: true,
+          }),
+        ],
+        availableCredentials: [],
+      }),
+    );
+    api.save.mockResolvedValue({
+      ok: false,
+      error: {
+        code: "invalid_oauth_configuration",
+        displayMessage: "Review this OAuth configuration.",
+        requestId: null,
+        status: 400,
+      },
+    });
+    render(OAuthSourceConnections, { source: source(), operations: api });
+
+    const dotHeading = await screen.findByRole("heading", { name: "client.id" });
+    const dashHeading = screen.getByRole("heading", { name: "client-id" });
+    const dotPanel = dotHeading.closest("section");
+    const dashPanel = dashHeading.closest("section");
+    expect(dotPanel).not.toBeNull();
+    expect(dashPanel).not.toBeNull();
+    if (dotPanel === null || dashPanel === null) return;
+
+    expect(dotHeading.id).not.toBe(dashHeading.id);
+    expect(dotPanel.getAttribute("aria-labelledby")).toBe(dotHeading.id);
+    expect(dashPanel.getAttribute("aria-labelledby")).toBe(dashHeading.id);
+    const dotCallback = within(dotPanel).getByLabelText<HTMLInputElement>("Exact callback URL");
+    const dashCallback = within(dashPanel).getByLabelText<HTMLInputElement>("Exact callback URL");
+    expect(dotCallback.id).not.toBe(dashCallback.id);
+    const dotRadio = dotPanel.querySelector<HTMLInputElement>('input[type="radio"]');
+    const dashRadio = dashPanel.querySelector<HTMLInputElement>('input[type="radio"]');
+    expect(dotRadio?.name).not.toBe(dashRadio?.name);
+
+    await fireEvent.input(within(dotPanel).getByLabelText(/Requested scopes/), {
+      target: { value: "dot-change" },
+    });
+    await fireEvent.click(within(dotPanel).getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(dotPanel.contains(document.activeElement)).toBe(true));
+
+    await fireEvent.input(within(dashPanel).getByLabelText(/Requested scopes/), {
+      target: { value: "dash-change" },
+    });
+    await fireEvent.click(within(dashPanel).getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(dashPanel.contains(document.activeElement)).toBe(true));
+    expect(dotPanel.querySelector('[role="alert"]')?.id).not.toBe(
+      dashPanel.querySelector('[role="alert"]')?.id,
+    );
   });
 });

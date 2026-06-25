@@ -191,7 +191,9 @@ export function normalizeOAuthScopes(value: string) {
 
 export function oauthCallbackRefreshKey(parameters: URLSearchParams) {
   const result = parameters.get("result");
-  if (result !== "success" && result !== "failed") return null;
+  if (result !== "success" && result !== "success_refresh_failed" && result !== "failed") {
+    return null;
+  }
   const connectionId = parameters.get("oauth");
   if (connectionId === null || connectionId.trim() === "") return null;
   return `${result}:${connectionId}`;
@@ -210,15 +212,23 @@ export function oauthCallbackOutcomeNotice(refreshKey: string, matched: boolean)
       message: "OAuth authorization did not complete. Review the connection status and try again.",
     };
   }
-  return matched
-    ? {
-        tone: "success" as const,
-        message: "OAuth authorization completed and the connection status was refreshed.",
-      }
-    : {
-        tone: "error" as const,
-        message: "OAuth returned, but no matching managed connection is available.",
-      };
+  if (!matched) {
+    return {
+      tone: "error" as const,
+      message: "OAuth returned, but no matching managed connection is available.",
+    };
+  }
+  if (refreshKey.startsWith("success_refresh_failed:")) {
+    return {
+      tone: "error" as const,
+      message:
+        "OAuth authorization completed, but the source catalog could not be refreshed. The connection remains authorized; retry the source refresh.",
+    };
+  }
+  return {
+    tone: "success" as const,
+    message: "OAuth authorization completed and the connection status was refreshed.",
+  };
 }
 
 export function oauthCallbackNoticeWithoutEligibleSources(

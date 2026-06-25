@@ -1,9 +1,15 @@
 ---
-title: Self Hosted Cloudflare
-description: "Run Executor as a single Cloudflare Worker in your own account, with Cloudflare Access for auth and D1 for storage."
+title: "Legacy: Cloudflare Worker"
+description: "Archived reference for the previous TypeScript Cloudflare Worker deployment."
 ---
 
-Executor runs as a single Cloudflare Worker. Authentication is handled entirely by
+<Warning>
+  This TypeScript Cloudflare Worker deployment is archived. It is not the supported self-hosted
+  product and does not ship the current Rust and Svelte application. Use [native
+  self-hosting](/self-hosting) or [Docker](/hosted/docker).
+</Warning>
+
+The archived deployment runs as a single Cloudflare Worker. Authentication is handled entirely by
 [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
 (there is no separate app login), storage is [D1](https://developers.cloudflare.com/d1/),
 tool code runs in QuickJS inside the Worker, and the web console, API, and MCP
@@ -15,12 +21,12 @@ and you manage members and credentials in Cloudflare Access rather than in the a
 ## Prerequisites
 
 - A Cloudflare account with Workers and Zero Trust (Access) enabled.
-- The [Executor repo](https://github.com/RhysSullivan/executor) checked out, with
+- The [Executor repo](https://github.com/davis7dotsh/executor-fork-testing) checked out, with
   dependencies installed (`bun install`).
 
 ## Deploy
 
-From `apps/host-cloudflare`:
+From `legacy/host-cloudflare`:
 
 ```bash
 bunx wrangler login

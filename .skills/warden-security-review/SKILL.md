@@ -23,6 +23,13 @@ npm exec --yes --package=@sentry/warden -- warden --help
 
 The repo has a `warden.toml` that uses remote skills from `getsentry/warden-skills`.
 
+Before scanning, verify that every configured target resolves to at least one
+non-ignored file:
+
+```bash
+bun run lint:warden-targets
+```
+
 Reference skills are mirrored under `.reference/warden-skills` when needed. `.reference/` is gitignored.
 
 ## Local Outputs
@@ -42,11 +49,13 @@ Warden may not treat bare directories as recursive targets. Prefer explicit quot
 
 ## Recommended Scans
 
-Authz on cloud/API surfaces:
+Authz on the active Rust API and OAuth surfaces plus archived opt-in API
+surfaces:
 
 ```bash
 npm exec --yes --package=@sentry/warden -- \
-  warden "legacy/cloud/src/auth/**/*.ts" "legacy/cloud/src/api/**/*.ts" \
+  warden "src/api.rs" "src/api/**/*.rs" "src/oauth/**/*.rs" \
+  "legacy/cloud/src/auth/**/*.ts" "legacy/cloud/src/api/**/*.ts" \
   "legacy/cloud/src/routes/**/*.tsx" "packages/core/api/src/**/*.ts" \
   --skill wrdn-authz --fail-on off --report-on low --min-confidence low \
   --parallel 2 --log -o .warden-runs/authz.jsonl
@@ -54,10 +63,15 @@ npm exec --yes --package=@sentry/warden -- \
 
 Code execution on sink-bearing runtime/plugin files:
 
+The archived local runtime remains in scope because explicit legacy development
+and test commands can still execute it. No release workflow publishes it. Its
+server code lives directly under `legacy/local/src`, not a `src/server`
+subdirectory.
+
 ```bash
 rg -l "\b(exec|spawn|execFile|fork|subprocess|Deno\.Command|new Function|eval\(|vm\.|QuickJS|quickjs|Worker\(|import\(|compile|instantiate|runIn|shell|command|child_process)\b" \
-  apps/local/src/server apps/cli/src packages/core/execution/src packages/core/sdk/src packages/kernel packages/plugins \
-  -g "*.ts" -g "*.tsx" -g "!*.test.ts" -g "!*.spec.ts" -g "!*.e2e.ts" -g "!**/dist/**" -g "!**/node_modules/**" \
+  src legacy/local/src legacy/cli/src packages/core/execution/src packages/core/sdk/src packages/kernel packages/plugins \
+  -g "*.rs" -g "*.ts" -g "*.tsx" -g "!*.test.ts" -g "!*.spec.ts" -g "!*.e2e.ts" -g "!**/dist/**" -g "!**/node_modules/**" \
   > .warden-runs/code-execution-targets.txt
 
 npm exec --yes --package=@sentry/warden -- \
@@ -69,15 +83,12 @@ npm exec --yes --package=@sentry/warden -- \
 Data exfiltration on backend/API/storage/plugin SDK surfaces:
 
 ```bash
-find legacy/cloud/src/api legacy/cloud/src/auth apps/local/src/server \
-  packages/core/api/src packages/core/storage-core/src packages/core/storage-file/src \
-  packages/core/storage-postgres/src packages/core/storage-drizzle/src \
-  packages/plugins/mcp/src packages/plugins/openapi/src packages/plugins/graphql/src \
-  packages/plugins/google-discovery/src packages/plugins/oauth2/src \
-  packages/plugins/onepassword/src packages/plugins/workos-vault/src \
-  packages/plugins/file-secrets/src packages/plugins/keychain/src \
-  -type f \( -name "*.ts" -o -name "*.tsx" \) |
-  rg -v '(\.test\.|\.spec\.|\.e2e\.|dist/|node_modules/|embedded-migrations\.gen\.ts|/react/)' \
+find src/api src/catalog src/invocation src/mcp src/oauth src/protocols src/runtime \
+  src/api.rs src/database.rs src/outbound.rs src/request_logs.rs \
+  legacy/cloud/src/api legacy/cloud/src/auth legacy/cloud/src/routes legacy/local/src \
+  packages/core/api/src packages/plugins packages/react/src/api \
+  -type f \( -name "*.rs" -o -name "*.ts" -o -name "*.tsx" \) |
+  rg -v '(\.test\.|\.spec\.|\.e2e\.|dist/|node_modules/|embedded-migrations\.gen\.ts)' \
   > .warden-runs/exfil-targets-focused.txt
 
 npm exec --yes --package=@sentry/warden -- \
@@ -109,12 +120,9 @@ For each candidate:
 - Determine what data returns to the caller: raw body, parsed fields, typed error message, timing/status oracle, or no observable data.
 - State confidence and deployment caveats.
 
-## Current Known Findings
+## Result freshness
 
-As of the Warden pass on 2026-04-29:
-
-- Real: authenticated SSRF in plugin/source setup URL fetching for OpenAPI, Google Discovery, GraphQL, and MCP remote endpoints.
-- Real: mutable third-party GitHub Actions refs in publish/release workflows, especially `oven-sh/setup-bun@v2` and `changesets/action@v1`.
-- Clean in that pass: authz scan on cloud auth/API/core API surfaces; code-execution scan on narrowed CLI/runtime/kernel/plugin sink files.
-
-Do not claim the whole codebase is secure from those clean runs. They are scoped scanner results.
+Do not carry old findings or clean claims forward without rerunning the current
+targets. Report the exact commit, skill, target list, confidence threshold, and
+output artifact for every result. A clean scoped pass is not evidence that the
+whole codebase is secure.

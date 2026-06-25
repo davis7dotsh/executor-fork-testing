@@ -11,8 +11,8 @@ use tower::ServiceExt;
 
 use super::{
     CancellationRegistry, McpRequestLimiter, PROTOCOL_HEADER, PROTOCOL_VERSION, SESSION_HEADER,
-    SessionRegistrationRaceHook, accepts, cancellation_signal, mcp_idempotency_key, rpc_id_string,
-    valid_request_id, virtual_tools,
+    SessionRegistrationRaceHook, accepts, cancellation_signal, mcp_execution_request_id,
+    mcp_idempotency_key, rpc_id_string, valid_request_id, virtual_tools,
 };
 use crate::{
     AppConfig, ExecutorApp,
@@ -87,6 +87,44 @@ fn request_ids_are_bounded_strings_or_numbers() {
     assert_ne!(
         mcp_idempotency_key("session", &rpc_id_string(&json!(1))),
         mcp_idempotency_key("session", &rpc_id_string(&json!("1")))
+    );
+}
+
+#[test]
+fn execute_request_log_ids_are_safe_deterministic_and_bounded() {
+    let token_id = "token-private-identity";
+    let session_id = "session-private-identity";
+    let raw_request_id = "request-private-identity".repeat(8);
+    let rpc_request_id = json!(raw_request_id.clone());
+    assert!(valid_request_id(&rpc_request_id));
+    let correlation = rpc_id_string(&rpc_request_id);
+
+    let request_log_id = mcp_execution_request_id(token_id, session_id, &correlation);
+    assert_eq!(
+        request_log_id,
+        mcp_execution_request_id(token_id, session_id, &correlation)
+    );
+    assert_eq!(request_log_id.len(), 102);
+    assert!(!request_log_id.contains(token_id));
+    assert!(!request_log_id.contains(session_id));
+    assert!(!request_log_id.contains(raw_request_id.as_str()));
+    assert_ne!(
+        request_log_id,
+        mcp_execution_request_id("another-token", session_id, &correlation)
+    );
+    assert_ne!(
+        request_log_id,
+        mcp_execution_request_id(token_id, "another-session", &correlation)
+    );
+
+    let longest_request_id = json!("x".repeat(256));
+    assert!(valid_request_id(&longest_request_id));
+    let longest_request_log_id =
+        mcp_execution_request_id(token_id, session_id, &rpc_id_string(&longest_request_id));
+    assert_eq!(longest_request_log_id.len(), 102);
+    assert_eq!(
+        format!("{longest_request_log_id}:call:{}", u64::MAX).len(),
+        128
     );
 }
 
@@ -187,6 +225,7 @@ async fn expired_session_cancels_pending_ask_before_it_can_execute() {
                 (header::COOKIE.as_str(), &cookie),
                 (header::ORIGIN.as_str(), ORIGIN),
                 ("x-executor-csrf", csrf),
+                ("idempotency-key", "mcp-expiring-token"),
             ],
         )
         .await,
@@ -379,6 +418,7 @@ async fn streamable_http_lifecycle_is_authenticated_session_bound_and_finite() {
             (header::COOKIE.as_str(), &cookie),
             (header::ORIGIN.as_str(), ORIGIN),
             ("x-executor-csrf", csrf),
+            ("idempotency-key", "mcp-stream-primary-token"),
         ],
     )
     .await;
@@ -704,6 +744,7 @@ async fn streamable_http_lifecycle_is_authenticated_session_bound_and_finite() {
                 (header::COOKIE.as_str(), &cookie),
                 (header::ORIGIN.as_str(), ORIGIN),
                 ("x-executor-csrf", csrf),
+                ("idempotency-key", "mcp-stream-secondary-token"),
             ],
         )
         .await,

@@ -473,35 +473,30 @@ fn rejects_path_parameters_that_do_not_match_the_template() {
 }
 
 #[test]
-fn stable_identity_does_not_depend_on_operation_id_and_trace_is_disabled() {
-    let make = |operation_id: &str| {
-        json!({
-            "openapi": "3.0.3",
-            "info": { "title": "Identity" },
-            "paths": {
-                "/items/{id}": {
-                    "parameters": [{
-                        "name": "id",
-                        "in": "path",
-                        "required": true,
-                        "schema": { "type": "string" }
-                    }],
-                    "trace": {
-                        "operationId": operation_id,
-                        "responses": { "200": { "description": "ok" } }
-                    }
+fn trace_operations_are_rejected_before_they_can_enter_the_catalog() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": { "title": "Unsupported TRACE" },
+        "paths": {
+            "/items/{id}": {
+                "parameters": [{
+                    "name": "id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" }
+                }],
+                "trace": {
+                    "operationId": "traceItem",
+                    "responses": { "200": { "description": "ok" } }
                 }
             }
-        })
-    };
-    let first = compile_document(&serde_json::to_vec(&make("firstName")).unwrap()).unwrap();
-    let second = compile_document(&serde_json::to_vec(&make("secondName")).unwrap()).unwrap();
-    assert_eq!(first.tools[0].stable_key, second.tools[0].stable_key);
-    assert_ne!(
-        first.tools[0].preferred_name,
-        second.tools[0].preferred_name
-    );
-    assert_eq!(first.tools[0].intrinsic_mode, ToolMode::Disabled);
+        }
+    });
+    assert!(matches!(
+        compile_document(&serde_json::to_vec(&document).unwrap()),
+        Err(OpenApiError::InvalidOperation { method, message, .. })
+            if method == "TRACE" && message == "TRACE operations are not supported"
+    ));
 }
 
 #[test]
@@ -1148,6 +1143,22 @@ fn canonical_credentials_validate_and_round_trip_every_supported_type() {
         invalid.validate(),
         Err(OpenApiCredentialError::InvalidSchemeName)
     );
+    for name in ["Auth\n", "Auth\r", "Auth\u{7f}"] {
+        let invalid = OpenApiCredentialSet {
+            schemes: [(
+                name.to_owned(),
+                OpenApiCredential::Bearer {
+                    token: "token".to_owned(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(OpenApiCredentialError::InvalidSchemeName)
+        );
+    }
 }
 
 #[test]
@@ -1331,6 +1342,72 @@ fn canonical_builder_applies_api_key_basic_bearer_and_oauth_credentials() {
     assert_eq!(
         request("/oauth").headers["authorization"],
         "Bearer oauth-secret"
+    );
+}
+
+#[test]
+fn basic_credentials_reject_ambiguous_usernames_and_encode_valid_utf8_identities() {
+    let invalid = OpenApiCredentialSet {
+        schemes: [(
+            "basic".to_owned(),
+            OpenApiCredential::Basic {
+                username: "admin:other".to_owned(),
+                password: "secret".to_owned(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    assert_eq!(
+        invalid.validate(),
+        Err(OpenApiCredentialError::InvalidBasicUsername)
+    );
+
+    let document = json!({
+        "openapi": "3.1.0",
+        "info": { "title": "Basic identity encoding" },
+        "servers": [{ "url": "https://api.example.test" }],
+        "components": { "securitySchemes": {
+            "basic": { "type": "http", "scheme": "basic" }
+        }},
+        "paths": { "/identity": { "get": {
+            "security": [{ "basic": [] }],
+            "responses": { "200": { "description": "ok" } }
+        }}}
+    });
+    let compiled = compile_document(&serde_json::to_vec(&document).unwrap()).unwrap();
+    let request = |username: &str, password: &str| {
+        build_protocol_request(
+            &compiled.tools[0].binding,
+            &json!({}),
+            &OpenApiCredentialSet {
+                schemes: [(
+                    "basic".to_owned(),
+                    OpenApiCredential::Basic {
+                        username: username.to_owned(),
+                        password: password.to_owned(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .expect("valid Basic credentials should encode")
+    };
+
+    assert_eq!(
+        request("", "password:with:colons").headers["authorization"],
+        "Basic OnBhc3N3b3JkOndpdGg6Y29sb25z"
+    );
+    assert_eq!(
+        request("δοκιμή", "pässword").headers["authorization"],
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "δοκιμή:pässword".as_bytes()
+            )
+        )
     );
 }
 

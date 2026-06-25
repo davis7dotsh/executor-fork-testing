@@ -104,6 +104,8 @@ describe("OAuth connection state", () => {
     });
     expect(oauthCallbackRefreshKey(parameters)).toBe("failed:connection-1");
     expect(oauthCallbackConnectionId("failed:connection-1")).toBe("connection-1");
+    parameters.set("result", "success_refresh_failed");
+    expect(oauthCallbackRefreshKey(parameters)).toBe("success_refresh_failed:connection-1");
     parameters.set("result", "provider-specific-value");
     expect(oauthCallbackRefreshKey(parameters)).toBeNull();
   });
@@ -120,6 +122,11 @@ describe("OAuth connection state", () => {
       "did not complete",
     );
     expect(oauthCallbackOutcomeNotice("success:connection-1", true).message).toContain("completed");
+    expect(oauthCallbackOutcomeNotice("success_refresh_failed:connection-1", true)).toEqual({
+      tone: "error",
+      message:
+        "OAuth authorization completed, but the source catalog could not be refreshed. The connection remains authorized; retry the source refresh.",
+    });
     expect(oauthCallbackOutcomeNotice("success:missing", false).message).toContain("no matching");
   });
 

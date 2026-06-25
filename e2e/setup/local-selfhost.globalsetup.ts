@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -41,6 +41,22 @@ const bootExecutor = async (
   label: string,
 ): Promise<BootedExecutor> => {
   const dataDir = mkdtempSync(`${tmpdir()}/executor-e2e-${label}-`);
+  const stdioTemplatesFile = resolve(dataDir, "mcp-stdio-templates.json");
+  writeFileSync(
+    stdioTemplatesFile,
+    JSON.stringify({
+      templates: [
+        {
+          name: "executor-e2e-stdio",
+          executable: process.execPath,
+          cwd: repoRoot,
+          arguments: [resolve(repoRoot, "e2e/fixtures/stdio-mcp-server.mjs")],
+          environment: {},
+          secretEnvironment: ["EXECUTOR_E2E_STDIO_SECRET"],
+        },
+      ],
+    }),
+  );
   const child = spawn(
     binary,
     [
@@ -51,6 +67,8 @@ const bootExecutor = async (
       dataDir,
       "--public-origin",
       `http://127.0.0.1:${port}`,
+      "--mcp-stdio-templates",
+      stdioTemplatesFile,
     ],
     { cwd: repoRoot, detached: true, stdio: ["ignore", "pipe", "pipe"] },
   );
@@ -111,6 +129,9 @@ export default async function setup(): Promise<() => Promise<void>> {
   const { ports, release } = await claimPorts([
     { envVar: "E2E_LOCAL_SELFHOST_PORT", offset: 4, label: "Rust local selfhost" },
     { envVar: "E2E_LOCAL_SETUP_PORT", offset: 5, label: "Rust first-boot setup" },
+    { envVar: "E2E_LOCAL_EMULATOR_A_PORT", offset: 6, label: "local emulator A" },
+    { envVar: "E2E_LOCAL_EMULATOR_B_PORT", offset: 7, label: "local emulator B" },
+    { envVar: "E2E_LOCAL_EMULATOR_C_PORT", offset: 8, label: "local emulator C" },
   ]);
   const mainPort = ports.E2E_LOCAL_SELFHOST_PORT!;
   const setupPort = ports.E2E_LOCAL_SETUP_PORT!;

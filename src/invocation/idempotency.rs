@@ -206,6 +206,12 @@ impl GatewayIdempotencyStore {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn with_response_ciphertext_capacity(mut self, bytes: i64) -> Self {
+        self.limits.response_ciphertext_bytes = bytes;
+        self
+    }
+
     pub(crate) async fn claim(
         &self,
         request: IdempotencyRequest<'_>,
@@ -406,6 +412,64 @@ impl GatewayIdempotencyStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn release_retryable_execution(
+        &self,
+        lease: &IdempotencyRecord,
+    ) -> Result<(), IdempotencyError> {
+        validate_identifier(&lease.id, 128)?;
+        validate_identifier(&lease.owner_api_token_id, 128)?;
+        if lease.state != IdempotencyState::Reserved
+            || lease.approval_id.is_some()
+            || lease.response_kind.is_some()
+            || lease.completed_at.is_some()
+            || lease.expires_at.is_some()
+        {
+            return Err(IdempotencyError::InvalidMetadata);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let released = sqlx::query(
+            "DELETE FROM gateway_invocation_idempotency AS idempotency \
+             WHERE idempotency.id = ? AND idempotency.owner_api_token_id = ? \
+               AND idempotency.created_at = ? AND idempotency.state = 'executing' \
+               AND idempotency.approval_id IS NULL \
+               AND idempotency.response_kind IS NULL \
+               AND idempotency.response_ciphertext IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM approval_correlations AS correlation \
+                   WHERE correlation.execution_id = 'gateway-idempotency:' || idempotency.id \
+                     AND correlation.call_id = 'gateway' \
+                     AND correlation.actor_kind = 'api_token' \
+                     AND correlation.actor_id = idempotency.owner_api_token_id \
+               )",
+        )
+        .bind(&lease.id)
+        .bind(&lease.owner_api_token_id)
+        .bind(lease.created_at)
+        .execute(&mut *transaction)
+        .await?;
+        if released.rows_affected() != 1 {
+            let current = sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT owner_api_token_id, state, created_at \
+                 FROM gateway_invocation_idempotency WHERE id = ?",
+            )
+            .bind(&lease.id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            return Err(match current {
+                None => IdempotencyError::NotFound,
+                Some((owner_api_token_id, _, created_at))
+                    if owner_api_token_id != lease.owner_api_token_id
+                        || created_at != lease.created_at =>
+                {
+                    IdempotencyError::InvalidMetadata
+                }
+                Some((_, state, _)) => IdempotencyError::InvalidTransition(state_name(&state)?),
+            });
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn abandon(&self, id: &str) -> Result<(), IdempotencyError> {
@@ -1311,6 +1375,196 @@ mod tests {
                 .await
                 .expect("replacement claim"),
             IdempotencyClaim::Fresh(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retryable_execution_release_reopens_the_same_key() {
+        let (_directory, store, _clock) = store().await;
+        let arguments = json!({"value": 1});
+        let IdempotencyClaim::Fresh(first) = store
+            .claim(request(
+                "owner-a",
+                "retryable-execution",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("first claim")
+        else {
+            panic!("first claim must be fresh");
+        };
+        store
+            .mark_executing(&first.id)
+            .await
+            .expect("execution boundary");
+        store
+            .release_retryable_execution(&first)
+            .await
+            .expect("known-safe execution releases");
+        assert_eq!(
+            store.state(&first.id).await.expect("released state reads"),
+            None
+        );
+
+        let IdempotencyClaim::Fresh(replacement) = store
+            .claim(request(
+                "owner-a",
+                "retryable-execution",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("replacement claim")
+        else {
+            panic!("the same key must be claimable again");
+        };
+        assert_ne!(replacement.id, first.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_retryable_release_cannot_delete_a_competing_replacement_claim() {
+        let (_directory, store, _clock) = store().await;
+        let arguments = json!({"value": 1});
+        let IdempotencyClaim::Fresh(first) = store
+            .claim(request(
+                "owner-a",
+                "retryable-race",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("first claim")
+        else {
+            panic!("first claim must be fresh");
+        };
+        store
+            .mark_executing(&first.id)
+            .await
+            .expect("first execution boundary");
+        store
+            .release_retryable_execution(&first)
+            .await
+            .expect("first execution releases");
+        let IdempotencyClaim::Fresh(replacement) = store
+            .claim(request(
+                "owner-a",
+                "retryable-race",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("replacement claim")
+        else {
+            panic!("replacement claim must be fresh");
+        };
+        store
+            .mark_executing(&replacement.id)
+            .await
+            .expect("replacement execution boundary");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(18));
+        let stale_store = store.clone();
+        let stale_barrier = barrier.clone();
+        let stale_lease = first.clone();
+        let stale_release = tokio::spawn(async move {
+            stale_barrier.wait().await;
+            stale_store.release_retryable_execution(&stale_lease).await
+        });
+        let mut claims = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            claims.push(tokio::spawn(async move {
+                let arguments = json!({"value": 1});
+                barrier.wait().await;
+                store
+                    .claim(request(
+                        "owner-a",
+                        "retryable-race",
+                        "source.tool",
+                        &arguments,
+                    ))
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        assert!(matches!(
+            stale_release.await.expect("stale release task"),
+            Err(IdempotencyError::NotFound)
+        ));
+        for claim in claims {
+            assert!(matches!(
+                claim.await.expect("claim task").expect("competing claim"),
+                IdempotencyClaim::InProgress(record) if record.id == replacement.id
+            ));
+        }
+        assert_eq!(
+            store
+                .state(&replacement.id)
+                .await
+                .expect("replacement state reads"),
+            Some(IdempotencyState::Executing)
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_execution_release_fails_closed_after_ownership_or_state_changes() {
+        let (_directory, store, _clock) = store().await;
+        let arguments = json!({"value": 1});
+        let IdempotencyClaim::Fresh(owner_lease) = store
+            .claim(request(
+                "owner-a",
+                "retryable-owner-change",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("owner claim")
+        else {
+            panic!("owner claim must be fresh");
+        };
+        store
+            .mark_executing(&owner_lease.id)
+            .await
+            .expect("owner execution boundary");
+        let mut forged_owner_lease = owner_lease.clone();
+        forged_owner_lease.owner_api_token_id = "owner-b".to_owned();
+        assert!(matches!(
+            store.release_retryable_execution(&forged_owner_lease).await,
+            Err(IdempotencyError::InvalidMetadata)
+        ));
+        assert_eq!(
+            store
+                .state(&owner_lease.id)
+                .await
+                .expect("changed ownership state reads"),
+            Some(IdempotencyState::Executing)
+        );
+
+        let IdempotencyClaim::Fresh(state_lease) = store
+            .claim(request(
+                "owner-a",
+                "retryable-state-change",
+                "source.tool",
+                &arguments,
+            ))
+            .await
+            .expect("state claim")
+        else {
+            panic!("state claim must be fresh");
+        };
+        store
+            .mark_executing(&state_lease.id)
+            .await
+            .expect("state execution boundary");
+        store
+            .mark_indeterminate(&state_lease.id)
+            .await
+            .expect("fixture changes state");
+        assert!(matches!(
+            store.release_retryable_execution(&state_lease).await,
+            Err(IdempotencyError::InvalidTransition("indeterminate"))
         ));
     }
 
