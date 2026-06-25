@@ -75,6 +75,21 @@ describe("release workflow hardening", () => {
     expect(ci).toContain("run: bun run test:release:shell");
   });
 
+  it("installs the locked OAuth emulator before Rust integration tests", () => {
+    const rust = workflowJob(workflow("ci.yml"), "rust");
+    const setup = rust.indexOf("uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76");
+    const install = rust.indexOf("run: bun install --frozen-lockfile --ignore-scripts");
+    const verify = rust.indexOf("run: test -x e2e/node_modules/.bin/emulate");
+    const test = rust.indexOf("run: cargo test --locked --all-targets --all-features");
+
+    expect(setup).toBeGreaterThanOrEqual(0);
+    expect(rust).toContain("bun-version: 1.3.11");
+    expect(install).toBeGreaterThan(setup);
+    expect(verify).toBeGreaterThan(install);
+    expect(test).toBeGreaterThan(verify);
+    expect(repositoryFile("e2e/package.json")).toContain('"@executor-js/emulate": "^0.7.5"');
+  });
+
   it("serializes installer mutations and preserves crash-durability ordering", () => {
     const installer = repositoryFile("scripts/install.sh");
     const beginTransaction = installer.slice(

@@ -5,15 +5,45 @@ export interface OAuthTestProvider {
   readonly issuer: string;
   readonly endpoint: string;
   readonly registerClient: (redirectUri: string) => Promise<string>;
+  readonly approveAuthorization: (authorizationUrl: string, login: string) => Promise<string>;
   readonly ledger: () => Promise<ReadonlyArray<LedgerEntry>>;
 }
+
+const DEFAULT_EMULATOR_PORT = 4000;
+
+const decodeHtmlAttribute = (value: string) =>
+  value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+
+const authorizationFormFields = (html: string) => {
+  const fields = new URLSearchParams();
+  for (const match of html.matchAll(
+    /<input\s+type="hidden"\s+name="([^"]+)"\s+value="([^"]*)"\s*\/?>/giu,
+  )) {
+    const [, name, value] = match;
+    if (name !== undefined && value !== undefined) {
+      fields.append(decodeHtmlAttribute(name), decodeHtmlAttribute(value));
+    }
+  }
+  if (!fields.has("client_id") || !fields.has("redirect_uri") || !fields.has("state")) {
+    throw new Error("MCP emulator authorization page returned no usable consent form");
+  }
+  return fields;
+};
 
 export const serveOAuthTestProvider = (port?: number) =>
   Effect.acquireRelease(
     Effect.promise(async (): Promise<{ provider: OAuthTestProvider; emulator: Emulator }> => {
+      const resolvedPort = port ?? DEFAULT_EMULATOR_PORT;
+      const baseUrl = `http://127.0.0.1:${resolvedPort}`;
       const emulator = await createEmulator({
         service: "mcp",
-        ...(port === undefined ? {} : { port }),
+        port: resolvedPort,
+        baseUrl,
       });
       return {
         emulator,
@@ -40,6 +70,35 @@ export const serveOAuthTestProvider = (port?: number) =>
               throw new Error("MCP emulator client registration returned no client_id");
             }
             return registration.client_id;
+          },
+          approveAuthorization: async (authorizationUrl, login) => {
+            const authorization = new URL(authorizationUrl);
+            if (authorization.origin !== new URL(emulator.url).origin) {
+              throw new Error("MCP emulator authorization URL uses an unexpected origin");
+            }
+            const consent = await fetch(authorization, {
+              headers: { accept: "text/html" },
+              redirect: "manual",
+            });
+            if (!consent.ok) {
+              throw new Error(`MCP emulator authorization page failed (${consent.status})`);
+            }
+            const fields = authorizationFormFields(await consent.text());
+            fields.set("login", login);
+            const approval = await fetch(`${emulator.url}/authorize/approve`, {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded" },
+              body: fields,
+              redirect: "manual",
+            });
+            if (approval.status !== 302) {
+              throw new Error(`MCP emulator authorization approval failed (${approval.status})`);
+            }
+            const location = approval.headers.get("location");
+            if (!location) {
+              throw new Error("MCP emulator authorization approval returned no callback URL");
+            }
+            return new URL(location, emulator.url).toString();
           },
           ledger: () => emulator.ledger.list(),
         },

@@ -28,7 +28,7 @@ use crate::{
         upstream::{
             http::{
                 DEFAULT_PROTOCOL_VERSION as HTTP_PROTOCOL_VERSION, StreamableHttpConfig,
-                StreamableHttpError, StreamableHttpTransport,
+                StreamableHttpError, StreamableHttpTransport, is_supported_protocol_version,
             },
             stdio::{
                 DEFAULT_PROTOCOL_VERSION as STDIO_PROTOCOL_VERSION, InitializeResult,
@@ -2661,7 +2661,7 @@ impl McpInvocationError {
 impl McpHttpSourceConfigurationV1 {
     fn decode(configuration: &Map<String, Value>) -> Result<Self, ProtocolError> {
         let decoded: Self = decode_configuration(configuration)?;
-        if decoded.negotiated_protocol_version != HTTP_PROTOCOL_VERSION {
+        if !is_supported_protocol_version(&decoded.negotiated_protocol_version) {
             return Err(corrupt_configuration());
         }
         validate_endpoint(&decoded.endpoint).map_err(|_| corrupt_configuration())?;
@@ -3134,7 +3134,7 @@ fn http_discovery_basis(
             "The MCP server returned invalid initialization metadata.",
         )
     })?;
-    if initialized.protocol_version != HTTP_PROTOCOL_VERSION {
+    if !is_supported_protocol_version(&initialized.protocol_version) {
         return Err(ProtocolError::new(
             ProtocolErrorCategory::Upstream,
             "mcp_protocol_version_mismatch",
@@ -4182,6 +4182,71 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn supported_http_protocol_versions_decode_for_discovery_and_persistence() {
+        for protocol_version in [HTTP_PROTOCOL_VERSION, "2025-06-18"] {
+            let basis = http_discovery_basis(
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "serverInfo": { "name": "fixture", "version": "1" }
+                }),
+                4,
+                Some(7),
+            )
+            .expect("supported HTTP discovery metadata decodes");
+            assert_eq!(basis.protocol_version, protocol_version);
+
+            let configuration = json!({
+                "endpoint": "https://example.com/mcp",
+                "allowPrivateNetwork": false,
+                "negotiatedProtocolVersion": protocol_version,
+            })
+            .as_object()
+            .expect("configuration is an object")
+            .clone();
+            let decoded = McpHttpSourceConfigurationV1::decode(&configuration)
+                .expect("supported persisted HTTP protocol version decodes");
+            assert_eq!(decoded.negotiated_protocol_version, protocol_version);
+        }
+    }
+
+    #[test]
+    fn old_and_unknown_http_protocol_versions_fail_discovery_and_persistence() {
+        for protocol_version in ["2025-03-26", "2099-01-01"] {
+            let discovery_error = http_discovery_basis(
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "serverInfo": { "name": "fixture", "version": "1" }
+                }),
+                0,
+                None,
+            )
+            .expect_err("unsupported HTTP discovery version is rejected");
+            assert_eq!(discovery_error.code, "mcp_protocol_version_mismatch");
+            assert_eq!(discovery_error.category, ProtocolErrorCategory::Upstream);
+
+            let configuration = json!({
+                "endpoint": "https://example.com/mcp",
+                "allowPrivateNetwork": false,
+                "negotiatedProtocolVersion": protocol_version,
+            })
+            .as_object()
+            .expect("configuration is an object")
+            .clone();
+            let Err(configuration_error) = McpHttpSourceConfigurationV1::decode(&configuration)
+            else {
+                panic!("unsupported persisted HTTP protocol version is rejected");
+            };
+            assert_eq!(configuration_error.code, "invalid_source_configuration");
+            assert_eq!(
+                configuration_error.category,
+                ProtocolErrorCategory::CorruptData
+            );
+        }
     }
 
     #[tokio::test]

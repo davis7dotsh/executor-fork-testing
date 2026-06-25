@@ -50,6 +50,17 @@ jobs:
       - name: Lint all targets and features
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      - name: Set up Bun for emulator-backed Rust tests
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install locked emulator dependency
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Verify OAuth test emulator
+        run: test -x e2e/node_modules/.bin/emulate
+
       - name: Test all targets and features
         run: cargo test --locked --all-targets --all-features
 

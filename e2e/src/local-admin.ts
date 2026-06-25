@@ -1,9 +1,12 @@
+import type { Identity } from "./target";
+
 export interface LocalTool {
   readonly id: string;
   readonly sourceId: string;
   readonly stableKey: string;
   readonly displayName: string;
   readonly callablePath: string;
+  readonly sandboxPath: string;
   readonly revision: number;
   readonly effectiveMode: { readonly mode: "enabled" | "ask" | "disabled" };
 }
@@ -24,11 +27,13 @@ export interface LocalToken {
 export class LocalAdminClient {
   readonly #origin: string;
   readonly #cookie: string;
+  readonly #cookiePairs: readonly string[];
   readonly #csrf: string;
 
-  private constructor(origin: string, cookie: string, csrf: string) {
+  private constructor(origin: string, cookiePairs: readonly string[], csrf: string) {
     this.#origin = origin;
-    this.#cookie = cookie;
+    this.#cookiePairs = [...cookiePairs];
+    this.#cookie = cookiePairs.join("; ");
     this.#csrf = csrf;
   }
 
@@ -48,7 +53,19 @@ export class LocalAdminClient {
       ?.slice("executor_csrf=".length);
     if (pairs.length === 0 || !csrf)
       throw new Error("administrator sign-in returned no CSRF cookie");
-    return new LocalAdminClient(origin, pairs.join("; "), csrf);
+    return new LocalAdminClient(origin, pairs, csrf);
+  }
+
+  asIdentity(label: string): Identity {
+    return {
+      label,
+      headers: { cookie: this.#cookie },
+      cookies: this.#cookiePairs.map((pair) => {
+        const separator = pair.indexOf("=");
+        if (separator <= 0) throw new Error("administrator sign-in returned an invalid cookie");
+        return { name: pair.slice(0, separator), value: pair.slice(separator + 1) };
+      }),
+    };
   }
 
   async createToken(name: string) {

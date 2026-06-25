@@ -144,6 +144,67 @@ async fn initialization_pins_session_and_protocol_for_followup_requests() {
 }
 
 #[tokio::test]
+async fn initialization_negotiates_legacy_and_pins_followup_headers() {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "serverInfo": { "name": "legacy", "version": "1" }
+        }
+    })
+    .to_string();
+    let tools = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "tools": [] }
+    })
+    .to_string();
+    let server = TestServer::start(vec![
+        response(
+            "200 OK",
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", "legacy-session"),
+            ],
+            &initialize,
+        ),
+        response("202 Accepted", &[], ""),
+        response("200 OK", &[("Content-Type", "application/json")], &tools),
+        response("204 No Content", &[], ""),
+    ])
+    .await;
+    let transport = make_transport(server.endpoint.clone());
+
+    transport
+        .initialize()
+        .await
+        .expect("legacy protocol negotiation succeeds");
+    transport
+        .list_tools(None, json!(1))
+        .await
+        .expect("legacy tools list succeeds");
+    transport
+        .terminate()
+        .await
+        .expect("legacy session termination succeeds");
+
+    let requests = server.finish().await;
+    assert!(requests[0].contains("\"protocolVersion\":\"2025-11-25\""));
+    assert!(
+        !requests[0]
+            .to_ascii_lowercase()
+            .contains("mcp-protocol-version:")
+    );
+    for request in &requests[1..] {
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("mcp-session-id: legacy-session"));
+        assert!(request.contains("mcp-protocol-version: 2025-06-18"));
+    }
+}
+
+#[tokio::test]
 async fn call_tool_accepts_sse_and_rejects_server_requests() {
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -564,44 +625,47 @@ async fn aborted_termination_keeps_cleanup_owned_until_delete_finishes() {
 }
 
 #[tokio::test]
-async fn protocol_mismatch_discards_the_server_session() {
-    let initialize = json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "result": { "protocolVersion": "2025-03-26", "capabilities": {} }
-    })
-    .to_string();
-    let server = TestServer::start(vec![
-        response(
-            "200 OK",
-            &[
-                ("Content-Type", "application/json"),
-                ("Mcp-Session-Id", "unusable"),
-            ],
-            &initialize,
-        ),
-        response("204 No Content", &[], ""),
-    ])
-    .await;
-    let transport = make_transport(server.endpoint.clone());
+async fn old_and_unknown_protocol_versions_discard_the_server_session() {
+    for (protocol_version, session_id) in [
+        ("2025-03-26", "old-session"),
+        ("2099-01-01", "unknown-session"),
+    ] {
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": { "protocolVersion": protocol_version, "capabilities": {} }
+        })
+        .to_string();
+        let server = TestServer::start(vec![
+            response(
+                "200 OK",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", session_id),
+                ],
+                &initialize,
+            ),
+            response("204 No Content", &[], ""),
+        ])
+        .await;
+        let transport = make_transport(server.endpoint.clone());
 
-    assert!(matches!(
-        transport.initialize().await,
-        Err(StreamableHttpError::ProtocolVersionMismatch)
-    ));
-    assert_eq!(transport.session_id().await, None);
-    assert!(matches!(
-        transport.list_tools(None, json!(1)).await,
-        Err(StreamableHttpError::NotInitialized)
-    ));
-    let requests = server.finish().await;
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].starts_with("DELETE /mcp HTTP/1.1"));
-    assert!(
-        requests[1]
-            .to_ascii_lowercase()
-            .contains("mcp-session-id: unusable")
-    );
+        assert!(matches!(
+            transport.initialize().await,
+            Err(StreamableHttpError::ProtocolVersionMismatch)
+        ));
+        assert_eq!(transport.session_id().await, None);
+        assert!(matches!(
+            transport.list_tools(None, json!(1)).await,
+            Err(StreamableHttpError::NotInitialized)
+        ));
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 2);
+        let cleanup = requests[1].to_ascii_lowercase();
+        assert!(cleanup.starts_with("delete /mcp http/1.1"));
+        assert!(cleanup.contains(&format!("mcp-session-id: {session_id}")));
+        assert!(cleanup.contains("mcp-protocol-version: 2025-11-25"));
+    }
 }
 
 #[tokio::test]

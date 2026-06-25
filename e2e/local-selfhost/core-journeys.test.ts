@@ -18,9 +18,19 @@ import type { Page } from "playwright";
 
 import { scenario } from "../src/scenario";
 import { LocalAdminClient, type LocalSource, type LocalToken } from "../src/local-admin";
+import {
+  expectLocatorChecked,
+  expectLocatorCount,
+  expectLocatorDisabled,
+  expectLocatorFocused,
+  expectLocatorText,
+  expectLocatorValue,
+  expectLocatorVisible,
+} from "../src/locator-assertions";
 import { serveOAuthTestProvider } from "../src/oauth-test-provider";
 import { e2ePort } from "../src/ports";
 import { Browser, Target } from "../src/services";
+import { openConnectSourcePanel } from "../src/source-panel";
 import { LOCAL_ADMIN, LOCAL_SETUP_BASE_URL } from "../targets/local-selfhost";
 
 const unique = (prefix: string) => `${prefix}-${randomBytes(4).toString("hex")}`;
@@ -96,13 +106,6 @@ const acquireToken = (client: LocalAdminClient, baseUrl: string, name: string) =
       }),
   );
 
-const openConnectSourcePanel = async (page: Page) => {
-  const panel = page.locator("details.import-panel");
-  if ((await panel.getAttribute("open")) === null) {
-    await panel.locator("summary").click();
-  }
-};
-
 const prepareInlineOpenApiSource = async (page: Page, document: string, displayName: string) => {
   await page.goto("/sources");
   await openConnectSourcePanel(page);
@@ -111,7 +114,7 @@ const prepareInlineOpenApiSource = async (page: Page, document: string, displayN
   await page.getByLabel("OpenAPI JSON or YAML").fill(document);
   await page.getByLabel("Allow private network addresses for this source").check();
   await page.getByRole("button", { name: "Preview tools" }).click();
-  await expect(page.getByLabel("Source name")).toBeVisible();
+  await expectLocatorVisible(page.getByLabel("Source name"));
   await page.getByLabel("Source name").fill(displayName);
 };
 
@@ -229,11 +232,11 @@ scenario(
         await page.goto(`${LOCAL_SETUP_BASE_URL}/setup#token=${encodeURIComponent(setupToken)}`);
         await expect.poll(() => new URL(page.url()).hash).toBe("");
         await page.getByLabel("Administrator username").fill("first-boot-admin");
-        await page.getByLabel("Password", { exact: true }).fill("first-boot-password-123");
+        await page.getByLabel(/^Password\b/).fill("first-boot-password-123");
         await page.getByLabel("Confirm password").fill("first-boot-password-123");
         await page.getByRole("button", { name: "Create administrator" }).click();
         await page.waitForURL((url) => url.pathname === "/sources");
-        await expect(page.getByRole("heading", { name: "Sources" })).toBeVisible();
+        await expectLocatorVisible(page.getByRole("heading", { name: "Sources" }));
       });
     });
     const replay = yield* Effect.promise(() =>
@@ -343,7 +346,7 @@ scenario(
               await page.getByRole("button", { name: "Sign in" }).click();
               await page.waitForURL((url) => url.pathname === "/sources");
               await page.goto("/tokens");
-              await expect(page.getByRole("heading", { name: "API tokens" })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: "API tokens" }));
             });
 
             const createAndDismissToken = async (index: number) => {
@@ -356,16 +359,16 @@ scenario(
               try {
                 await page.getByRole("button", { name: "Create token" }).click();
                 await gate.started;
-                await expect(
+                await expectLocatorDisabled(
                   page.getByRole("button", { name: "Creating token..." }),
-                ).toBeDisabled();
+                );
                 await page.getByRole("button", { name: "Sign out" }).click();
-                await expect(
+                await expectLocatorVisible(
                   page.getByRole("status").filter({
                     hasText:
                       "Wait for token creation to finish before leaving this page or signing out.",
                   }),
-                ).toBeVisible();
+                );
                 expect(
                   sessionDeletes,
                   "blocked sign-out does not destroy the administrator session",
@@ -379,7 +382,7 @@ scenario(
                 if (gate.hasStarted()) await gate.settled;
               }
 
-              await expect(page.getByLabel("API token")).toBeVisible();
+              await expectLocatorVisible(page.getByLabel("API token"));
               const secret = await page.getByLabel("API token").inputValue();
               const created = createdTokens[index];
               if (created === undefined) throw new Error("created token ID was not captured");
@@ -394,12 +397,12 @@ scenario(
               ).toBeGreaterThan(0);
 
               await page.getByRole("button", { name: "Sign out" }).click();
-              await expect(
+              await expectLocatorVisible(
                 page.getByRole("status").filter({
                   hasText:
                     "Save the token and choose “I saved it” before leaving this page or signing out.",
                 }),
-              ).toBeVisible();
+              );
               expect(sessionDeletes, "the unsaved reveal blocks session deletion too").toHaveLength(
                 0,
               );
@@ -408,7 +411,7 @@ scenario(
                 "the revealed secret remains on the guarded page",
               ).toBe("/tokens");
               await page.getByRole("button", { name: "I saved it" }).click();
-              await expect(page.getByLabel("API token")).toHaveCount(0);
+              await expectLocatorCount(page.getByLabel("API token"), 0);
             };
 
             await step("Create and safely dismiss the first unique token", async () => {
@@ -446,9 +449,9 @@ scenario(
               for (const tokenName of tokenNames) {
                 const exactName = page.getByText(tokenName, { exact: true });
                 const row = page.locator("tbody tr").filter({ has: exactName });
-                await expect(row, `${tokenName} selects one repeat-safe row`).toHaveCount(1);
-                await expect(row.locator('td[data-label="Status"]')).toContainText("Active");
-                await expect(row.locator('td[data-label="Token"] code')).toContainText("...");
+                await expectLocatorCount(row, 1, `${tokenName} selects one repeat-safe row`);
+                await expectLocatorText(row.locator('td[data-label="Status"]'), "Active");
+                await expectLocatorText(row.locator('td[data-label="Token"] code'), "...");
               }
             });
             await step("Revoke one exact token from the dashboard", async () => {
@@ -462,9 +465,9 @@ scenario(
               const confirmation = page.getByRole("dialog", {
                 name: `Stop using ${tokenName}?`,
               });
-              await expect(confirmation).toBeVisible();
+              await expectLocatorVisible(confirmation);
               await confirmation.getByRole("button", { name: "Revoke token" }).click();
-              await expect(row.locator('td[data-label="Status"]')).toContainText("Revoked");
+              await expectLocatorText(row.locator('td[data-label="Status"]'), "Revoked");
 
               const rejected = await fetch(
                 new URL("/api/v1/gateway/tools/invoke", target.baseUrl),
@@ -502,7 +505,7 @@ scenario(
                 "the traced administrator cookie is invalidated before artifacts close",
               ).toBe(204);
               await page.goto("/login");
-              await expect(page.getByLabel("Username")).toBeVisible();
+              await expectLocatorVisible(page.getByLabel("Username"));
             });
           }
         });
@@ -643,11 +646,11 @@ scenario(
             await step("Open Sources and see every supported protocol", async () => {
               await page.goto("/sources");
               for (const source of created) {
-                await expect(page.getByText(source.displayName, { exact: true })).toBeVisible();
+                await expectLocatorVisible(page.getByText(source.displayName, { exact: true }));
               }
-              await expect(page.getByText("OpenAPI", { exact: true }).last()).toBeVisible();
-              await expect(page.getByText("GraphQL", { exact: true }).last()).toBeVisible();
-              await expect(page.getByText("MCP HTTP", { exact: true }).last()).toBeVisible();
+              await expectLocatorVisible(page.getByText("OpenAPI", { exact: true }).last());
+              await expectLocatorVisible(page.getByText("GraphQL", { exact: true }).last());
+              await expectLocatorVisible(page.getByText("MCP HTTP", { exact: true }).last());
             });
           });
         }),
@@ -755,7 +758,7 @@ scenario(
                 .getByLabel("OAuth access token (manual, advanced)", { exact: true })
                 .fill(githubToken);
               await page.getByRole("button", { name: "Import source" }).click();
-              await expect(page.getByRole("heading", { name: names.openapi })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: names.openapi }));
             });
 
             await step("Connect GraphQL with a bearer token", async () => {
@@ -771,7 +774,7 @@ scenario(
               await page.getByLabel("Method").selectOption("bearer");
               await page.getByLabel("Bearer token").fill(githubToken);
               await page.getByRole("button", { name: "Connect source" }).click();
-              await expect(page.getByRole("heading", { name: names.graphql })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: names.graphql }));
             });
 
             await step("Connect MCP HTTP with a manually managed access token", async () => {
@@ -787,7 +790,7 @@ scenario(
               await page.getByLabel("Method").selectOption("oauth_access_token");
               await page.getByLabel("OAuth access token").fill(mcpToken);
               await page.getByRole("button", { name: "Connect source" }).click();
-              await expect(page.getByRole("heading", { name: names.mcpHttp })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: names.mcpHttp }));
             });
 
             await step("Connect the trusted local MCP stdio template", async () => {
@@ -803,7 +806,7 @@ scenario(
               await page.getByLabel("Source name").fill(names.mcpStdio);
               await page.getByLabel("EXECUTOR_E2E_STDIO_SECRET").fill(stdioSecret);
               await page.getByRole("button", { name: "Connect source" }).click();
-              await expect(page.getByRole("heading", { name: names.mcpStdio })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: names.mcpStdio }));
             });
 
             await step("Configure and connect managed OAuth from the dashboard", async () => {
@@ -817,12 +820,12 @@ scenario(
               await page.getByLabel("Source name").fill(names.managedOAuth);
               await page.getByLabel("Allow private network addresses for this source").check();
               await page.getByRole("button", { name: "Connect source" }).click();
-              await expect(page.getByRole("heading", { name: names.managedOAuth })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: names.managedOAuth }));
 
               const oauth = page.getByRole("region", {
                 name: `Managed OAuth for ${names.managedOAuth}`,
               });
-              await expect(oauth.getByLabel("Client ID")).toBeVisible();
+              await expectLocatorVisible(oauth.getByLabel("Client ID"));
               await oauth
                 .getByLabel("Authorization server override (optional)")
                 .fill(provider.issuer);
@@ -830,26 +833,28 @@ scenario(
               await oauth.getByLabel("Requested scopes").fill("repo read:user");
               await oauth.getByRole("button", { name: "Save configuration" }).click();
               const callback = oauth.getByLabel("Exact callback URL");
-              await expect(callback).toBeVisible();
+              await expectLocatorVisible(callback);
               const clientId = await provider.registerClient(await callback.inputValue());
               await oauth.getByLabel("Client ID").fill(clientId);
               await oauth.getByRole("button", { name: "Save configuration" }).click();
-              await expect(oauth.getByText("OAuth configuration saved")).toBeVisible();
+              await expectLocatorVisible(oauth.getByText("OAuth configuration saved"));
               await oauth.getByRole("button", { name: "Connect OAuth" }).click();
-              await page.getByRole("button", { name: /admin/i }).click();
-              await page.waitForURL(
+              const returnedToExecutor = page.waitForURL(
                 (url) => url.pathname === "/sources" && url.searchParams.has("oauth"),
+                { waitUntil: "commit" },
               );
-              await expect(page.getByText("OAuth authorization completed")).toBeVisible();
+              await page.getByRole("button", { name: /admin/i }).click();
+              await returnedToExecutor;
+              await expectLocatorVisible(page.getByText("OAuth authorization completed"));
               const connectedOauth = page.getByRole("region", {
                 name: `Managed OAuth for ${names.managedOAuth}`,
               });
-              await expect(connectedOauth.getByText("Connected", { exact: true })).toBeVisible();
+              await expectLocatorVisible(connectedOauth.getByText("Connected", { exact: true }));
               const card = page.getByRole("article").filter({
                 has: page.getByRole("heading", { name: names.managedOAuth, exact: true }),
               });
               await card.getByRole("button", { name: "Reconnect and refresh tools" }).click();
-              await expect(page.locator("#source-status")).toContainText("Source refreshed:");
+              await expectLocatorText(page.locator("#source-status"), "Source refreshed:");
             });
           });
 
@@ -984,11 +989,12 @@ scenario(
               async () => {
                 await page.goto("/sources");
                 for (const name of createdNames) {
-                  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+                  await expectLocatorVisible(page.getByRole("heading", { name, exact: true }));
                 }
-                await expect(
+                await expectLocatorText(
                   page.getByRole("region", { name: `Managed OAuth for ${names.managedOAuth}` }),
-                ).toContainText("Connected");
+                  "Connected",
+                );
               },
             );
             await step(
@@ -998,7 +1004,8 @@ scenario(
                   has: page.getByRole("heading", { name: names.openapi, exact: true }),
                 });
                 await card.getByRole("link", { name: "View tools" }).click();
-                await expect(page.getByRole("table")).toContainText(
+                await expectLocatorText(
+                  page.getByRole("table"),
                   "Exchange client credentials with Basic",
                 );
               },
@@ -1101,12 +1108,12 @@ scenario(
                 const reloaded = page.reload();
                 releaseLookup();
                 await reloaded;
-                await expect(
+                await expectLocatorVisible(
                   page.getByRole("status").filter({
                     hasText: "Executor is still finishing this source connection.",
                   }),
-                ).toBeVisible();
-                await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+                );
+                await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
                 await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
               } finally {
                 releaseLookup();
@@ -1213,11 +1220,11 @@ scenario(
                 const reloaded = page.reload();
                 releaseLookup();
                 await reloaded;
-                await expect(
+                await expectLocatorVisible(
                   page.getByText(
                     "The unused source connection key was sealed. You can start a new request.",
                   ),
-                ).toBeVisible();
+                );
                 await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
               } finally {
                 releaseLookup();
@@ -1278,7 +1285,7 @@ scenario(
               );
               await page.getByRole("button", { name: "Import source" }).click();
               const retry = page.getByRole("button", { name: "Retry exact request" });
-              await expect(retry).toBeVisible();
+              await expectLocatorVisible(retry);
               expect(attempts, "initial delivery and its automatic retry both failed").toHaveLength(
                 2,
               );
@@ -1292,7 +1299,7 @@ scenario(
               ).toEqual([attempts[0]?.body, attempts[0]?.body]);
 
               await retry.click();
-              await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
               expect(attempts, "the deliberate retry reached the server").toHaveLength(3);
               expect(attempts[2]?.key).toBe(attempts[0]?.key);
               expect(attempts[2]?.body).toBe(attempts[0]?.body);
@@ -1415,7 +1422,7 @@ scenario(
                 } finally {
                   releaseFirstLookup();
                 }
-                await expect(page.locator("#source-create-status")).toBeVisible();
+                await expectLocatorVisible(page.locator("#source-create-status"));
                 await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
                 expect(postCount, "failed replay recovery never resubmits the source").toBe(1);
                 expect(replayFailure?.status).toBe(originalFailure?.status);
@@ -1512,13 +1519,13 @@ scenario(
                   window.open("/sources", "_blank");
                 });
                 clone = await popup;
-                await expect(clone.getByRole("heading", { name: sourceName })).toBeVisible();
+                await expectLocatorVisible(clone.getByRole("heading", { name: sourceName }));
                 await expect.poll(() => clone?.evaluate(() => sessionStorage.length)).toBe(0);
                 expect(postCount, "the duplicated tab used lookup instead of POST").toBe(1);
               } finally {
                 releaseOriginal();
               }
-              await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
               expect(postCount, "both tabs converge on the original POST").toBe(1);
               await clone?.close();
             });
@@ -1673,7 +1680,7 @@ scenario(
                   await page.getByLabel("Password").fill(LOCAL_ADMIN.password);
                   await page.getByRole("button", { name: "Sign in" }).click();
                   await page.waitForURL((url) => url.pathname === "/sources");
-                  await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+                  await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
                   await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
                   expect(postCount, "authenticated recovery still uses the original POST").toBe(1);
                   expect(sealCount, "authenticated recovery never seals a committed key").toBe(0);
@@ -1776,7 +1783,7 @@ scenario(
                 await page.getByRole("button", { name: "Import source" }).click();
                 try {
                   await authoritativeListDelivered;
-                  await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+                  await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
                   releaseStaleList();
                   await staleListDelivered;
                   await page.evaluate(
@@ -1785,7 +1792,7 @@ scenario(
                         requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
                       }),
                   );
-                  await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+                  await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
                 } finally {
                   releaseStaleList();
                 }
@@ -1866,7 +1873,7 @@ scenario(
               await page.getByRole("button", { name: "Import source" }).click();
               try {
                 await submissionStarted;
-                await expect(page.getByLabel("Basic auth", { exact: true })).toHaveValue("");
+                await expectLocatorValue(page.getByLabel("Basic auth", { exact: true }), "");
                 const sourceTypes = page.getByRole("group", { name: "Source type" });
                 for (const connector of [
                   "OpenAPI service",
@@ -1874,10 +1881,10 @@ scenario(
                   "MCP over HTTP",
                   "Trusted local MCP template",
                 ]) {
-                  await expect(
+                  await expectLocatorDisabled(
                     sourceTypes.getByLabel(connector),
                     `${connector} stays locked during dispatch`,
-                  ).toBeDisabled();
+                  );
                 }
 
                 const unload = await page.evaluate(() => {
@@ -1915,18 +1922,18 @@ scenario(
                 await page.getByRole("link", { name: "Tools" }).click();
                 expect(new URL(page.url()).pathname).toBe("/sources");
                 const warning = page.locator("#source-navigation-status");
-                await expect(warning).toContainText("still being submitted");
-                await expect(warning).toBeFocused();
+                await expectLocatorText(warning, "still being submitted");
+                await expectLocatorFocused(warning);
 
                 await page
                   .goBack({ waitUntil: "domcontentloaded", timeout: 1_000 })
                   .catch(() => null);
                 expect(new URL(page.url()).pathname).toBe("/sources");
-                await expect(warning).toBeFocused();
+                await expectLocatorFocused(warning);
 
                 await page.getByRole("button", { name: "Sign out" }).click();
                 expect(new URL(page.url()).pathname).toBe("/sources");
-                await expect(warning).toBeFocused();
+                await expectLocatorFocused(warning);
                 expect(
                   sessionDeletes,
                   "blocked sign-out never destroys the administrator session",
@@ -1935,7 +1942,7 @@ scenario(
                 releaseSubmission();
               }
 
-              await expect(page.getByRole("heading", { name: sourceName })).toBeVisible();
+              await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
               await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
               await page.getByRole("link", { name: "Tools" }).click();
               await page.waitForURL((url) => url.pathname === "/tools");
@@ -1977,8 +1984,10 @@ scenario(
         }),
       );
       const catalog = yield* Effect.promise(() => client.listTools({ sourceId: source.id }));
-      const tool = catalog.items[0];
-      if (!tool) return yield* Effect.die("the mode fixture produced no tool");
+      const tool = catalog.items.find((candidate) =>
+        candidate.sandboxPath.endsWith(".echo_echo_message"),
+      );
+      if (!tool) return yield* Effect.die("the mode fixture produced no echo message tool");
       const token = yield* acquireToken(client, target.baseUrl, unique("mode-agent"));
       const invoke = (idempotencyKey?: string) => {
         const headers = new Headers({
@@ -1989,7 +1998,10 @@ scenario(
         return fetch(new URL("/api/v1/gateway/tools/invoke", target.baseUrl), {
           method: "POST",
           headers,
-          body: JSON.stringify({ path: tool.callablePath, arguments: { message: "Mode" } }),
+          body: JSON.stringify({
+            path: tool.callablePath,
+            arguments: { path: { message: "Mode" } },
+          }),
         });
       };
 
@@ -2010,9 +2022,10 @@ scenario(
                 const confirmation = card.getByRole("group", {
                   name: `Confirm default for ${name}`,
                 });
-                await expect(confirmation).toBeVisible();
+                await expectLocatorVisible(confirmation);
                 await confirmation.getByRole("button", { name: "Confirm broad change" }).click();
-                await expect(page.locator("#source-status")).toContainText(
+                await expectLocatorText(
+                  page.locator("#source-status"),
                   "Source default changed to Enabled",
                 );
               },
@@ -2023,7 +2036,7 @@ scenario(
               await page.getByLabel("Search tools").fill("echo");
               await page.getByRole("button", { name: "Search" }).click();
               await page.getByLabel("Source").selectOption({ label: name });
-              await expect(page.getByRole("table")).toContainText("echo");
+              await expectLocatorText(page.getByRole("table"), "echo");
             });
 
             await step(
@@ -2041,7 +2054,7 @@ scenario(
                 });
                 await toolModes.getByLabel("Disabled", { exact: true }).check();
                 expect((await changed).status(), "the row mutation reached the real API").toBe(200);
-                await expect(toolModes.getByLabel("Disabled", { exact: true })).toBeChecked();
+                await expectLocatorChecked(toolModes.getByLabel("Disabled", { exact: true }));
                 const denied = await invoke();
                 expect(
                   (await denied.json()) as unknown,
@@ -2058,11 +2071,13 @@ scenario(
                 const confirmation = page.getByRole("group", {
                   name: "Confirm bulk tool behavior",
                 });
-                await expect(confirmation).toContainText(
+                await expectLocatorText(
+                  confirmation,
                   "1 tool will become Enabled under its source default",
                 );
                 await confirmation.getByRole("button", { name: "Confirm Inherit" }).click();
-                await expect(page.locator("#bulk-status")).toContainText(
+                await expectLocatorText(
+                  page.locator("#bulk-status"),
                   "Inherit applied to 1 selected tool",
                 );
                 expect(
@@ -2087,7 +2102,7 @@ scenario(
               expect((await changed).status(), "the Ask row mutation reached the real API").toBe(
                 200,
               );
-              await expect(toolModes.getByLabel("Ask", { exact: true })).toBeChecked();
+              await expectLocatorChecked(toolModes.getByLabel("Ask", { exact: true }));
 
               const asked = await invoke(randomUUID());
               expect(asked.status, "the row-level Ask setting pauses the gateway call").toBe(202);
@@ -2095,10 +2110,10 @@ scenario(
                 readonly approval: { readonly id: string; readonly statusUrl: string };
               };
               await page.goto(`/approvals?approval=${encodeURIComponent(pending.approval.id)}`);
-              await expect(page.getByText(tool.callablePath, { exact: true }).last()).toBeVisible();
+              await expectLocatorVisible(page.getByText(tool.callablePath, { exact: true }).last());
               await page.getByRole("button", { name: "Approve once" }).click();
               await page.getByRole("button", { name: "Yes, approve once" }).click();
-              await expect(page.getByText(/was approved/i)).toBeVisible();
+              await expectLocatorVisible(page.getByText(/was approved/i));
               await expect
                 .poll(
                   async () => {
@@ -2115,7 +2130,7 @@ scenario(
               await page.goto(
                 `/tools?source=${encodeURIComponent(source.id)}&q=${encodeURIComponent("echo")}`,
               );
-              await expect(page.getByRole("table")).toContainText(tool.displayName);
+              await expectLocatorText(page.getByRole("table"), tool.displayName);
             });
 
             await step("Ask applies immediately to the selected tools", async () => {
@@ -2125,7 +2140,7 @@ scenario(
                 .getByLabel("Ask")
                 .check();
               await page.getByRole("button", { name: /^Apply Ask to \d+ selected$/ }).click();
-              await expect(page.locator("#bulk-status")).toContainText("Ask applied");
+              await expectLocatorText(page.locator("#bulk-status"), "Ask applied");
             });
 
             await step("Disabling many tools requires a second confirmation", async () => {
@@ -2150,33 +2165,33 @@ scenario(
                 name: "Confirm bulk tool behavior",
               });
               let cancel = confirmation.getByRole("button", { name: "Cancel" });
-              await expect(confirmation).toBeVisible();
-              await expect(cancel).toBeFocused();
-              await expect(selectAll).toBeDisabled();
-              await expect(selection).toBeDisabled();
-              await expect(bulkModes).toBeDisabled();
-              await expect(toolModes).toBeDisabled();
-              await expect(applyDisabled).toBeDisabled();
-              await expect(applyInherit).toBeDisabled();
+              await expectLocatorVisible(confirmation);
+              await expectLocatorFocused(cancel);
+              await expectLocatorDisabled(selectAll);
+              await expectLocatorDisabled(selection);
+              await expectLocatorDisabled(bulkModes);
+              await expectLocatorDisabled(toolModes);
+              await expectLocatorDisabled(applyDisabled);
+              await expectLocatorDisabled(applyInherit);
 
               await cancel.press("Escape");
-              await expect(confirmation).toHaveCount(0);
-              await expect(applyDisabled).toBeFocused();
+              await expectLocatorCount(confirmation, 0);
+              await expectLocatorFocused(applyDisabled);
 
               await applyDisabled.click();
               confirmation = page.getByRole("group", { name: "Confirm bulk tool behavior" });
               cancel = confirmation.getByRole("button", { name: "Cancel" });
-              await expect(cancel).toBeFocused();
+              await expectLocatorFocused(cancel);
               await cancel.click();
-              await expect(confirmation).toHaveCount(0);
-              await expect(applyDisabled).toBeFocused();
+              await expectLocatorCount(confirmation, 0);
+              await expectLocatorFocused(applyDisabled);
 
               await applyDisabled.click();
               confirmation = page.getByRole("group", { name: "Confirm bulk tool behavior" });
               await confirmation.getByRole("button", { name: "Confirm Disabled" }).click();
               const status = page.locator("#bulk-status");
-              await expect(status).toContainText("Disabled applied");
-              await expect(status).toBeFocused();
+              await expectLocatorText(status, "Disabled applied");
+              await expectLocatorFocused(status);
               const denied = await invoke();
               expect(
                 (await denied.json()) as unknown,
@@ -2195,7 +2210,7 @@ scenario(
                 .check();
               await page.getByRole("button", { name: /^Apply Enabled to \d+ selected$/ }).click();
               await page.getByRole("button", { name: "Confirm Enabled" }).click();
-              await expect(page.locator("#bulk-status")).toContainText("Enabled applied");
+              await expectLocatorText(page.locator("#bulk-status"), "Enabled applied");
               expect((await invoke()).status, "enabled tools are callable without approval").toBe(
                 200,
               );
@@ -2225,8 +2240,10 @@ scenario(
         }),
       );
       const catalog = yield* Effect.promise(() => client.listTools({ sourceId: source.id }));
-      const tool = catalog.items[0];
-      if (!tool) return yield* Effect.die("the MCP and CLI fixture produced no tool");
+      const tool = catalog.items.find((candidate) =>
+        candidate.sandboxPath.endsWith(".echo_echo_message"),
+      );
+      if (!tool) return yield* Effect.die("the MCP and CLI fixture produced no echo message tool");
       yield* Effect.promise(() => client.setToolMode(tool, "enabled"));
       const token = yield* acquireToken(client, target.baseUrl, unique("mcp-cli-agent"));
       const binary = process.env.E2E_EXECUTOR_BIN;
@@ -2245,13 +2262,13 @@ scenario(
           expect(sources.stdout, "the CLI lists the source catalog").toContain(source.slug);
           const search = yield* cli(["tools", "search", "echo"]);
           expect(search.stdout, "the CLI searches the same global tools").toContain(
-            tool.callablePath,
+            tool.sandboxPath,
           );
-          const described = yield* cli(["tools", "describe", tool.callablePath]);
+          const described = yield* cli(["tools", "describe", tool.sandboxPath]);
           expect(described.stdout, "the CLI describes the selected tool").toContain(
             tool.displayName,
           );
-          const called = yield* cli(["call", tool.callablePath, '{"message":"CLI"}']);
+          const called = yield* cli(["call", tool.sandboxPath, '{"path":{"message":"CLI"}}']);
           expect(called.stdout, "the CLI calls the enabled tool").toContain("CLI");
 
           const httpMcp = yield* Effect.acquireRelease(
@@ -2274,7 +2291,7 @@ scenario(
             httpMcp.callTool({
               name: "execute",
               arguments: {
-                code: `const values = await Promise.all([${tool.callablePath}({ message: "one" }), ${tool.callablePath}({ message: "two" })]); return values;`,
+                code: `const values = await Promise.all([${tool.callablePath}({ path: { message: "one" } }), ${tool.callablePath}({ path: { message: "two" } })]); return values;`,
               },
             }),
           );
@@ -2341,8 +2358,10 @@ scenario(
       yield* Effect.ensuring(
         Effect.gen(function* () {
           const page = yield* Effect.promise(() => client.listTools({ sourceId: source.id }));
-          const tool = page.items[0];
-          if (!tool) return yield* Effect.die("the approval fixture produced no tool");
+          const tool = page.items.find((candidate) =>
+            candidate.sandboxPath.endsWith(".echo_echo_message"),
+          );
+          if (!tool) return yield* Effect.die("the approval fixture produced no echo message tool");
           yield* Effect.promise(() => client.setToolMode(tool, "ask"));
           const token = yield* acquireToken(client, target.baseUrl, unique("approval-agent"));
           const invoke = yield* Effect.promise(() =>
@@ -2353,10 +2372,14 @@ scenario(
                 "content-type": "application/json",
                 "idempotency-key": randomUUID(),
               },
-              body: JSON.stringify({ path: tool.callablePath, arguments: { message: "Ada" } }),
+              body: JSON.stringify({
+                path: tool.callablePath,
+                arguments: { path: { message: "Ada" } },
+              }),
             }),
           );
-          expect(invoke.status, "Ask returns an accepted approval handle").toBe(202);
+          const invokeBody = yield* Effect.promise(() => invoke.clone().text());
+          expect(invoke.status, `Ask returns an accepted approval handle: ${invokeBody}`).toBe(202);
           const pending = (yield* Effect.promise(() => invoke.json())) as {
             readonly approval: { readonly id: string; readonly statusUrl: string };
           };
@@ -2372,19 +2395,19 @@ scenario(
           yield* browser.session(identity, async ({ page, step }) => {
             await step("Review the exact pending request", async () => {
               await page.goto(`/approvals?approval=${encodeURIComponent(pending.approval.id)}`);
-              await expect(page.getByText(tool.callablePath, { exact: true }).last()).toBeVisible();
-              await expect(page.getByText("Structural, redacted argument preview")).toBeVisible();
+              await expectLocatorVisible(page.getByText(tool.callablePath, { exact: true }).last());
+              await expectLocatorVisible(page.getByText("Structural, redacted argument preview"));
             });
             await step("Approve this invocation once", async () => {
               await page.getByRole("button", { name: "Approve once" }).click();
               await page.getByRole("button", { name: "Yes, approve once" }).click();
-              await expect(page.getByText(/was approved/i)).toBeVisible();
+              await expectLocatorVisible(page.getByText(/was approved/i));
             });
             await step("Open Logs and find the completed gateway request", async () => {
               await page.goto("/logs");
-              await expect(
+              await expectLocatorVisible(
                 page.getByText(tool.callablePath, { exact: true }).first(),
-              ).toBeVisible();
+              );
             });
           });
 
@@ -2460,18 +2483,23 @@ scenario(
           const authorization = yield* Effect.promise(() =>
             client.authorizeOAuthConnection(source.id, credentialKey, connection.revision),
           );
-          const identity = yield* target.newIdentity();
+          const identity = client.asIdentity(LOCAL_ADMIN.username);
           yield* browser.privateSession(identity, async ({ page, step }) => {
             await step(
               "Follow the provider authorization back to this exact connection",
               async () => {
-                await page.goto(authorization.authorizationUrl);
-                await page.getByRole("button", { name: /admin/i }).click();
-                await page.waitForURL(
-                  (url) => url.pathname === "/sources" && url.searchParams.has("oauth"),
+                const callbackUrl = await provider.approveAuthorization(
+                  authorization.authorizationUrl,
+                  LOCAL_ADMIN.username,
                 );
-                await expect(page.getByText("OAuth authorization completed")).toBeVisible();
-                await expect(page.getByText("Connected", { exact: true }).last()).toBeVisible();
+                const returnedToExecutor = page.waitForURL(
+                  (url) => url.pathname === "/sources" && url.searchParams.has("oauth"),
+                  { waitUntil: "commit" },
+                );
+                await page.goto(callbackUrl);
+                await returnedToExecutor;
+                await expectLocatorVisible(page.getByText("OAuth authorization completed"));
+                await expectLocatorVisible(page.getByText("Connected", { exact: true }).last());
               },
             );
           });
@@ -2481,11 +2509,11 @@ scenario(
           yield* browser.session(identity, async ({ page, step }) => {
             await step("Return to Sources and see the managed connection online", async () => {
               await page.goto("/sources");
-              await expect(page.getByText(source.displayName, { exact: true })).toBeVisible();
+              await expectLocatorVisible(page.getByText(source.displayName, { exact: true }));
               const oauth = page.getByRole("region", {
                 name: `Managed OAuth for ${source.displayName}`,
               });
-              await expect(oauth.getByText("Connected", { exact: true })).toBeVisible();
+              await expectLocatorVisible(oauth.getByText("Connected", { exact: true }));
             });
             await step(
               "Cancel OAuth deletion with the keyboard and return to its opener",
@@ -2499,11 +2527,11 @@ scenario(
                   name: "Delete this OAuth configuration?",
                 });
                 const cancel = confirmation.getByRole("button", { name: "Cancel" });
-                await expect(confirmation).toBeVisible();
-                await expect(cancel).toBeFocused();
+                await expectLocatorVisible(confirmation);
+                await expectLocatorFocused(cancel);
                 await cancel.press("Escape");
-                await expect(confirmation).toHaveCount(0);
-                await expect(deleteOpener).toBeFocused();
+                await expectLocatorCount(confirmation, 0);
+                await expectLocatorFocused(deleteOpener);
               },
             );
           });

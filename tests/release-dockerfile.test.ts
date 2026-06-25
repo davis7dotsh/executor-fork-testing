@@ -77,6 +77,17 @@ describe("native release artifact reuse", () => {
     );
   });
 
+  it("enables cargo-about's CLI binary everywhere it is installed", () => {
+    const installs = [dockerfile, release].flatMap(
+      (source) => source.match(/cargo install cargo-about[^\n]*/gu) ?? [],
+    );
+
+    expect(installs.length).toBeGreaterThan(0);
+    for (const install of installs) {
+      expect(install).toContain("--features cli");
+    }
+  });
+
   it("builds each release image from its matching Linux archive and assembles a manifest", () => {
     const containers = release.slice(release.indexOf("  build-container-dry-run:"));
     expect(containers).toContain("name: executor-release-artifacts");

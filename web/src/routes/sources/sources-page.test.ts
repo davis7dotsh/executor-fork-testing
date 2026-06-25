@@ -1668,6 +1668,7 @@ describe("Sources page coordination", () => {
     );
     render(SourcesPageHarness);
 
+    await screen.findByRole("region", { name: "Managed OAuth for Product API" });
     const manage = await screen.findByRole<HTMLButtonElement>("button", {
       name: "Manage credentials",
     });
@@ -1678,7 +1679,11 @@ describe("Sources page coordination", () => {
     window.dispatchEvent(loadUnload);
     expect(loadUnload.defaultPrevented).toBe(false);
     await fireEvent.input(token, { target: { value: "graphql-secret" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
+    const saveReplacement = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Save replacement",
+    });
+    await waitFor(() => expect(saveReplacement.disabled).toBe(false));
+    await fireEvent.click(saveReplacement);
     await waitFor(() => expect(request.signal).not.toBeNull());
     await expectPendingWriteFence(() => logoutCalls);
     expect(request.signal?.aborted).toBe(false);
@@ -1726,6 +1731,7 @@ describe("Sources page coordination", () => {
     );
     render(SourcesPageHarness);
 
+    await screen.findByRole("region", { name: "Managed OAuth for Issue tracker" });
     const manage = await screen.findByRole<HTMLButtonElement>("button", {
       name: "Manage credentials",
     });
@@ -1736,7 +1742,11 @@ describe("Sources page coordination", () => {
     window.dispatchEvent(loadUnload);
     expect(loadUnload.defaultPrevented).toBe(false);
     await fireEvent.input(token, { target: { value: "mcp-secret" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Save replacement" }));
+    const saveReplacement = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Save replacement",
+    });
+    await waitFor(() => expect(saveReplacement.disabled).toBe(false));
+    await fireEvent.click(saveReplacement);
     await waitFor(() => expect(request.signal).not.toBeNull());
     await expectPendingWriteFence(() => logoutCalls);
     expect(request.signal?.aborted).toBe(false);

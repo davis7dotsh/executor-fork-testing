@@ -24,6 +24,11 @@ use crate::outbound::{
 };
 
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [DEFAULT_PROTOCOL_VERSION, "2025-06-18"];
+
+pub(crate) fn is_supported_protocol_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
 
 const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 const MCP_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
@@ -359,9 +364,7 @@ impl StreamableHttpTransport {
         let selected_version =
             serde_json::from_value::<ProtocolVersion>(selected_version_value.clone())
                 .map_err(|_| StreamableHttpError::InvalidResponse)?;
-        if selected_version != self.requested_protocol_version
-            || selected_version != ProtocolVersion::V_2025_11_25
-        {
+        if !is_supported_protocol_version(selected_version.as_str()) {
             return Err(StreamableHttpError::ProtocolVersionMismatch);
         }
         self.lock_state().negotiated_protocol_version = Some(selected_version);

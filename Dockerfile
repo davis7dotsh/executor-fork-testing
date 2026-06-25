@@ -44,7 +44,7 @@ COPY --from=web-builder /build/web/build ./web/build
 
 RUN --mount=type=cache,id=executor-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=executor-cargo-target-${TARGETARCH},target=/build/target,sharing=locked \
-    cargo install cargo-about --version 0.9.0 --locked && \
+    cargo install cargo-about --version 0.9.0 --locked --features cli && \
     cargo about generate about.hbs > THIRD_PARTY_LICENSES.html && \
     cargo build --locked --release && \
     cp target/release/executor /usr/local/bin/executor
