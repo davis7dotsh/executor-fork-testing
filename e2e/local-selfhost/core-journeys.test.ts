@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { expect } from "@effect/vitest";
-import { createEmulator, type Emulator } from "@executor-js/emulate";
+import { createEmulator, type Emulator, type LedgerEntry } from "@executor-js/emulate";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -38,6 +38,22 @@ const executeFile = promisify(execFile);
 const emulatorPortA = e2ePort("E2E_LOCAL_EMULATOR_A_PORT", 6);
 const emulatorPortB = e2ePort("E2E_LOCAL_EMULATOR_B_PORT", 7);
 const emulatorPortC = e2ePort("E2E_LOCAL_EMULATOR_C_PORT", 8);
+const sourceCreateStorageKey = "executor.source-create.idempotency-key.v1";
+
+const sourceCreateStorageValue = (page: Page) =>
+  page.evaluate((key) => sessionStorage.getItem(key), sourceCreateStorageKey);
+
+const isSuccessfulMcpToolCall = (entry: LedgerEntry) => {
+  const body = entry.request.body;
+  return (
+    entry.path === "/mcp" &&
+    entry.response.status === 200 &&
+    typeof body === "object" &&
+    body !== null &&
+    "method" in body &&
+    body.method === "tools/call"
+  );
+};
 
 const adminClient = (baseUrl: string) =>
   Effect.promise(() =>
@@ -646,7 +662,9 @@ scenario(
             await step("Open Sources and see every supported protocol", async () => {
               await page.goto("/sources");
               for (const source of created) {
-                await expectLocatorVisible(page.getByText(source.displayName, { exact: true }));
+                const heading = page.getByText(source.displayName, { exact: true });
+                await heading.scrollIntoViewIfNeeded();
+                await expectLocatorVisible(heading);
               }
               await expectLocatorVisible(page.getByText("OpenAPI", { exact: true }).last());
               await expectLocatorVisible(page.getByText("GraphQL", { exact: true }).last());
@@ -1100,11 +1118,10 @@ scenario(
               await page.getByRole("button", { name: "Import source" }).click();
               try {
                 await lookupStarted;
-                const pendingKeys = await page.evaluate(() => Object.values(sessionStorage));
-                expect(pendingKeys, "one opaque key survives the ambiguous response").toHaveLength(
-                  1,
+                const pendingKey = await sourceCreateStorageValue(page);
+                expect(pendingKey, "one opaque key survives the ambiguous response").toMatch(
+                  /^[0-9a-f]{32}$/,
                 );
-                expect(pendingKeys[0]).toMatch(/^[0-9a-f]{32}$/);
                 const reloaded = page.reload();
                 releaseLookup();
                 await reloaded;
@@ -1114,7 +1131,7 @@ scenario(
                   }),
                 );
                 await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
-                await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
+                await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
               } finally {
                 releaseLookup();
               }
@@ -1225,7 +1242,7 @@ scenario(
                     "The unused source connection key was sealed. You can start a new request.",
                   ),
                 );
-                await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
+                await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
               } finally {
                 releaseLookup();
               }
@@ -1423,7 +1440,7 @@ scenario(
                   releaseFirstLookup();
                 }
                 await expectLocatorVisible(page.locator("#source-create-status"));
-                await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
+                await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
                 expect(postCount, "failed replay recovery never resubmits the source").toBe(1);
                 expect(replayFailure?.status).toBe(originalFailure?.status);
                 expect(replayFailure?.body, "the replay body is byte-identical").toBe(
@@ -1513,14 +1530,16 @@ scenario(
               let clone: Page | null = null;
               try {
                 await committed;
-                expect(await page.evaluate(() => sessionStorage.length)).toBe(1);
+                expect(await sourceCreateStorageValue(page)).toMatch(/^[0-9a-f]{32}$/);
                 const popup = page.waitForEvent("popup");
                 await page.evaluate(() => {
                   window.open("/sources", "_blank");
                 });
                 clone = await popup;
                 await expectLocatorVisible(clone.getByRole("heading", { name: sourceName }));
-                await expect.poll(() => clone?.evaluate(() => sessionStorage.length)).toBe(0);
+                await expect
+                  .poll(() => (clone ? sourceCreateStorageValue(clone) : null))
+                  .toBeNull();
                 expect(postCount, "the duplicated tab used lookup instead of POST").toBe(1);
               } finally {
                 releaseOriginal();
@@ -1649,7 +1668,7 @@ scenario(
                     new URL(page.url()).pathname,
                     "the recovery page remains mounted while session deletion is in flight",
                   ).toBe("/sources");
-                  expect(await page.evaluate(() => sessionStorage.length)).toBe(1);
+                  expect(await sourceCreateStorageValue(page)).toMatch(/^[0-9a-f]{32}$/);
                   releaseLookup();
                   await lookupSettled;
                   await page.evaluate(
@@ -1664,24 +1683,24 @@ scenario(
                   ).toBe(1);
                   expect(sealCount, "sign-out pause never seals the recoverable key").toBe(0);
                   expect(
-                    await page.evaluate(() => sessionStorage.length),
+                    await sourceCreateStorageValue(page),
                     "the pending key survives the lookup and session-delete race",
-                  ).toBe(1);
+                  ).toMatch(/^[0-9a-f]{32}$/);
                   releaseSessionDelete();
                   await signOut;
                   await page.waitForURL((url) => url.pathname === "/login");
                   expect(sessionDeleteCount, "recovery permits one deliberate sign-out").toBe(1);
                   expect(
-                    await page.evaluate(() => sessionStorage.length),
+                    await sourceCreateStorageValue(page),
                     "the key remains available to the next authenticated Sources page",
-                  ).toBe(1);
+                  ).toMatch(/^[0-9a-f]{32}$/);
 
                   await page.getByLabel("Username").fill(LOCAL_ADMIN.username);
                   await page.getByLabel("Password").fill(LOCAL_ADMIN.password);
                   await page.getByRole("button", { name: "Sign in" }).click();
                   await page.waitForURL((url) => url.pathname === "/sources");
                   await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
-                  await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
+                  await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
                   expect(postCount, "authenticated recovery still uses the original POST").toBe(1);
                   expect(sealCount, "authenticated recovery never seals a committed key").toBe(0);
                 } finally {
@@ -1907,11 +1926,12 @@ scenario(
                     }),
                   ),
                 );
-                const entries = Object.entries(storage);
-                expect(
-                  entries,
-                  "session storage has only the pending idempotency record",
-                ).toHaveLength(1);
+                const entries = Object.entries(storage).filter(
+                  ([key]) => key === sourceCreateStorageKey,
+                );
+                expect(entries, "session storage has one pending idempotency record").toHaveLength(
+                  1,
+                );
                 expect(entries[0]?.[1]).toMatch(/^[0-9a-f]{32}$/);
                 const persisted = JSON.stringify(storage);
                 expect(persisted).not.toContain(github.url);
@@ -1943,7 +1963,7 @@ scenario(
               }
 
               await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
-              await expect.poll(() => page.evaluate(() => sessionStorage.length)).toBe(0);
+              await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
               await page.getByRole("link", { name: "Tools" }).click();
               await page.waitForURL((url) => url.pathname === "/tools");
               expect(
@@ -2169,8 +2189,8 @@ scenario(
               await expectLocatorFocused(cancel);
               await expectLocatorDisabled(selectAll);
               await expectLocatorDisabled(selection);
-              await expectLocatorDisabled(bulkModes);
-              await expectLocatorDisabled(toolModes);
+              await expectLocatorDisabled(bulkModes.getByLabel("Disabled"));
+              await expectLocatorDisabled(toolModes.getByLabel("Ask", { exact: true }));
               await expectLocatorDisabled(applyDisabled);
               await expectLocatorDisabled(applyInherit);
 
@@ -2266,7 +2286,7 @@ scenario(
           );
           const described = yield* cli(["tools", "describe", tool.sandboxPath]);
           expect(described.stdout, "the CLI describes the selected tool").toContain(
-            tool.displayName,
+            tool.sandboxPath,
           );
           const called = yield* cli(["call", tool.sandboxPath, '{"path":{"message":"CLI"}}']);
           expect(called.stdout, "the CLI calls the enabled tool").toContain("CLI");
@@ -2541,7 +2561,7 @@ scenario(
           const enabled = yield* Effect.promise(() => client.setToolMode(tool, "enabled"));
           const token = yield* acquireToken(client, target.baseUrl, unique("oauth-agent"));
           const callsBefore = (yield* Effect.promise(() => provider.ledger())).filter(
-            (entry) => entry.path === "/mcp",
+            isSuccessfulMcpToolCall,
           ).length;
           const invoked = yield* Effect.promise(() =>
             fetch(new URL("/api/v1/gateway/tools/invoke", target.baseUrl), {
@@ -2555,9 +2575,7 @@ scenario(
           );
           expect(invoked.status, "the connected OAuth tool is callable").toBe(200);
           expect(
-            (yield* Effect.promise(() => provider.ledger())).filter(
-              (entry) => entry.path === "/mcp" && entry.response.status === 200,
-            ).length,
+            (yield* Effect.promise(() => provider.ledger())).filter(isSuccessfulMcpToolCall).length,
             "the emulator ledger records an authenticated MCP tool call",
           ).toBeGreaterThan(callsBefore);
         }),

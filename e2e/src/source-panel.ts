@@ -11,8 +11,10 @@ export interface SourcePanelPage {
 
 const sourcePanelSelector = "details.import-panel";
 const sourcePickerSelector = "fieldset.source-type-picker";
+const settledSourceCatalogSelector = 'div.source-grid[aria-busy="false"], section.empty-state';
 
 export const openConnectSourcePanel = async (page: SourcePanelPage) => {
+  await page.locator(settledSourceCatalogSelector).waitFor({ state: "attached" });
   const picker = page.locator(sourcePickerSelector);
   await picker.waitFor({ state: "attached" });
   const panel = page.locator(sourcePanelSelector);

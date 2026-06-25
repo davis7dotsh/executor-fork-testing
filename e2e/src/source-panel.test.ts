@@ -4,6 +4,7 @@ import { openConnectSourcePanel, type SourcePanelPage } from "./source-panel";
 
 const sourcePanelSelector = "details.import-panel";
 const sourcePickerSelector = "fieldset.source-type-picker";
+const settledSourceCatalogSelector = 'div.source-grid[aria-busy="false"], section.empty-state';
 
 const fixture = (initiallyOpen: boolean, autoOpenBeforeFirstClick = false) => {
   const calls: string[] = [];
@@ -45,6 +46,7 @@ it("does not click a source panel that is visible once its picker is attached", 
   await openConnectSourcePanel(page);
 
   expect(calls).toEqual([
+    `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
     `visible:${sourcePickerSelector}`,
@@ -58,6 +60,7 @@ it("opens an attached source picker when its panel is closed", async () => {
   await openConnectSourcePanel(page);
 
   expect(calls).toEqual([
+    `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
     `visible:${sourcePickerSelector}`,
@@ -73,6 +76,7 @@ it("reopens a panel that auto-opens between the visibility check and click", asy
   await openConnectSourcePanel(page);
 
   expect(calls).toEqual([
+    `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
     `visible:${sourcePickerSelector}`,
