@@ -122,9 +122,14 @@ const acquireToken = (client: LocalAdminClient, baseUrl: string, name: string) =
       }),
   );
 
-const prepareInlineOpenApiSource = async (page: Page, document: string, displayName: string) => {
+const prepareInlineOpenApiSource = async (
+  page: Page,
+  document: string,
+  displayName: string,
+  options: { readonly waitForCatalog?: boolean } = {},
+) => {
   await page.goto("/sources");
-  await openConnectSourcePanel(page);
+  await openConnectSourcePanel(page, options);
   await page.getByRole("group", { name: "Source type" }).getByLabel("OpenAPI service").check();
   await page.getByLabel("Paste document").check();
   await page.getByLabel("OpenAPI JSON or YAML").fill(document);
@@ -666,9 +671,11 @@ scenario(
                 await heading.scrollIntoViewIfNeeded();
                 await expectLocatorVisible(heading);
               }
-              await expectLocatorVisible(page.getByText("OpenAPI", { exact: true }).last());
-              await expectLocatorVisible(page.getByText("GraphQL", { exact: true }).last());
-              await expectLocatorVisible(page.getByText("MCP HTTP", { exact: true }).last());
+              for (const protocol of ["OpenAPI", "GraphQL", "MCP HTTP"]) {
+                const label = page.getByText(protocol, { exact: true }).last();
+                await label.scrollIntoViewIfNeeded();
+                await expectLocatorVisible(label);
+              }
             });
           });
         }),
@@ -1797,6 +1804,7 @@ scenario(
                   page,
                   minimalOpenApiDocument(github.url, sourceName),
                   sourceName,
+                  { waitForCatalog: false },
                 );
                 await staleListCaptured;
                 await page.getByRole("button", { name: "Import source" }).click();
@@ -1945,9 +1953,25 @@ scenario(
                 await expectLocatorText(warning, "still being submitted");
                 await expectLocatorFocused(warning);
 
-                await page
-                  .goBack({ waitUntil: "domcontentloaded", timeout: 1_000 })
+                const unloadPrompt = page
+                  .waitForEvent("dialog", { timeout: 2_000 })
                   .catch(() => null);
+                const historyNavigation = page
+                  .goBack({
+                    waitUntil: "domcontentloaded",
+                    timeout: 2_000,
+                  })
+                  .catch(() => null);
+                const dialog = await unloadPrompt;
+                const dialogType = dialog?.type() ?? null;
+                expect(
+                  [null, "beforeunload"],
+                  "history navigation either cancels in-app or raises the native unload guard",
+                ).toContain(dialogType);
+                if (dialog !== null) {
+                  await dialog.dismiss();
+                }
+                await historyNavigation;
                 expect(new URL(page.url()).pathname).toBe("/sources");
                 await expectLocatorFocused(warning);
 

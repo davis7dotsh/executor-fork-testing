@@ -15,9 +15,9 @@ const fixture = (initiallyOpen: boolean, autoOpenBeforeFirstClick = false) => {
     async waitFor(options: { readonly state: "attached" | "visible" }) {
       calls.push(`wait:${selector}:${options.state}`);
     },
-    async isVisible() {
-      calls.push(`visible:${selector}`);
-      return selector === sourcePickerSelector ? panelOpen : true;
+    async getAttribute(name: string) {
+      calls.push(`attribute:${selector}:${name}`);
+      return selector === sourcePanelSelector && name === "open" && panelOpen ? "" : null;
     },
     locator(child: string) {
       calls.push(`locator:${selector}:${child}`);
@@ -49,7 +49,7 @@ it("does not click a source panel that is visible once its picker is attached", 
     `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
-    `visible:${sourcePickerSelector}`,
+    `attribute:${sourcePanelSelector}:open`,
     `wait:${sourcePickerSelector}:visible`,
   ]);
 });
@@ -63,14 +63,14 @@ it("opens an attached source picker when its panel is closed", async () => {
     `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
-    `visible:${sourcePickerSelector}`,
+    `attribute:${sourcePanelSelector}:open`,
     `click:${sourcePanelSelector} summary`,
-    `visible:${sourcePickerSelector}`,
+    `attribute:${sourcePanelSelector}:open`,
     `wait:${sourcePickerSelector}:visible`,
   ]);
 });
 
-it("reopens a panel that auto-opens between the visibility check and click", async () => {
+it("reopens a panel that auto-opens between the open-state check and click", async () => {
   const { calls, page } = fixture(false, true);
 
   await openConnectSourcePanel(page);
@@ -79,10 +79,25 @@ it("reopens a panel that auto-opens between the visibility check and click", asy
     `wait:${settledSourceCatalogSelector}:attached`,
     `wait:${sourcePickerSelector}:attached`,
     `locator:${sourcePanelSelector}:summary`,
-    `visible:${sourcePickerSelector}`,
+    `attribute:${sourcePanelSelector}:open`,
     `click:${sourcePanelSelector} summary`,
-    `visible:${sourcePickerSelector}`,
+    `attribute:${sourcePanelSelector}:open`,
     `click:${sourcePanelSelector} summary`,
+    `wait:${sourcePickerSelector}:visible`,
+  ]);
+});
+
+it("opens the panel without waiting for an intentionally gated catalog request", async () => {
+  const { calls, page } = fixture(false);
+
+  await openConnectSourcePanel(page, { waitForCatalog: false });
+
+  expect(calls).toEqual([
+    `wait:${sourcePickerSelector}:attached`,
+    `locator:${sourcePanelSelector}:summary`,
+    `attribute:${sourcePanelSelector}:open`,
+    `click:${sourcePanelSelector} summary`,
+    `attribute:${sourcePanelSelector}:open`,
     `wait:${sourcePickerSelector}:visible`,
   ]);
 });
