@@ -27,7 +27,7 @@ import {
   expectLocatorValue,
   expectLocatorVisible,
 } from "../src/locator-assertions";
-import { serveOAuthTestProvider } from "../src/oauth-test-provider";
+import { approveOAuthTestAuthorization, serveOAuthTestProvider } from "../src/oauth-test-provider";
 import { e2ePort } from "../src/ports";
 import { Browser, Target } from "../src/services";
 import { openConnectSourcePanel } from "../src/source-panel";
@@ -754,6 +754,8 @@ scenario(
         issuer: staticMcp.url,
         endpoint: `${staticMcp.url}/mcp`,
         registerClient: (redirectUri: string) => registerMcpOAuthClient(staticMcp.url, redirectUri),
+        approveAuthorization: (authorizationUrl: string, login: string) =>
+          approveOAuthTestAuthorization(staticMcp.url, authorizationUrl, login),
         ledger: () => staticMcp.ledger.list(),
       };
       const suffix = randomBytes(3).toString("hex");
@@ -891,12 +893,22 @@ scenario(
               await oauth.getByLabel("Client ID").fill(clientId);
               await oauth.getByRole("button", { name: "Save configuration" }).click();
               await expectLocatorVisible(oauth.getByText("OAuth configuration saved"));
+              const reachedProvider = page.waitForURL(
+                (url) =>
+                  url.origin === new URL(provider.issuer).origin && url.pathname === "/authorize",
+                { waitUntil: "commit" },
+              );
               await oauth.getByRole("button", { name: "Connect OAuth" }).click();
+              await reachedProvider;
+              const callbackUrl = await provider.approveAuthorization(
+                page.url(),
+                LOCAL_ADMIN.username,
+              );
               const returnedToExecutor = page.waitForURL(
                 (url) => url.pathname === "/sources" && url.searchParams.has("oauth"),
                 { waitUntil: "commit" },
               );
-              await page.getByRole("button", { name: /admin/i }).click();
+              await page.goto(callbackUrl);
               await returnedToExecutor;
               await expectLocatorVisible(page.getByText("OAuth authorization completed"));
               const connectedOauth = page.getByRole("region", {
