@@ -3,10 +3,12 @@ import { defineConfig } from "vite";
 import appPlugin from "./vite";
 
 // Standalone Vite config for iterating on the SPA in isolation, without
-// the apps/local API middleware or Electron sidecar. API/MCP calls fail
+// the legacy/local API middleware or Electron sidecar. API/MCP calls fail
 // here unless a separate server is running.
-const LOCAL_CONFIG = fileURLToPath(new URL("../../apps/local/executor.config.ts", import.meta.url));
-const LOCAL_JSONC = fileURLToPath(new URL("../../apps/local/executor.jsonc", import.meta.url));
+const LOCAL_CONFIG = fileURLToPath(
+  new URL("../../legacy/local/executor.config.ts", import.meta.url),
+);
+const LOCAL_JSONC = fileURLToPath(new URL("../../legacy/local/executor.jsonc", import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
 export default defineConfig({

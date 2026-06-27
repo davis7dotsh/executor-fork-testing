@@ -1,6 +1,6 @@
 // Regression for issue #1125: on the macOS desktop app the native traffic-light
 // window controls are drawn over the frameless web content at
-// trafficLightPosition {x:16,y:17} (apps/desktop/src/main/index.ts) — three
+// trafficLightPosition {x:16,y:17} (legacy/desktop/src/main/index.ts) — three
 // 12px buttons with 20px center spacing, occupying x ∈ [16, 68].
 //
 // The original bug: the window minWidth was 720 but the web layout switches to
@@ -40,7 +40,7 @@ import { _electron, type ElectronApplication, type Locator, type Page } from "pl
 import { scenario } from "../src/scenario";
 import { RunDir } from "../src/services";
 
-const appDir = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appDir = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 const electronBinary = createRequire(join(appDir, "package.json"))("electron") as string;
 
 // Rightmost edge of the traffic-light cluster (left edges 16/36/56, +12px) plus

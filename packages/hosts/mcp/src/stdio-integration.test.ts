@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "../../../..");
-const cliEntry = resolve(repoRoot, "apps/cli/src/main.ts");
-const testScope = resolve(repoRoot, "apps/local");
+const cliEntry = resolve(repoRoot, "legacy/cli/src/main.ts");
+const testScope = resolve(repoRoot, "legacy/local");
 
 describe("MCP stdio integration", () => {
   it.effect(

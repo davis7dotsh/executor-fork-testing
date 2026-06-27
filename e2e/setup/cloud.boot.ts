@@ -12,7 +12,7 @@ import { createEmulator } from "@executor-js/emulate";
 
 import { bootProcesses, waitForHttp } from "./boot";
 
-export const cloudDir = fileURLToPath(new URL("../../apps/cloud/", import.meta.url));
+export const cloudDir = fileURLToPath(new URL("../../legacy/cloud/", import.meta.url));
 
 export interface CloudBootOptions {
   readonly cloudPort: number;

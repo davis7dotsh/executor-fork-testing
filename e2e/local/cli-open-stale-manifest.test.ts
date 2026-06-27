@@ -67,7 +67,7 @@ scenario(
       writeFileSync(openerPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       chmodSync(openerPath, 0o755);
 
-      const { stdout, stderr } = await execFileAsync("bun", ["run", "dev:cli", "open"], {
+      const { stdout, stderr } = await execFileAsync("bun", ["run", "legacy:dev:cli", "open"], {
         cwd: repoRoot,
         env: {
           ...process.env,

@@ -1,184 +1,191 @@
-# executor
+# Executor
 
-[https://github.com/user-attachments/assets/11225f83-e848-42ba-99b2-a993bcc88dad](https://github.com/user-attachments/assets/11225f83-e848-42ba-99b2-a993bcc88dad)
+Executor is a single-user, self-hosted tool gateway for AI agents. One Rust
+binary serves the Svelte dashboard, stores state in SQLite, exposes an MCP
+endpoint, and runs concurrent TypeScript tool workflows in isolated QuickJS
+workers.
 
-The integration layer for AI agents. One catalog for every tool, shared across every agent you use.
+The active product supports:
 
-[Ask DeepWiki](https://deepwiki.com/RhysSullivan/executor)
+- OpenAPI, GraphQL, and MCP sources
+- API key, bearer, basic, manual OAuth token, and managed OAuth credentials
+- one global tool catalog with Enabled, Ask, and Disabled modes
+- interactive approval for sensitive calls
+- a stateful Streamable HTTP MCP endpoint and a local stdio bridge
+- native Linux and macOS binaries, plus Docker
 
-## Quick start
+Windows is not a release target. The previous TypeScript CLI, local app,
+hosted deployments, managed cloud, and Electron products are archived in
+[`legacy/`](legacy/README.md).
 
-```bash
-npm install -g executor
-executor install
-executor web
+`Cargo.toml` is the native product version source. Published releases provide
+four checksum-verified Linux and macOS archives plus the multi-platform
+`ghcr.io/<repository-owner>/executor` image. See [installation](docs/install.md)
+and [release operations](RELEASING.md).
+
+## Try it from this checkout
+
+The production binary embeds the dashboard, so the web build must run before
+the release Cargo build. From the repository root:
+
+```sh
+bun run bootstrap
+bun run --cwd web build
+cargo build --locked --release
+
+mkdir -p .executor-local/data
+chmod 0700 .executor-local/data
+./target/release/executor server --data-dir "$PWD/.executor-local/data"
 ```
 
-This installs the local background service and opens the web UI. From there, add your first source and start using tools.
+This checkout expects Bun 1.3.x and Rust 1.96 or newer. The release workflow
+currently pins Bun 1.3.11 and Rust 1.96.0.
 
-### Use as an MCP server
+Executor listens at `http://127.0.0.1:4788` by default. Open the one-time
+`/setup#token=...` URL printed by the server and create the only administrator
+account with a password of at least 12 characters. The dashboard then signs in
+with those credentials. Open **API tokens** and create a token for your client.
+The token secret is shown once.
 
-Point any MCP-compatible agent (Cursor, Claude Code, OpenCode, etc.) at Executor to share your tool catalog, auth, and policies across all of them.
+On WSL2, paste the setup URL into the Windows browser. You can also open the
+dashboard from the WSL shell after setup:
 
-```bash
-
-executor mcp
+```sh
+/mnt/c/windows/explorer.exe http://127.0.0.1:4788
 ```
 
-Example `mcp.json` for Claude Code / Cursor:
+State is under `.executor-local/data` in this example. Stop the server before
+copying that directory for backup, and keep `executor.db`, its WAL files, and
+`master.key` together.
+
+## Connect sources
+
+Open **Sources**, choose a connector, and follow the preview or connection
+flow:
+
+- OpenAPI accepts a URL or pasted OpenAPI 3.0/3.1 JSON or YAML.
+- GraphQL connects to an introspection-enabled endpoint.
+- MCP Streamable HTTP connects to a remote or local HTTP MCP endpoint.
+- MCP stdio selects only a machine-admin-approved command template.
+
+After import, review each source under **Tools**. GraphQL queries start Enabled,
+mutations start Ask, and deprecated operations start Disabled. MCP tools are
+Enabled only when the upstream explicitly marks them read-only and not
+destructive. Other MCP tools start Ask.
+
+See [source and OAuth setup](docs/sources.md) and the detailed
+[MCP contract](docs/mcp.md).
+
+## Use the CLI
+
+Client commands talk to an already-running Executor server. They never open a
+second copy of the database.
+
+```sh
+./target/release/executor --version
+export EXECUTOR_API_TOKEN='token-shown-by-the-dashboard'
+
+./target/release/executor tools sources
+./target/release/executor tools search 'create issue'
+./target/release/executor tools describe source_slug.tool_name
+./target/release/executor call source_slug.tool_name '{"input":"value"}'
+```
+
+Use `--base-url` or `EXECUTOR_BASE_URL` for another instance. Remote instances
+must use HTTPS unless you deliberately pass `--allow-insecure-http` on a
+separately authenticated and encrypted tunnel. A private LAN alone does not
+protect the bearer token. See the [CLI guide](docs/cli.md).
+
+## Use Executor as an MCP server
+
+For clients that support Streamable HTTP, use the instance origin plus `/mcp`
+and send the dashboard API token as a bearer token. Client configuration
+schemas differ, so treat this as a schematic shape and adapt it to the selected
+client's MCP documentation:
 
 ```json
 {
   "mcpServers": {
     "executor": {
-      "command": "executor",
-      "args": ["mcp"]
+      "type": "http",
+      "url": "http://127.0.0.1:4788/mcp",
+      "headers": {
+        "Authorization": "Bearer <EXECUTOR_API_TOKEN>"
+      }
     }
   }
 }
 ```
 
-### Use with Pi
+For a client that launches only stdio MCP servers, the common shape is:
 
-[Pi](https://pi.dev) does not include a built-in MCP client. To use Executor from Pi, install the community bridge:
-
-```bash
-pi install git:github.com/gvkhosla/pi-executor-mcp@v0.2.0
+```json
+{
+  "mcpServers": {
+    "executor": {
+      "command": "/absolute/path/to/executor",
+      "args": ["mcp"],
+      "env": {
+        "EXECUTOR_API_TOKEN": "<EXECUTOR_API_TOKEN>"
+      }
+    }
+  }
+}
 ```
 
-Reload Pi, then verify the bridge:
+The bridge connects to `http://127.0.0.1:4788` by default. Set
+`EXECUTOR_BASE_URL` when the server uses another origin.
 
-```text
-/reload
-/executor-status
+## Install and operate
+
+- [Native install and first boot](docs/install.md)
+- [Docker Compose](docs/docker.md)
+- [Linux systemd](docs/systemd.md)
+- [macOS launchd](docs/launchd.md)
+- [Runtime and sandbox boundary](docs/runtime.md)
+- [Architecture and security contracts](docs/architecture.md)
+
+For a reverse proxy or managed OAuth, set `EXECUTOR_PUBLIC_ORIGIN` to the exact
+HTTPS origin used in the browser before starting Executor. Callback URLs are
+connection-specific and are displayed in the source's Managed OAuth panel.
+
+## Develop and verify
+
+`bun run bootstrap` installs workspace dependencies, prepares the retained
+TypeScript packages, and installs Playwright Chromium.
+
+A debug Rust server does not require production web assets:
+
+```sh
+mkdir -p .executor-debug
+chmod 0700 .executor-debug
+cargo run -- server --data-dir "$PWD/.executor-debug"
 ```
 
-After that, ask Pi to search, inspect, and call tools through Executor.
+Debug builds intentionally embed a small fixture page. That path is suitable
+for API, CLI, and MCP work, not dashboard acceptance. Use the release build
+sequence above when you need the real embedded Svelte application.
 
-## Add a source
+The broad merge gates are:
 
-If you can represent it with a JSON schema, it can be an integration. Executor has first-party support for OpenAPI, GraphQL, MCP, and Google Discovery — but the plugin system is open to any source type.
-
-### Via the web UI
-
-Run `executor web`, go to **Add Source**, paste a URL, and Executor will detect the type, index the tools, and handle auth.
-
-### Via the CLI
-
-```bash
-executor call executor openapi addSource '{
-  "spec": "https://petstore3.swagger.io/api/v3/openapi.json",
-  "namespace": "petstore",
-  "baseUrl": "https://petstore3.swagger.io/api/v3"
-}'
+```sh
+bun run format:check
+bun run lint
+bun run typecheck
+bun run test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+bun run test:e2e
 ```
 
-Use `baseUrl` when the OpenAPI document has relative `servers` entries (for example `"/api/v3"`).
+The e2e command builds the Svelte assets and a local debug Rust binary before
+driving the real first-boot, source, tool-mode, approval, log, token, and OAuth
+journeys in Chromium.
 
-## Use tools
+See [`RUNNING.md`](RUNNING.md) for the current repository workflow and e2e
+status. Default commands exclude all archived application packages.
 
-Agents discover and call tools through a typed TypeScript runtime:
+## License
 
-```ts
-// discover by intent
-const matches = await tools.discover({ query: "github issues", limit: 5 });
-
-// inspect the schema
-const detail = await tools.describe.tool({
-  path: matches.bestPath,
-  includeSchemas: true,
-});
-
-// call with type safety
-const issues = await tools.github.issues.list({
-  owner: "vercel",
-  repo: "next.js",
-});
-```
-
-Use tools via the CLI:
-
-```bash
-executor tools search "send email"
-executor call --help
-executor call github --help
-executor call github issues --help
-executor call cloudflare --help --match dns --limit 20
-executor call github issues create '{"owner":"octocat","repo":"Hello-World","title":"Hi"}'
-executor call gmail send '{"to":"alice@example.com","subject":"Hi"}'
-```
-
-`executor call`, `executor resume`, and `executor tools ...` commands auto-start a local daemon if needed.
-If the default port is busy, the CLI will pick an available local port and track it automatically.
-
-If an execution pauses for auth or approval, resume it:
-
-```bash
-executor resume --execution-id exec_123
-```
-
-## CLI reference
-
-```bash
-executor install                    # install/start the durable background service
-executor web                        # open the running web UI
-executor web --foreground           # start a temporary foreground runtime + web UI
-executor daemon run                 # start persistent local daemon in background
-executor daemon status              # show daemon status
-executor daemon stop                # stop daemon
-executor daemon restart             # restart daemon
-executor mcp                        # start MCP endpoint
-executor call <path...> '{"k":"v"}' # invoke a tool by path segments
-executor call <path...> --help      # browse namespaces/resources/methods
-executor call <path...> --help --match "<text>" --limit <n> # narrow huge namespaces
-executor resume --execution-id <id> # resume paused execution
-executor tools search "<query>"     # search tools by intent
-executor tools sources              # list configured sources + tool counts
-executor tools describe <path>      # show tool TypeScript/JSON schema
-```
-
-## Developing locally
-
-```bash
-bun install
-bun dev
-```
-
-The dev server starts at `http://127.0.0.1:4788`.
-
-### Tests
-
-```bash
-bun run test       # unit + integration suites
-bun run test:e2e   # full-stack e2e: boots the cloud and self-host apps and drives them
-```
-
-The browser e2e scenarios need Playwright's Chromium once per machine:
-`bunx playwright install chromium`.
-
-## Community
-
-Join the Discord: [https://discord.gg/eF29HBHwM6](https://discord.gg/eF29HBHwM6)
-
-## Learn more
-
-Visit [executor.sh](https://executor.sh) to learn more.
-
-## Attribution
-
-- Thank you to [Crystian](https://www.linkedin.com/in/crystian/) for providing the npm package name `executor`.
-
-## References
-
-As part of my coding process, I give my agent access to references to other codebases to understand patterns and how other people have implemented systems.
-
-A non exhaustive list of references are:
-
-- [Better Auth](https://github.com/better-auth/better-auth) - Storage adapter reference
-- [Effect](https://github.com/Effect-TS/effect) - General code patterns
-- [OpenCode](https://github.com/anomalyco/opencode) - Plugin system reference
-- [OpenClaw](https://github.com/openclaw/openclaw) - Plugin system reference
-- [Emdash](https://github.com/emdash-cms/emdash) - Plugin system reference
-- [Pi](https://github.com/badlogic/pi-mono) - Plugin system reference
-
-It's encouraged also that you can use this codebase as a reference to understand how it's implemented
+MIT

@@ -18,14 +18,13 @@ server hot-reloads.
 
 ## How it's served
 
-Mintlify hosts the built site at `executor.mintlify.dev`. The Executor Cloud
-worker reverse-proxies it onto the first-party origin at `executor.sh/docs`
-(see `apps/cloud/src/edge/docs.ts`), so the public docs live at
-`executor.sh/docs` instead of a `*.mintlify.dev` subdomain.
+Mintlify builds and hosts the site at `executor.mintlify.dev`. The canonical
+public URL is `executor.sh/docs`, configured through the Mintlify project and
+the production domain's external routing settings.
 
 Mintlify is configured to host under the `/docs` subpath (Settings → Domain
-setup → **Host at /docs**), so it serves `/docs/*` paths that the proxy
-forwards unchanged. A config change like that only takes effect on the next
-build, so push a commit to `apps/docs` to redeploy.
+setup → **Host at /docs**). The docs deployment is independent of archived code
+under `legacy/`; no supported Executor runtime serves or proxies this site. A
+Mintlify config change takes effect on the next docs build.
 
 To deploy from this directory, point the Mintlify GitHub app at `apps/docs`.

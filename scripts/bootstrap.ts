@@ -11,24 +11,43 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+export type BootstrapExecutor = (
+  label: string,
+  command: string,
+  args: ReadonlyArray<string>,
+) => void;
 
-const run = (label: string, cmd: string, args: ReadonlyArray<string>) => {
-  console.log(`\n[bootstrap] ${label}: ${cmd} ${args.join(" ")}`);
-  execFileSync(cmd, [...args], { cwd: repoRoot, stdio: "inherit" });
+export const runBootstrap = (execute: BootstrapExecutor) => {
+  execute("dependencies (+ prepare builds)", "bun", ["install", "--frozen-lockfile"]);
+  execute("playwright chromium", "bun", [
+    "run",
+    "--cwd",
+    "e2e",
+    "playwright",
+    "install",
+    "--with-deps",
+    "chromium",
+  ]);
 };
 
-// `bun install` runs the workspace prepare hook, which builds
-// @executor-js/vite-plugin and @executor-js/react — the two artifacts the
-// apps' vite dev servers fail without in a fresh worktree.
-run("dependencies (+ prepare builds)", "bun", ["install"]);
+const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-// e2e browser scenarios need Playwright's chromium; the cache is shared
-// per-machine so this is a fast no-op when already present.
-run("playwright chromium", "bunx", ["playwright", "install", "chromium"]);
+const main = () => {
+  // `bun install --frozen-lockfile` runs the workspace prepare hook, which builds
+  // @executor-js/vite-plugin and @executor-js/react, the two artifacts the
+  // legacy apps' Vite dev servers fail without in a fresh worktree.
+  // Resolve Playwright from e2e so the browser revision matches its locked
+  // dependency. The cache is shared per-machine when Chromium is already present.
+  runBootstrap((label, command, args) => {
+    console.log(`\n[bootstrap] ${label}: ${command} ${args.join(" ")}`);
+    execFileSync(command, [...args], { cwd: repoRoot, stdio: "inherit" });
+  });
 
-if (!existsSync(resolve(repoRoot, "node_modules/.bin/vitest"))) {
-  throw new Error("bootstrap: vitest missing after install — bun install likely failed");
-}
+  if (!existsSync(resolve(repoRoot, "node_modules/.bin/vitest"))) {
+    throw new Error("bootstrap: vitest missing after install, bun install likely failed");
+  }
 
-console.log("\n[bootstrap] done — `cd e2e && bun run test` runs the full suite.");
+  console.log("\n[bootstrap] done. See RUNNING.md for current verification commands.");
+};
+
+if (import.meta.main) main();

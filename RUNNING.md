@@ -1,125 +1,219 @@
-# RUNNING.md — how things run today
+# Running the Rust and Svelte rewrite
 
-> **This document may be out of date.** It describes how things run today,
-> not how they must run. Trust it as a starting point; if you hit weirdness,
-> the implementation has probably moved and this file is why. Verify against
-> the code, then update this file when you notice drift. The principles in
-> [AGENTS.md](AGENTS.md) are the stable contract; everything below is
-> implementation detail that churns.
+This file describes the active local and self-hosted product. The archived
+TypeScript application entry points are under `legacy/` and are not part of
+the default workflow.
 
-## Fresh checkout / worktree setup
+## Fresh checkout
 
-`bun run bootstrap` from the repo root — idempotent: `bun install` (whose
-prepare hook builds `@executor-js/vite-plugin` and `packages/react`, the
-artifacts dev servers fail without) plus Playwright chromium. A fresh
-worktree that skips it dies with "Failed to resolve entry for package
-'@executor-js/vite-plugin'".
-
-Our two upstream forks — `@executor-js/emulate` (service emulators) and
-`@executor-js/mcporter` (headless MCP client) — are consumed purely as
-published npm packages; nothing in this repo references them by path. There
-are no `vendor/` submodules. Each fork is its own standalone repo
-(`github.com/UsefulSoftwareCo/emulate`, `github.com/UsefulSoftwareCo/mcporter`):
-develop on its `main`, publish a bump, then bump the dependency here. The
-`emulate` skill covers the emulator publish/deploy loop.
-
-## Dev servers
-
-- Everything except desktop/cloud: `bun run dev` (turbo, from root)
-- One app: `bun run dev` from its `apps/<name>` directory
-- Self-host boots standalone with just env vars — see
-  `e2e/setup/selfhost.globalsetup.ts` for the canonical recipe (data dir,
-  bootstrap admin email/password, base URL, `EXECUTOR_ALLOW_LOCAL_NETWORK`)
-- Cloud needs WorkOS + Autumn; for a no-.env boot, point it at emulators —
-  see `e2e/setup/cloud.globalsetup.ts` for the canonical recipe (the real
-  SDKs against emulated services, PGlite dev DB)
-
-The e2e globalsetup files are the source of truth for "how do I boot a
-working instance of X" — read them before inventing a boot path.
-
-## E2E: running, viewing, sharing
-
-`e2e/AGENTS.md` covers writing scenarios. Operationally:
-
-- `cd e2e && bun run test` boots dev servers and runs everything;
-  `--project cloud|selfhost` narrows. `E2E_CLOUD_URL`/`E2E_SELFHOST_URL`
-  attach to an already-running server instead of booting.
-- Runs land in `e2e/runs/<target>/<scenario-slug>/` — `result.json`, step
-  screenshots, `session.mp4` + `trace.zip` for browser scenarios, and the
-  scenario source as `test.ts`.
-- `cd e2e && bun run serve` builds the viewer and serves the scenario ×
-  target matrix over HTTP, bound to all interfaces (reachable over the
-  tailnet). It prefers port 8901 but walks forward to the next free port if
-  that's taken (so concurrent worktrees, or a leaked previous viewer, never
-  wedge each other) — read the printed `e2e viewer → …` URL for the actual
-  port. `PORT=…` pins a port explicitly and fails loudly if it's busy. The
-  built SPA is port- and mount-agnostic (relative assets + hash routing), so
-  whatever port it lands on just works. Individual runs are at
-  `#/<target>/<slug>` hash routes — when handing results to the user, link
-  those directly, not the bare matrix.
-- `bun e2e/scripts/pr-media.ts e2e/runs/<target>/<slug>` converts a run's
-  recording to a gif, uploads it to the `e2e-media` branch, and prints
-  PR-ready markdown.
-
-E2E dev-server ports are derived and CLAIMED per checkout (`cd e2e && bun
-run ports` prints this checkout's block; see `e2e/src/ports.ts`) — each
-checkout hashes its repo root to a preferred block, atomically locks it,
-and walks to the next free block if squatted, so concurrent worktrees never
-collide or attach to each other's servers. `E2E_*_PORT` env vars pin ports
-explicitly. If a boot reports a squatted port, an old dev server leaked —
-`bun run reap` (repo root) lists and kills orphaned stacks.
-
-## The dev CLI: live instances, interactively
-
-`cd e2e && bun run cli` — the same primitives scenarios use, as commands.
-Boot a target, mint identities, make typed API calls, drive MCP, read the
-emulator ledger — develop interactively, then crystallize the journey into
-a scenario.
+From the repository root:
 
 ```sh
-bun run cli up selfhost --share   # boot, reachable over the tailnet, stays up
-bun run cli up cloud --share      # emulated WorkOS+Autumn, tailscale-HTTPS fronted
-bun run cli status                # what's running, URLs, creds
-bun run cli identity selfhost     # fresh identity (headers / cookies / creds)
-bun run cli api selfhost tools.list
-bun run cli mcp selfhost call execute '{"code":"return 1+1;"}'
-bun run cli ledger cloud workos   # what hit the emulator
-bun run cli down selfhost         # tear down (also removes tailscale serves)
+bun run bootstrap
 ```
 
-Instances persist until `down` — `up --share` IS the "touch it" handoff
-artifact, and the seeding direction too: boot, drive the product into a
-state (API/MCP/UI), hand across the URL. State files in `e2e/.dev/` mark
-deliberate long-lived instances (vs leaks); attach scenarios to a running
-instance with `E2E_<TARGET>_URL`.
+Bootstrap runs the workspace install and prepare hooks, then installs
+Playwright Chromium. It is safe to rerun. The workspace currently declares Bun
+1.3.11 and the native release workflow uses Rust 1.96.0.
 
-Why cloud `--share` is more involved (encoded in the CLI, kept here for
-when you hit it manually): the cloud app sets `secure: true` auth cookies,
-so login breaks over plain http from any non-localhost origin ("Invalid
-login state"). Both the app AND the WorkOS emulator get fronted with
-`tailscale serve` HTTPS, the emulator advertises its public URL on both
-sides (its `baseUrl` and the app's `WORKOS_API_URL` — the browser-facing
-authorize URL derives from the latter), and Vite must allow the public
-hostname (`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS`).
+`Cargo.toml` is the only native product version source. Confirm the active
+checkout before packaging with:
 
-## Environment gotchas (learned the hard way)
+```sh
+cargo run -- --version
+```
 
-- The shell is fish, and the working directory resets between Bash calls.
-  Use absolute paths rooted at THIS worktree; don't rely on a prior `cd`.
-- Don't write probe scripts to `/tmp` — they can't resolve workspace
-  packages (`effect`, `playwright`, …). Put scratch scripts under the repo
-  root (`scratch/` is gitignored) so bun resolves the workspace.
-- A fresh worktree's Vite dep-optimizer cache can serve PRE-REBASE code
-  (symptom: behavior matching old code only in dev servers, while unit
-  tests pass). Kill the server, clear `node_modules/.vite` /
-  `.tanstack`-adjacent caches, reboot.
-- The real Tailscale CLI on this machine is
-  `/opt/homebrew/opt/tailscale/bin/tailscale`; `/usr/local/bin/tailscale`
-  is a broken shim pointing at a deleted app. The tailnet IP is on the
-  `utun` interface (100.x.y.z) if the CLI fails.
-- `bun.lock` conflicts on rebase: take either side, re-run `bun install`,
-  never hand-merge.
-- Long-lived demo servers you left up for the user look like leaks to
-  cleanup tooling — `e2e/.dev/<target>.json` marks deliberate instances;
-  check it before reaping, and `bun run cli down <target>` is the clean
-  teardown.
+## Production-like local run
+
+The real Svelte dashboard is compiled first and embedded in the Rust release
+binary:
+
+```sh
+bun run --cwd web build
+cargo build --locked --release
+
+mkdir -p .executor-local/data
+chmod 0700 .executor-local/data
+./target/release/executor server --data-dir "$PWD/.executor-local/data"
+```
+
+Open the setup URL printed by the process. The dashboard creates the
+administrator and immediately signs in with those credentials. Add a source,
+review its tool modes, and create an API token under `/tokens`.
+
+The server binds to `127.0.0.1:4788` unless `--bind` changes it. Keep plaintext
+HTTP on loopback. For another browser-facing hostname, terminate TLS at a
+reverse proxy and set the exact external origin with `--public-origin` or
+`EXECUTOR_PUBLIC_ORIGIN`.
+
+On this WSL2 machine, the Windows browser can reach the loopback server. Open
+it with:
+
+```sh
+/mnt/c/windows/explorer.exe http://127.0.0.1:4788
+```
+
+Use a worktree-specific data directory, as shown above, so concurrent checkouts
+never share SQLite or the instance master key. One process lock protects each
+data directory.
+
+## Debug server without a web build
+
+Normal debug compilation does not require `web/build`:
+
+```sh
+mkdir -p .executor-debug
+chmod 0700 .executor-debug
+cargo run -- server --data-dir "$PWD/.executor-debug"
+```
+
+Debug builds embed the deterministic fixture under `tests/fixtures/web-assets`.
+This is useful for Rust API, CLI, MCP, and lifecycle work. It is not a visual
+dashboard development server. Use the production-like sequence when the real
+Svelte application must be present.
+
+`EXECUTOR_WEB_ASSETS_DIR` is a compile-time packaging override for focused
+asset tests. It is not a runtime static-directory setting.
+
+## Client smoke test
+
+Create a dashboard API token, then use the same binary as a client:
+
+```sh
+export EXECUTOR_API_TOKEN='token-shown-once-by-the-dashboard'
+
+./target/release/executor tools sources
+./target/release/executor tools search 'health check'
+./target/release/executor tools describe source_slug.tool_name
+./target/release/executor call source_slug.tool_name '{}'
+```
+
+The server never auto-starts for client commands. `call`, `tools`, and `mcp`
+require a running server and an API token. `open` only opens the clean dashboard
+URL and uses the administrator login cookie in the browser.
+
+## Managed OAuth callbacks
+
+Set the final browser-facing origin before creating an OAuth connection:
+
+```sh
+./target/release/executor server \
+  --data-dir "$PWD/.executor-local/data" \
+  --public-origin https://executor.example.com
+```
+
+After importing an eligible OpenAPI, GraphQL, or HTTP MCP source, open its
+**Managed OAuth** panel. Save the provider discovery and client configuration,
+copy the exact displayed callback URL into the provider, then select **Connect
+OAuth**. Every connection has its own callback path:
+
+```text
+/api/v1/oauth/callback/<connection-id>
+```
+
+The supported managed flow is OAuth 2 authorization code with PKCE. OpenID
+Connect and the `openid` scope are not supported. See
+[`docs/sources.md`](docs/sources.md).
+
+## Verification
+
+Use the narrowest relevant command while iterating. For a merge-ready change,
+run the complete active-product gates:
+
+```sh
+bun run format:check
+bun run lint
+bun run typecheck
+bun run test
+
+bun run --cwd web format:check
+bun run --cwd web lint
+bun run --cwd web check
+bun run --cwd web test
+
+cargo fmt --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+Use `vitest run ...` or a package script that delegates to Vitest for focused
+TypeScript tests. Never use `bun test`.
+
+## Browser e2e
+
+`bun run test:e2e` builds the Svelte distribution, embeds it in the debug Rust
+binary, and runs only the active `local-selfhost` browser project. The harness
+boots two fresh loopback instances: one prepared single-admin instance for the
+main journeys and one untouched instance for the first-boot setup journey.
+Both use temporary private data directories that are removed during teardown.
+
+The throwaway main-instance credentials are:
+
+```text
+username: admin
+password: executor-e2e-admin-password
+```
+
+The archived cloud browser suite remains an explicit opt-in:
+
+```sh
+bun run legacy:test:e2e:cloud
+```
+
+Runs land under `e2e/runs/local-selfhost/<scenario>/`. View them with
+`cd e2e && bun run serve`, then open the exact URL and port printed by the
+viewer. Credential-entry journeys deliberately omit traces and video so setup
+secrets, passwords, and one-time API tokens never become artifacts.
+
+## Service and container runs
+
+The release binary embeds its hardened systemd and launchd installation assets.
+On Linux, system service changes require root:
+
+```sh
+sudo "$(command -v executor)" service install
+executor service status
+sudo executor service restart
+sudo executor service stop
+sudo executor service start
+sudo executor service remove
+```
+
+On macOS, run the same commands without `sudo`. The LaunchAgent belongs to the
+logged-in user. `service install --no-start` writes the managed files while
+leaving the service stopped. `service status` prints exactly `active` or
+`inactive`; inactive exits with status 3.
+
+These commands mutate real operating-system service state. Do not use them for
+ordinary development checkouts or tests. Use the maintained operator guides
+for paths, permissions, backup requirements, and removal behavior:
+
+- [`docs/docker.md`](docs/docker.md)
+- [`docs/systemd.md`](docs/systemd.md)
+- [`docs/launchd.md`](docs/launchd.md)
+- [`docs/install.md`](docs/install.md)
+
+## Legacy opt-ins
+
+Default dev, test, lint, typecheck, and format paths exclude all six archived
+application packages. Work on them only through the explicit scripts:
+
+```sh
+bun run legacy:dev
+bun run legacy:dev:cli -- --help
+bun run legacy:test
+bun run legacy:typecheck
+bun run legacy:typecheck:slow
+bun run legacy:test:e2e:cloud
+bun run legacy:test:e2e:desktop
+```
+
+See [`legacy/README.md`](legacy/README.md) for the boundary.
+
+Publishing is also opt-in. `release.yml` is the sole native product release
+entrypoint and requires explicit dry-run or publish mode, a semver tag, and an
+exact full commit SHA. The separate TypeScript workflow publishes only
+explicitly confirmed `@executor-js/*` library versions under immutable
+compatibility tags. Legacy CLI and desktop publishing are retired. See
+[`RELEASING.md`](RELEASING.md) for the checked release sequence.

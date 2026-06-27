@@ -5,6 +5,7 @@
     ".reference",
     ".turbo",
     "dist",
+    "legacy",
     "vendor",
     "e2e/runs",
     "node_modules",
@@ -12,7 +13,6 @@
     "bun.lock",
     "*.tsbuildinfo",
     "executor-*.tgz",
-    "**/routeTree.gen.ts",
-    "apps/cloud/src/services/executor-schema.ts"
+    "**/routeTree.gen.ts"
   ]
 }

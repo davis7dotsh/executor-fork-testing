@@ -1,137 +1,2084 @@
-name: Release
-run-name: prepare release
+name: Release native Executor
+run-name: "${{ format('{0} {1} at {2}', inputs.mode, inputs.tag, inputs.commit_sha) }}"
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build only, or publish and promote the release
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - publish
+      tag:
+        description: Exact v-prefixed Cargo version, for example v0.1.0
+        required: true
+        type: string
+      commit_sha:
+        description: Exact 40-character commit SHA to build
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: native-release
   cancel-in-progress: false
 
-jobs:
-  release:
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: write
-      id-token: write
-      pull-requests: write
+env:
+  BUILDKIT_IMAGE: moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+  BUILDX_VERSION: v0.34.1
+  BUN_VERSION: 1.3.11
+  EXECUTOR_REPOSITORY: ${{ github.repository }}
+  MACOS_BUILD_CLANG_VERSION: Apple clang version 17.0.0 (clang-1700.0.13.5)
+  MACOS_BUILD_DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  MACOS_BUILD_LD_VERSION: "1167.5"
+  MACOS_BUILD_SDK_VERSION: "15.5"
+  MACOS_BUILD_XCODE_BUILD: 16F6
+  MACOS_BUILD_XCODE_VERSION: "16.4"
+  MACOS_FLOOR_CLANG_VERSION: Apple clang version 15.0.0 (clang-1500.3.9.4)
+  MACOS_FLOOR_DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+  MACOS_FLOOR_LD_VERSION: "1053.12"
+  MACOS_FLOOR_SDK_VERSION: "14.5"
+  MACOS_FLOOR_XCODE_BUILD: 15F31d
+  MACOS_FLOOR_XCODE_VERSION: "15.4"
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  RUST_VERSION: 1.96.0
 
+jobs:
+  validate:
+    name: Validate immutable release inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      channel: ${{ steps.release.outputs.channel }}
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
+      image: ${{ steps.release.outputs.image }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Verify exact native release environment policy
+        if: inputs.mode == 'publish'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          environment_file="$RUNNER_TEMP/native-release-environment.json"
+          policies_file="$RUNNER_TEMP/native-release-branch-policies.json"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$EXECUTOR_REPOSITORY/environments/native-release" \
+            > "$environment_file"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$EXECUTOR_REPOSITORY/environments/native-release/deployment-branch-policies?per_page=100" \
+            > "$policies_file"
+
+          python3 - "$environment_file" "$policies_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          environment = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          policies = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+
+          if environment.get("name") != "native-release":
+              raise SystemExit("native-release environment name does not match")
+          if environment.get("can_admins_bypass") is not False:
+              raise SystemExit("native-release must disable administrator bypass")
+
+          protection_rules = environment.get("protection_rules")
+          if not isinstance(protection_rules, list):
+              raise SystemExit("native-release protection rules are missing")
+          rule_types = sorted(rule.get("type") for rule in protection_rules)
+          if rule_types != ["branch_policy", "required_reviewers"]:
+              raise SystemExit(
+                  "native-release must have only branch_policy and required_reviewers rules"
+              )
+
+          reviewer_rule = next(
+              rule for rule in protection_rules if rule.get("type") == "required_reviewers"
+          )
+          if reviewer_rule.get("prevent_self_review") is not False:
+              raise SystemExit("native-release must set prevent_self_review=false")
+          reviewers = reviewer_rule.get("reviewers")
+          if not isinstance(reviewers, list) or len(reviewers) != 1:
+              raise SystemExit("native-release must have exactly one required reviewer")
+          reviewer = reviewers[0]
+          identity = reviewer.get("reviewer")
+          if (
+              reviewer.get("type") != "User"
+              or not isinstance(identity, dict)
+              or identity.get("login") != "bmdavis419"
+              or identity.get("id") != 45952064
+          ):
+              raise SystemExit("native-release required reviewer must be bmdavis419 (45952064)")
+
+          deployment_policy = environment.get("deployment_branch_policy")
+          if deployment_policy != {
+              "protected_branches": False,
+              "custom_branch_policies": True,
+          }:
+              raise SystemExit("native-release must use custom deployment branch policies only")
+
+          branch_policies = policies.get("branch_policies")
+          if (
+              policies.get("total_count") != 1
+              or not isinstance(branch_policies, list)
+              or len(branch_policies) != 1
+              or branch_policies[0].get("name") != "main"
+              or branch_policies[0].get("type") != "branch"
+          ):
+              raise SystemExit("native-release must allow only the main branch")
+          PY
+
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.11
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-
-      - name: Update npm for trusted publishing
-        run: |
-          npm install -g npm@latest
-          npm --version
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Create or update release pull request
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          version: bun run changeset:version
-          commit: Version Packages
-          title: Version Packages
-          createGithubReleases: false
-        env:
-          # PAT (RELEASE_PAT) so the auto-opened Version Packages PR
-          # triggers downstream workflows (pkg-pr-new, CI). PRs authored
-          # by the default GITHUB_TOKEN do not trigger other workflows by
-          # GitHub design. Falls back to GITHUB_TOKEN when the secret is
-          # not set, so the workflow keeps working in forks / before the
-          # secret is configured.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Smoke test packed @executor-js library packages
-        if: steps.changesets.outputs.hasChangesets == 'false'
-        run: bun run release:smoke:packages
-
-      - name: Publish @executor-js library packages
-        if: steps.changesets.outputs.hasChangesets == 'false'
-        run: bun run release:publish:packages
-
-      - name: Detect release version change
-        if: steps.changesets.outputs.hasChangesets == 'false'
-        id: detect_release
-        run: |
-          before="${{ github.event.before }}"
-          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            before="$(git rev-list --max-count=1 HEAD^ 2>/dev/null || true)"
-          fi
-
-          version="$(node -e "console.log(JSON.parse(require('fs').readFileSync('apps/cli/package.json', 'utf8')).version)")"
-          if [ -n "$before" ] && git cat-file -e "$before:apps/cli/package.json" 2>/dev/null; then
-            previous_version="$(git show "$before:apps/cli/package.json" | node -e "let data = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => { data += chunk; }); process.stdin.on('end', () => { console.log(JSON.parse(data).version ?? ''); });")"
-          else
-            previous_version=""
-          fi
-
-          release_tag="v$version"
-          if [ -n "$previous_version" ] && [ "$previous_version" != "$version" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          elif ! git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null 2>&1; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Validate release tag
-        if: steps.changesets.outputs.hasChangesets == 'false' && steps.detect_release.outputs.changed == 'true'
-        id: validate_release
-        env:
-          RELEASE_VERSION: ${{ steps.detect_release.outputs.version }}
-        run: bun run scripts/validate-release-ref.ts --version-env RELEASE_VERSION --output tag
-
-      - name: Create and push release tag
-        if: steps.changesets.outputs.hasChangesets == 'false' && steps.detect_release.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
-          RELEASE_TAG: ${{ steps.validate_release.outputs.tag }}
-        run: |
-          auth_remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          if git ls-remote --exit-code --tags "$auth_remote" "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Tag $RELEASE_TAG already exists."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$RELEASE_TAG"
-          git push "$auth_remote" "$RELEASE_TAG"
-
-      - name: Trigger CLI publish
-        if: steps.changesets.outputs.hasChangesets == 'false' && steps.detect_release.outputs.changed == 'true'
+      - name: Bind version, commit, tag, and release state
+        id: release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.validate_release.outputs.tag }}
+          INPUT_COMMIT_SHA: ${{ inputs.commit_sha }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
-          gh workflow run publish-executor-package.yml --ref "$RELEASE_TAG" -f tag="$RELEASE_TAG"
+          set -euo pipefail
 
-      # Desktop build downloads CLI binaries from the release, so it must
-      # run after CLI publish completes. Trigger it from the CLI workflow
-      # or manually via: gh workflow run publish-desktop.yml -f tag=vX.Y.Z
+          if [[ ! "$INPUT_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit_sha must be an exact lowercase 40-character Git commit SHA" >&2
+            exit 1
+          fi
+          if [ "$WORKFLOW_SHA" != "$INPUT_COMMIT_SHA" ]; then
+            echo "Workflow revision $WORKFLOW_SHA does not match requested release commit $INPUT_COMMIT_SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid workflow run attempt: $RUN_ATTEMPT" >&2
+            exit 1
+          fi
+
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$INPUT_COMMIT_SHA" ]; then
+            echo "Checked out $actual_sha, expected $INPUT_COMMIT_SHA" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "$actual_sha" refs/remotes/origin/main; then
+            echo "Release commit $actual_sha is not on origin/main" >&2
+            exit 1
+          fi
+          if [ "$RUN_ATTEMPT" = 1 ] \
+            && [ "$(git rev-parse refs/remotes/origin/main)" != "$actual_sha" ]; then
+            echo "The first release attempt must use the current origin/main commit" >&2
+            exit 1
+          fi
+
+          version="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(manifest["package"]["version"])
+          PY
+          )"
+          python3 - "$version" <<'PY'
+          import re
+          import sys
+
+          pattern = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
+              r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+          )
+          if pattern.fullmatch(sys.argv[1]) is None:
+              raise SystemExit("Cargo.toml package version is not valid SemVer")
+          PY
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "Release tag $RELEASE_TAG does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *+* ]]; then
+            echo "Cargo release versions cannot contain build metadata because OCI tags do not support +" >&2
+            exit 1
+          fi
+
+          if git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"; then
+            tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            if [ "$tag_sha" != "$actual_sha" ]; then
+              echo "Release tag $RELEASE_TAG points to $tag_sha, expected $actual_sha" >&2
+              exit 1
+            fi
+          elif [ "$RELEASE_MODE" = "publish" ]; then
+            echo "Publish mode requires existing remote tag $RELEASE_TAG" >&2
+            exit 1
+          else
+            echo "Dry run continues without remote tag $RELEASE_TAG"
+          fi
+          if [ "$RELEASE_MODE" = "publish" ] \
+            && [ "$WORKFLOW_REF" != refs/heads/main ]; then
+            echo "Publish mode must be dispatched from refs/heads/main, got $WORKFLOW_REF" >&2
+            exit 1
+          fi
+
+          if [ "$RELEASE_MODE" = "publish" ] \
+            && gh release view "$RELEASE_TAG" --repo "$EXECUTOR_REPOSITORY" >/dev/null 2>&1; then
+              release_title="$RELEASE_TAG [executor-run:$RUN_ID]"
+              release_state="$RUNNER_TEMP/existing-release.json"
+              gh api "repos/$EXECUTOR_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_state"
+              actual_title="$(jq -r '.name // ""' "$release_state")"
+              if [ "$actual_title" != "$release_title" ]; then
+                echo "Release $RELEASE_TAG belongs to a different workflow run" >&2
+                exit 1
+              fi
+              python3 - "$release_state" "$RELEASE_TAG" "$actual_sha" "$version" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_prerelease = "-" in sys.argv[4]
+          if (
+              release.get("tag_name") != sys.argv[2]
+              or release.get("target_commitish") != sys.argv[3]
+              or release.get("prerelease") is not expected_prerelease
+              or release.get("draft") not in (True, False)
+          ):
+              raise SystemExit("existing release does not match the validated release state")
+          if release.get("draft") is False and release.get("immutable") is not True:
+              raise SystemExit("published release does not match the immutable rerun state")
+          PY
+
+              run_binding="$RUNNER_TEMP/RELEASE-RUN.json"
+              python3 - "$run_binding" "$EXECUTOR_REPOSITORY" "$RELEASE_TAG" "$actual_sha" "$RUN_ID" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          binding = {
+              "commit": sys.argv[4],
+              "repository": sys.argv[2],
+              "run_id": sys.argv[5],
+              "tag": sys.argv[3],
+          }
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+              is_draft="$(jq -r .draft "$release_state")"
+              binding_count="$(
+                jq '[.assets[]? | select(.name == "RELEASE-RUN.json")] | length' \
+                  "$release_state"
+              )"
+              if [ "$binding_count" -eq 1 ]; then
+                binding_download="$RUNNER_TEMP/existing-release-binding"
+                rm -rf "$binding_download"
+                mkdir -p "$binding_download"
+                gh release download "$RELEASE_TAG" \
+                  --repo "$EXECUTOR_REPOSITORY" \
+                  --pattern RELEASE-RUN.json \
+                  --dir "$binding_download"
+                if ! cmp "$run_binding" "$binding_download/RELEASE-RUN.json"; then
+                  echo "Release $RELEASE_TAG belongs to a different workflow run or source" >&2
+                  exit 1
+                fi
+              elif [ "$binding_count" -eq 0 ] && [ "$is_draft" = true ]; then
+                echo "Same-run draft is missing RELEASE-RUN.json; staging will repair it"
+              else
+                echo "Release $RELEASE_TAG must contain exactly one RELEASE-RUN.json asset" >&2
+                exit 1
+              fi
+
+              if [ "$is_draft" != true ]; then
+                echo "Same-run retry will reuse immutable published release $RELEASE_TAG"
+              else
+                echo "Same-run retry will repair and verify draft release $RELEASE_TAG"
+              fi
+          fi
+
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+            echo "Could not resolve the release commit timestamp" >&2
+            exit 1
+          fi
+
+          owner="$(printf '%s' "${EXECUTOR_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$version" == *-* ]]; then
+            channel=beta
+            prerelease=true
+          else
+            channel=latest
+            prerelease=false
+          fi
+
+          {
+            echo "channel=$channel"
+            echo "commit_sha=$actual_sha"
+            echo "image=ghcr.io/${owner}/executor"
+            echo "prerelease=$prerelease"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  authorize-publish:
+    name: Authorize protected native publication
+    if: inputs.mode == 'publish'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-release
+    permissions:
+      contents: read
+    outputs:
+      registry_username: ${{ steps.token.outputs.registry_username }}
+    steps:
+      - name: Require the environment-scoped release token and capabilities
+        id: token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "native-release must provide the NATIVE_RELEASE_TOKEN secret" >&2
+            exit 1
+          fi
+
+          token_owner="$(gh api user --jq .login)"
+          if [ "$token_owner" != bmdavis419 ]; then
+            echo "NATIVE_RELEASE_TOKEN must belong to bmdavis419, got $token_owner" >&2
+            exit 1
+          fi
+          oauth_scopes="$(
+            gh api --include user \
+              | awk -F ': ' 'tolower($1) == "x-oauth-scopes" { print $2; exit }' \
+              | tr -d '\r'
+          )"
+          python3 - "$oauth_scopes" <<'PY'
+          import sys
+
+          actual_scopes = {scope.strip() for scope in sys.argv[1].split(",") if scope.strip()}
+          expected_scopes = {"public_repo", "write:packages"}
+          if actual_scopes != expected_scopes:
+              raise SystemExit(
+                  "NATIVE_RELEASE_TOKEN must have exactly public_repo and write:packages scopes"
+              )
+          PY
+          if [ "$(gh api "repos/$EXECUTOR_REPOSITORY" --jq .permissions.push)" != true ]; then
+            echo "NATIVE_RELEASE_TOKEN cannot write to $EXECUTOR_REPOSITORY" >&2
+            exit 1
+          fi
+          if [ "$(
+            gh api "repos/$EXECUTOR_REPOSITORY/immutable-releases" --jq .enabled
+          )" != true ]; then
+            echo "Immutable releases must be enabled for $EXECUTOR_REPOSITORY" >&2
+            exit 1
+          fi
+
+          printf '%s' "$GH_TOKEN" \
+            | docker login ghcr.io --username "$token_owner" --password-stdin
+          docker logout ghcr.io
+          echo "registry_username=$token_owner" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact immutable release tag ruleset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          summaries="$RUNNER_TEMP/release-tag-rulesets.json"
+          details="$RUNNER_TEMP/release-tag-rulesets.ndjson"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$EXECUTOR_REPOSITORY/rulesets?includes_parents=true&per_page=100" \
+            > "$summaries"
+
+          : > "$details"
+          while IFS= read -r ruleset_id; do
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/$EXECUTOR_REPOSITORY/rulesets/$ruleset_id" \
+              >> "$details"
+            printf '\n' >> "$details"
+          done < <(
+            jq -r '.[] | select(.target == "tag" and .enforcement == "active") | .id' \
+              "$summaries"
+          )
+
+          python3 - "$details" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          rulesets = [
+              json.loads(line)
+              for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if line
+          ]
+          for ruleset in rulesets:
+              ref_name = ruleset.get("conditions", {}).get("ref_name", {})
+              rules = ruleset.get("rules", [])
+              rule_types = sorted(rule.get("type") for rule in rules)
+              update_rules = [rule for rule in rules if rule.get("type") == "update"]
+              if (
+                  ruleset.get("target") == "tag"
+                  and ruleset.get("enforcement") == "active"
+                  and ruleset.get("bypass_actors") == []
+                  and ref_name.get("include") == ["refs/tags/v*"]
+                  and ref_name.get("exclude") == []
+                  and rule_types == ["deletion", "update"]
+                  and len(update_rules) == 1
+                  and update_rules[0].get("parameters")
+                  == {"update_allows_fetch_and_merge": False}
+              ):
+                  break
+          else:
+              raise SystemExit(
+                  "an exact active no-bypass v* tag ruleset must restrict updates and deletions"
+              )
+          PY
+
+  web:
+    name: Build embedded web application once
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install web dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build embedded web application
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        run: bun run --cwd web build
+
+      - name: Verify canonical web payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f web/build/index.html
+          test -f web/build/THIRD_PARTY_JAVASCRIPT_LICENSES.json
+
+      - name: Upload canonical web payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-web-build
+          path: web/build/
+          if-no-files-found: error
+          compression-level: 9
+          overwrite: true
+          retention-days: 14
+
+  notices:
+    name: Generate third-party notices
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Generate dependency license inventory
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          cargo install cargo-about --version 0.9.0 --locked --features cli
+          cargo about generate about.hbs > THIRD_PARTY_LICENSES.html
+
+      - name: Upload notices
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-license-notices
+          path: THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+          compression-level: 9
+          overwrite: true
+          retention-days: 14
+
+  macos-service-tests:
+    name: Test macOS service lifecycle on compatibility floor
+    needs: validate
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Verify pinned compatibility-floor Apple toolchain
+        shell: bash
+        run: |
+          bash scripts/verify-apple-toolchain.sh \
+            "$MACOS_FLOOR_DEVELOPER_DIR" \
+            "$MACOS_FLOOR_XCODE_VERSION" \
+            "$MACOS_FLOOR_XCODE_BUILD" \
+            "$MACOS_FLOOR_SDK_VERSION" \
+            "$MACOS_FLOOR_CLANG_VERSION" \
+            "$MACOS_FLOOR_LD_VERSION"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Test Rust service lifecycle
+        env:
+          DEVELOPER_DIR: ${{ env.MACOS_FLOOR_DEVELOPER_DIR }}
+        run: cargo test --locked --lib service::tests
+
+      - name: Test LaunchAgent safety with isolated fixtures
+        run: bash scripts/test-install-launchd-safety.sh
+
+      - name: Test bounded LaunchAgent logging
+        run: bash scripts/test-bounded-log.sh
+
+      - name: Test archive install and uninstall lifecycle
+        run: bash scripts/test-install-release-archive.sh
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    needs:
+      - validate
+      - web
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download canonical web payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-web-build
+          path: web/build
+
+      - name: Verify canonical web payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f web/build/index.html
+          test -f web/build/THIRD_PARTY_JAVASCRIPT_LICENSES.json
+
+      - name: Verify pinned release Apple toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/verify-apple-toolchain.sh \
+            "$MACOS_BUILD_DEVELOPER_DIR" \
+            "$MACOS_BUILD_XCODE_VERSION" \
+            "$MACOS_BUILD_XCODE_BUILD" \
+            "$MACOS_BUILD_SDK_VERSION" \
+            "$MACOS_BUILD_CLANG_VERSION" \
+            "$MACOS_BUILD_LD_VERSION"
+
+      - name: Install Rust toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "${{ matrix.target }}"
+          rustup override set "$RUST_VERSION"
+
+      - name: Set up pinned Docker Buildx for Linux native build
+        if: runner.os == 'Linux'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Build Linux release binary in pinned Ubuntu 22.04 toolchain
+        if: runner.os == 'Linux'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        with:
+          context: .
+          file: Dockerfile.release-native
+          target: artifact
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            RUST_TARGET=${{ matrix.target }}
+            SOURCE_DATE_EPOCH=${{ needs.validate.outputs.source_date_epoch }}
+          build-contexts: |
+            release-web=web/build
+          outputs: type=local,dest=${{ runner.temp }}/pinned-native
+          provenance: false
+          sbom: false
+
+      - name: Stage pinned Linux release binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "target/${{ matrix.target }}/release"
+          install -m 0755 \
+            "$RUNNER_TEMP/pinned-native/executor" \
+            "target/${{ matrix.target }}/release/executor"
+
+      - name: Build macOS release binary
+        if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: ${{ env.MACOS_BUILD_DEVELOPER_DIR }}
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Verify macOS 14 deployment target
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          DEVELOPER_DIR: ${{ env.MACOS_BUILD_DEVELOPER_DIR }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/executor"
+          build_info="$(xcrun vtool -show-build "$binary")"
+          printf '%s\n' "$build_info"
+          minos="$(printf '%s\n' "$build_info" | awk '$1 == "minos" { print $2; exit }')"
+          if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "macOS release binary declares minos $minos, expected $MACOSX_DEPLOYMENT_TARGET" >&2
+            exit 1
+          fi
+
+      - name: Verify native binary version
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          actual="$(target/${{ matrix.target }}/release/executor --version)"
+          test "$actual" = "executor $EXPECTED_VERSION"
+
+      - name: Verify Linux glibc 2.35 compatibility ceiling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/executor"
+          max_glibc="$(readelf --version-info "$binary" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
+            | sed 's/^GLIBC_//' \
+            | sort -Vu \
+            | tail -n 1)"
+          test -n "$max_glibc"
+          if [ "$(printf '%s\n' "$max_glibc" 2.35 | sort -V | tail -n 1)" != 2.35 ]; then
+            echo "Linux release binary requires GLIBC_$max_glibc, above the 2.35 baseline" >&2
+            exit 1
+          fi
+
+      - name: Stage native binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/native-binary"
+          mkdir -p "$output"
+          install -m 0755 "target/${{ matrix.target }}/release/executor" "$output/executor"
+
+      - name: Upload raw native binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-native-${{ matrix.target }}
+          path: ${{ runner.temp }}/native-binary/executor
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  package-native:
+    name: Package native archives in pinned compressor environment
+    needs:
+      - build-native
+      - notices
+      - validate
+      - web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download raw native binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/native-binaries
+          pattern: executor-native-*
+
+      - name: Download third-party notices
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-license-notices
+          path: ${{ runner.temp }}/release-metadata
+
+      - name: Download canonical web payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-web-build
+          path: ${{ runner.temp }}/canonical-web
+
+      - name: Stage complete packaging input
+        shell: bash
+        run: |
+          set -euo pipefail
+          input="$RUNNER_TEMP/release-inputs"
+          mkdir -p "$input/native"
+          for target in \
+            aarch64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu; do
+              source="$RUNNER_TEMP/native-binaries/executor-native-$target/executor"
+              test -s "$source"
+              mkdir "$input/native/$target"
+              install -m 0755 "$source" "$input/native/$target/executor"
+          done
+          install -m 0644 LICENSE "$input/LICENSE"
+          install -m 0644 \
+            "$RUNNER_TEMP/release-metadata/THIRD_PARTY_LICENSES.html" \
+            "$input/THIRD_PARTY_LICENSES.html"
+          install -m 0644 \
+            "$RUNNER_TEMP/canonical-web/THIRD_PARTY_JAVASCRIPT_LICENSES.json" \
+            "$input/THIRD_PARTY_JAVASCRIPT_LICENSES.json"
+
+      - name: Set up pinned Docker Buildx for archive packaging
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Build archives in pinned Python and zlib environment
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.release-package
+          target: artifacts
+          build-args: |
+            BUILDKIT_IMAGE=${{ env.BUILDKIT_IMAGE }}
+            BUILDX_VERSION=${{ env.BUILDX_VERSION }}
+            MACOS_BUILD_CLANG_VERSION=${{ env.MACOS_BUILD_CLANG_VERSION }}
+            MACOS_BUILD_LD_VERSION=${{ env.MACOS_BUILD_LD_VERSION }}
+            MACOS_BUILD_SDK_VERSION=${{ env.MACOS_BUILD_SDK_VERSION }}
+            MACOS_BUILD_XCODE_BUILD=${{ env.MACOS_BUILD_XCODE_BUILD }}
+            MACOS_BUILD_XCODE_VERSION=${{ env.MACOS_BUILD_XCODE_VERSION }}
+            MACOS_FLOOR_CLANG_VERSION=${{ env.MACOS_FLOOR_CLANG_VERSION }}
+            MACOS_FLOOR_LD_VERSION=${{ env.MACOS_FLOOR_LD_VERSION }}
+            MACOS_FLOOR_SDK_VERSION=${{ env.MACOS_FLOOR_SDK_VERSION }}
+            MACOS_FLOOR_XCODE_BUILD=${{ env.MACOS_FLOOR_XCODE_BUILD }}
+            MACOS_FLOOR_XCODE_VERSION=${{ env.MACOS_FLOOR_XCODE_VERSION }}
+            REPRODUCIBILITY_RUN=first
+            SOURCE_DATE_EPOCH=${{ needs.validate.outputs.source_date_epoch }}
+          build-contexts: |
+            release-inputs=${{ runner.temp }}/release-inputs
+          outputs: type=local,dest=${{ runner.temp }}/release-artifacts
+          provenance: false
+          sbom: false
+
+      - name: Repeat pinned archive build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.release-package
+          target: artifacts
+          build-args: |
+            BUILDKIT_IMAGE=${{ env.BUILDKIT_IMAGE }}
+            BUILDX_VERSION=${{ env.BUILDX_VERSION }}
+            MACOS_BUILD_CLANG_VERSION=${{ env.MACOS_BUILD_CLANG_VERSION }}
+            MACOS_BUILD_LD_VERSION=${{ env.MACOS_BUILD_LD_VERSION }}
+            MACOS_BUILD_SDK_VERSION=${{ env.MACOS_BUILD_SDK_VERSION }}
+            MACOS_BUILD_XCODE_BUILD=${{ env.MACOS_BUILD_XCODE_BUILD }}
+            MACOS_BUILD_XCODE_VERSION=${{ env.MACOS_BUILD_XCODE_VERSION }}
+            MACOS_FLOOR_CLANG_VERSION=${{ env.MACOS_FLOOR_CLANG_VERSION }}
+            MACOS_FLOOR_LD_VERSION=${{ env.MACOS_FLOOR_LD_VERSION }}
+            MACOS_FLOOR_SDK_VERSION=${{ env.MACOS_FLOOR_SDK_VERSION }}
+            MACOS_FLOOR_XCODE_BUILD=${{ env.MACOS_FLOOR_XCODE_BUILD }}
+            MACOS_FLOOR_XCODE_VERSION=${{ env.MACOS_FLOOR_XCODE_VERSION }}
+            REPRODUCIBILITY_RUN=second
+            SOURCE_DATE_EPOCH=${{ needs.validate.outputs.source_date_epoch }}
+          build-contexts: |
+            release-inputs=${{ runner.temp }}/release-inputs
+          outputs: type=local,dest=${{ runner.temp }}/release-artifacts-repeat
+          provenance: false
+          sbom: false
+
+      - name: Verify byte-identical archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          first="$RUNNER_TEMP/release-artifacts"
+          second="$RUNNER_TEMP/release-artifacts-repeat"
+          cmp "$first/BUILD-TOOLCHAINS.txt" "$second/BUILD-TOOLCHAINS.txt"
+          for target in \
+            aarch64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu; do
+              archive="executor-${target}.tar.gz"
+              cmp "$first/$archive" "$second/$archive"
+              cmp "$first/$archive.sha256" "$second/$archive.sha256"
+              (cd "$first" && sha256sum --check "$archive.sha256")
+          done
+
+      - name: Upload canonical packaged archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-release-archives
+          path: ${{ runner.temp }}/release-artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  smoke-native:
+    name: Smoke packaged ${{ matrix.target }}
+    needs:
+      - package-native
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download packaged native archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-archives
+          path: ${{ runner.temp }}/release-archive
+
+      - name: Download canonical web payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-web-build
+          path: ${{ runner.temp }}/canonical-web
+
+      - name: Verify and extract packaged native archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="executor-${{ matrix.target }}.tar.gz"
+          input="$RUNNER_TEMP/release-archive"
+          output="$RUNNER_TEMP/packaged-executor"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$input" && sha256sum --check "$archive.sha256")
+          else
+            (cd "$input" && shasum -a 256 --check "$archive.sha256")
+          fi
+          mkdir -p "$output"
+          tar -xzf "$input/$archive" -C "$output"
+          test -x "$output/executor"
+
+      - name: Boot archive and verify first boot, health, and embedded web identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/packaged-executor/executor"
+          data_dir="$RUNNER_TEMP/executor-smoke-data"
+          log_file="$RUNNER_TEMP/executor-smoke.log"
+          port="$(python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()')"
+          mkdir -p "$data_dir"
+          chmod 0700 "$data_dir"
+
+          "$binary" server \
+            --bind "127.0.0.1:$port" \
+            --data-dir "$data_dir" \
+            > "$log_file" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            if kill -0 "$server_pid" >/dev/null 2>&1; then
+              kill -TERM "$server_pid" >/dev/null 2>&1 || true
+              wait "$server_pid" || true
+            fi
+            rm -rf "$data_dir"
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for _ in {1..120}; do
+            if curl --fail --silent --show-error "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            cat "$log_file" >&2
+            exit 1
+          fi
+
+          grep -F 'Complete first-boot setup at:' "$log_file" >/dev/null
+          grep -E "http://127\\.0\\.0\\.1:${port}/setup#token=.+" "$log_file" >/dev/null
+          scripts/smoke-release-server.sh \
+            "http://127.0.0.1:$port" \
+            "$RUNNER_TEMP/canonical-web"
+
+          kill -TERM "$server_pid"
+          wait "$server_pid"
+          trap - EXIT
+          rm -rf "$data_dir"
+
+  checksums:
+    name: Assemble checksum manifest
+    needs:
+      - macos-service-tests
+      - package-native
+      - smoke-native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download target artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-archives
+          path: release-artifacts
+
+      - name: Verify archives and assemble manifest
+        shell: bash
+        working-directory: release-artifacts
+        run: |
+          set -euo pipefail
+
+          expected_targets=(
+            aarch64-apple-darwin
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+          )
+
+          : > SHA256SUMS
+          for target in "${expected_targets[@]}"; do
+            archive="executor-${target}.tar.gz"
+            sidecar="${archive}.sha256"
+            test -f "$archive"
+            test -f "$sidecar"
+            cat "$sidecar" >> SHA256SUMS
+          done
+
+          test "$(find . -maxdepth 1 -name 'executor-*.tar.gz' -type f | wc -l)" -eq 4
+          test -s BUILD-TOOLCHAINS.txt
+          sha256sum BUILD-TOOLCHAINS.txt >> SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload complete release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-release-artifacts
+          path: release-artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  stage-release:
+    name: Stage draft GitHub release
+    if: inputs.mode == 'publish'
+    needs:
+      - assemble-container
+      - authorize-publish
+      - checksums
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-artifacts
+          path: release-artifacts
+
+      - name: Create or reuse draft and upload exact assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --no-tags origin \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [ "$tag_sha" != "$RELEASE_SHA" ]; then
+            echo "Release tag $RELEASE_TAG moved to $tag_sha, expected $RELEASE_SHA" >&2
+            exit 1
+          fi
+
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid assembled container digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          bindings="$RUNNER_TEMP/release-bindings"
+          mkdir -p "$bindings"
+          run_binding="$bindings/RELEASE-RUN.json"
+          image_binding="$bindings/RELEASE-IMAGE.json"
+          python3 - \
+            "$run_binding" \
+            "$image_binding" \
+            "$EXECUTOR_REPOSITORY" \
+            "$RELEASE_TAG" \
+            "$RELEASE_SHA" \
+            "$RUN_ID" \
+            "$IMAGE" \
+            "$IMAGE_DIGEST" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          run_binding = {
+              "commit": sys.argv[5],
+              "repository": sys.argv[3],
+              "run_id": sys.argv[6],
+              "tag": sys.argv[4],
+          }
+          image_binding = {
+              **run_binding,
+              "digest": sys.argv[8],
+              "image": sys.argv[7],
+          }
+          for path, binding in (
+              (sys.argv[1], run_binding),
+              (sys.argv[2], image_binding),
+          ):
+              pathlib.Path(path).write_text(
+                  json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n",
+                  encoding="utf-8",
+              )
+          PY
+
+          assets=(
+            "$image_binding"
+            "$run_binding"
+            release-artifacts/BUILD-TOOLCHAINS.txt
+            release-artifacts/executor-aarch64-apple-darwin.tar.gz
+            release-artifacts/executor-aarch64-apple-darwin.tar.gz.sha256
+            release-artifacts/executor-aarch64-unknown-linux-gnu.tar.gz
+            release-artifacts/executor-aarch64-unknown-linux-gnu.tar.gz.sha256
+            release-artifacts/executor-x86_64-apple-darwin.tar.gz
+            release-artifacts/executor-x86_64-apple-darwin.tar.gz.sha256
+            release-artifacts/executor-x86_64-unknown-linux-gnu.tar.gz
+            release-artifacts/executor-x86_64-unknown-linux-gnu.tar.gz.sha256
+            release-artifacts/SHA256SUMS
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+
+          release_title="$RELEASE_TAG [executor-run:$RUN_ID]"
+          published_release=false
+          if gh release view "$RELEASE_TAG" --repo "$EXECUTOR_REPOSITORY" >/dev/null 2>&1; then
+            release_state="$RUNNER_TEMP/staged-release.json"
+            gh api "repos/$EXECUTOR_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_state"
+            actual_title="$(jq -r '.name // ""' "$release_state")"
+            if [ "$actual_title" != "$release_title" ]; then
+              echo "Release $RELEASE_TAG belongs to a different workflow run" >&2
+              exit 1
+            fi
+            python3 - "$release_state" "$RELEASE_TAG" "$RELEASE_SHA" "$PRERELEASE" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_prerelease = sys.argv[4] == "true"
+          if (
+              release.get("tag_name") != sys.argv[2]
+              or release.get("target_commitish") != sys.argv[3]
+              or release.get("prerelease") is not expected_prerelease
+              or release.get("draft") not in (True, False)
+          ):
+              raise SystemExit("existing release does not match the validated release state")
+          if release.get("draft") is False and release.get("immutable") is not True:
+              raise SystemExit("published release is not immutable")
+          PY
+
+            is_draft="$(jq -r .draft "$release_state")"
+            binding_count="$(
+              jq '[.assets[]? | select(.name == "RELEASE-RUN.json")] | length' \
+                "$release_state"
+            )"
+            if [ "$binding_count" -eq 1 ]; then
+              ownership="$RUNNER_TEMP/existing-release-ownership"
+              rm -rf "$ownership"
+              mkdir -p "$ownership"
+              gh release download "$RELEASE_TAG" \
+                --repo "$EXECUTOR_REPOSITORY" \
+                --pattern RELEASE-RUN.json \
+                --dir "$ownership"
+              if ! cmp "$run_binding" "$ownership/RELEASE-RUN.json"; then
+                echo "Release $RELEASE_TAG belongs to a different workflow run or source" >&2
+                exit 1
+              fi
+            elif [ "$binding_count" -eq 0 ] && [ "$is_draft" = true ]; then
+              echo "Recovering same-run draft created before its binding asset uploaded"
+            else
+              echo "Release $RELEASE_TAG must contain exactly one RELEASE-RUN.json asset" >&2
+              exit 1
+            fi
+
+            if [ "$is_draft" != true ]; then
+              published_release=true
+            fi
+          else
+            args=(
+              release create "$RELEASE_TAG"
+              --repo "$EXECUTOR_REPOSITORY"
+              --title "$release_title"
+              --target "$RELEASE_SHA"
+              --verify-tag
+              --generate-notes
+              --draft
+            )
+            if [ "$PRERELEASE" = true ]; then
+              args+=(--prerelease)
+            fi
+            gh "${args[@]}"
+          fi
+
+          if [ "$published_release" = false ]; then
+            gh release upload "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --repo "$EXECUTOR_REPOSITORY" \
+              --clobber
+          fi
+
+          expected_assets="$(for asset in "${assets[@]}"; do basename "$asset"; done | sort)"
+          remote_assets="$(gh release view "$RELEASE_TAG" --repo "$EXECUTOR_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          if [ "$remote_assets" != "$expected_assets" ]; then
+            echo "Release assets do not match the exact native release bundle" >&2
+            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$remote_assets") || true
+            exit 1
+          fi
+
+          verified_assets="$RUNNER_TEMP/verified-release-assets"
+          rm -rf "$verified_assets"
+          mkdir -p "$verified_assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$EXECUTOR_REPOSITORY" \
+            --dir "$verified_assets"
+          for asset in "${assets[@]}"; do
+            cmp "$asset" "$verified_assets/$(basename "$asset")"
+          done
+
+  build-container-dry-run:
+    name: Dry-run container ${{ matrix.platform }}
+    if: inputs.mode == 'dry-run'
+    needs:
+      - checksums
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            artifact: amd64
+            platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            artifact: arm64
+            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download matching native release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-artifacts
+          path: ${{ runner.temp }}/release-archive
+
+      - name: Download canonical web payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-web-build
+          path: ${{ runner.temp }}/canonical-web
+
+      - name: Verify and extract native release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="executor-${{ matrix.target }}.tar.gz"
+          input="$RUNNER_TEMP/release-archive"
+          output="$RUNNER_TEMP/prebuilt-executor"
+          (cd "$input" && sha256sum --check "$archive.sha256")
+          mkdir -p "$output"
+          tar -xzf "$input/$archive" -C "$output"
+          test -x "$output/executor"
+          test -f "$output/LICENSE"
+          test -f "$output/THIRD_PARTY_LICENSES.html"
+          test -f "$output/THIRD_PARTY_JAVASCRIPT_LICENSES.json"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Build prebuilt runtime without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-prebuilt
+          platforms: ${{ matrix.platform }}
+          build-contexts: |
+            prebuilt-executor=${{ runner.temp }}/prebuilt-executor
+          load: true
+          push: false
+          tags: executor-release-smoke:${{ matrix.artifact }}
+          labels: |
+            org.opencontainers.image.title=Executor
+            org.opencontainers.image.description=Native self-hosted Executor
+            org.opencontainers.image.source=https://github.com/${{ env.EXECUTOR_REPOSITORY }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          provenance: false
+          sbom: false
+
+      - name: Smoke release-only prebuilt image path
+        shell: bash
+        run: |
+          scripts/smoke-release-container.sh \
+            "executor-release-smoke:${{ matrix.artifact }}" \
+            "$RUNNER_TEMP/canonical-web" \
+            "executor-release-smoke-${GITHUB_RUN_ID}-${{ matrix.artifact }}" \
+            "executor-release-smoke-data-${GITHUB_RUN_ID}-${{ matrix.artifact }}"
+
+  publish-container-arch:
+    name: Publish container ${{ matrix.platform }} by digest
+    if: inputs.mode == 'publish'
+    needs:
+      - authorize-publish
+      - checksums
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-gnu
+            artifact: amd64
+          - runner: ubuntu-22.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-gnu
+            artifact: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    environment: native-release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download matching native release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-artifacts
+          path: ${{ runner.temp }}/release-archive
+
+      - name: Verify and extract native release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="executor-${{ matrix.target }}.tar.gz"
+          input="$RUNNER_TEMP/release-archive"
+          output="$RUNNER_TEMP/prebuilt-executor"
+          (cd "$input" && sha256sum --check "$archive.sha256")
+          mkdir -p "$output"
+          tar -xzf "$input/$archive" -C "$output"
+          test -x "$output/executor"
+          test -f "$output/LICENSE"
+          test -f "$output/THIRD_PARTY_LICENSES.html"
+          test -f "$output/THIRD_PARTY_JAVASCRIPT_LICENSES.json"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ needs.authorize-publish.outputs.registry_username }}
+          password: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+
+      - name: Build and push architecture image by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_date_epoch }}
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-prebuilt
+          platforms: ${{ matrix.platform }}
+          build-contexts: |
+            prebuilt-executor=${{ runner.temp }}/prebuilt-executor
+          outputs: type=image,name=${{ needs.validate.outputs.image }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
+          labels: |
+            org.opencontainers.image.title=Executor
+            org.opencontainers.image.description=Native self-hosted Executor
+            org.opencontainers.image.source=https://github.com/${{ env.EXECUTOR_REPOSITORY }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          provenance: false
+          sbom: false
+
+      - name: Export architecture digest
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid architecture image digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/container-digests"
+          touch "$RUNNER_TEMP/container-digests/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload architecture digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: executor-container-digest-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/container-digests/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+  assemble-container:
+    name: Assemble multi-platform container manifest
+    if: inputs.mode == 'publish'
+    needs:
+      - authorize-publish
+      - publish-container-arch
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-release
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download architecture digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/container-digests
+          pattern: executor-container-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ needs.authorize-publish.outputs.registry_username }}
+          password: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+
+      - name: Assemble and verify staging manifest
+        id: manifest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(find "$RUNNER_TEMP/container-digests" -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "${#digests[@]}" -ne 2 ]; then
+            echo "Expected two architecture digests, found ${#digests[@]}" >&2
+            exit 1
+          fi
+
+          sources=()
+          for digest in "${digests[@]}"; do
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid architecture digest: $digest" >&2
+              exit 1
+            fi
+            sources+=("$IMAGE@sha256:$digest")
+          done
+
+          staging="$IMAGE:staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --tag "$staging" \
+            "${sources[@]}"
+          raw_manifest="$(docker buildx imagetools inspect "$staging" --raw)"
+          python3 scripts/verify-release-index.py \
+            --version "$VERSION" \
+            <<< "$raw_manifest"
+
+          digest="$(docker buildx imagetools inspect "$staging" | awk '$1 == "Digest:" { print $2; exit }')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid assembled image digest: $digest" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  smoke-container:
+    name: Smoke published prebuilt container ${{ matrix.platform }}
+    if: inputs.mode == 'publish'
+    needs:
+      - assemble-container
+      - authorize-publish
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            artifact: amd64
+            platform: linux/amd64
+          - runner: ubuntu-22.04-arm
+            artifact: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    environment: native-release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download canonical web payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-web-build
+          path: ${{ runner.temp }}/canonical-web
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ needs.authorize-publish.outputs.registry_username }}
+          password: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+
+      - name: Pull and smoke exact assembled digest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+        run: |
+          set -euo pipefail
+          reference="$IMAGE@$IMAGE_DIGEST"
+          docker pull "$reference"
+          scripts/smoke-release-container.sh \
+            "$reference" \
+            "$RUNNER_TEMP/canonical-web" \
+            "executor-published-smoke-${GITHUB_RUN_ID}-${{ matrix.artifact }}" \
+            "executor-published-smoke-data-${GITHUB_RUN_ID}-${{ matrix.artifact }}"
+
+      - name: Verify exact digest is anonymously pullable
+        shell: bash
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+        run: |
+          set -euo pipefail
+          anonymous_config="$RUNNER_TEMP/anonymous-docker-config"
+          mkdir -p "$anonymous_config"
+          DOCKER_CONFIG="$anonymous_config" docker pull "$IMAGE@$IMAGE_DIGEST"
+
+  promote:
+    name: Promote release
+    if: inputs.mode == 'publish'
+    needs:
+      - assemble-container
+      - authorize-publish
+      - smoke-container
+      - stage-release
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: native-release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release bundle for final verification
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: executor-release-artifacts
+          path: release-artifacts
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          version: ${{ env.BUILDX_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ needs.authorize-publish.outputs.registry_username }}
+          password: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+
+      - name: Revalidate remote release tag before promotion
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [ "$tag_sha" != "$RELEASE_SHA" ]; then
+            echo "Release tag $RELEASE_TAG moved to $tag_sha, expected $RELEASE_SHA" >&2
+            exit 1
+          fi
+
+      - name: Assign immutable tags and verify channel eligibility
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.validate.outputs.channel }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+          RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid container digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          inspect_digest() {
+            local reference="$1"
+            local error_file="$RUNNER_TEMP/imagetools-inspect-error"
+            local output digest
+            : > "$error_file"
+            if output="$(docker buildx imagetools inspect "$reference" 2>"$error_file")"; then
+              digest="$(awk '$1 == "Digest:" { print $2; exit }' <<< "$output")"
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "Could not resolve a valid digest for $reference" >&2
+                return 2
+              fi
+              printf '%s\n' "$digest"
+              return 0
+            fi
+            if grep -Eqi 'manifest unknown|not found|404' "$error_file"; then
+              return 1
+            fi
+            cat "$error_file" >&2
+            return 2
+          }
+
+          release_history="$RUNNER_TEMP/published-releases.json"
+          gh api --paginate --slurp \
+            "repos/$EXECUTOR_REPOSITORY/releases?per_page=100" \
+            > "$release_history"
+          history_relation="$(
+            python3 scripts/check-release-channel-order.py \
+              --channel "$CHANNEL" \
+              --history-file "$release_history" \
+              --candidate "$VERSION"
+          )"
+          echo "Published release history permits $history_relation candidate $VERSION"
+
+          channel_reference="$IMAGE:$CHANNEL"
+          if current_channel_digest="$(inspect_digest "$channel_reference")"; then
+            channel_manifest="$(docker buildx imagetools inspect "$channel_reference" --raw)"
+            current_channel_version="$(
+              jq -r '.annotations["org.opencontainers.image.version"] // ""' \
+                <<< "$channel_manifest"
+            )"
+            if [ -z "$current_channel_version" ]; then
+              echo "Existing channel $channel_reference has no release version annotation" >&2
+              exit 1
+            fi
+            relation="$(
+              python3 scripts/check-release-channel-order.py \
+                --channel "$CHANNEL" \
+                --current "$current_channel_version" \
+                --candidate "$VERSION"
+            )"
+            if [ "$relation" = equal ]; then
+              if [ "$current_channel_digest" != "$IMAGE_DIGEST" ]; then
+                echo "Channel $channel_reference already has version $VERSION at a different digest" >&2
+                exit 1
+              fi
+              echo "Channel $channel_reference already points to the expected digest"
+            fi
+          else
+            rc=$?
+            if [ "$rc" -ne 1 ]; then
+              exit "$rc"
+            fi
+            echo "Channel $channel_reference does not exist yet"
+          fi
+
+          immutable_tags=("$RELEASE_TAG" "$VERSION" "sha-$RELEASE_SHA")
+          missing_tags=()
+          for tag in "${immutable_tags[@]}"; do
+            reference="$IMAGE:$tag"
+            if existing="$(inspect_digest "$reference")"; then
+              if [ "$existing" != "$IMAGE_DIGEST" ]; then
+                echo "Immutable tag $reference already points to $existing, expected $IMAGE_DIGEST" >&2
+                exit 1
+              fi
+              echo "Immutable tag $reference already points to the expected digest"
+            else
+              status=$?
+              if [ "$status" -ne 1 ]; then
+                exit "$status"
+              fi
+              missing_tags+=("$tag")
+            fi
+          done
+
+          for tag in "${missing_tags[@]}"; do
+            docker buildx imagetools create \
+              --tag "$IMAGE:$tag" \
+              "$IMAGE@$IMAGE_DIGEST"
+          done
+
+          for tag in "${immutable_tags[@]}"; do
+            actual="$(inspect_digest "$IMAGE:$tag")"
+            if [ "$actual" != "$IMAGE_DIGEST" ]; then
+              echo "Immutable tag $IMAGE:$tag resolved to $actual after assignment" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify release ownership and image binding before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+          RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid assembled container digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          release_title="$RELEASE_TAG [executor-run:$RUN_ID]"
+          release_state="$RUNNER_TEMP/pre-publication-release.json"
+          gh api "repos/$EXECUTOR_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_state"
+          python3 - \
+            "$release_state" \
+            "$RELEASE_TAG" \
+            "$RELEASE_SHA" \
+            "$release_title" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              release.get("tag_name") != sys.argv[2]
+              or release.get("target_commitish") != sys.argv[3]
+              or release.get("name") != sys.argv[4]
+              or release.get("draft") not in (True, False)
+          ):
+              raise SystemExit("release ownership does not match this workflow run")
+          if release.get("draft") is False and release.get("immutable") is not True:
+              raise SystemExit("published release is not immutable")
+          PY
+
+          bindings="$RUNNER_TEMP/final-release-bindings"
+          mkdir -p "$bindings"
+          run_binding="$bindings/RELEASE-RUN.json"
+          image_binding="$bindings/RELEASE-IMAGE.json"
+          python3 - \
+            "$run_binding" \
+            "$image_binding" \
+            "$EXECUTOR_REPOSITORY" \
+            "$RELEASE_TAG" \
+            "$RELEASE_SHA" \
+            "$RUN_ID" \
+            "$IMAGE" \
+            "$IMAGE_DIGEST" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          run_binding = {
+              "commit": sys.argv[5],
+              "repository": sys.argv[3],
+              "run_id": sys.argv[6],
+              "tag": sys.argv[4],
+          }
+          image_binding = {
+              **run_binding,
+              "digest": sys.argv[8],
+              "image": sys.argv[7],
+          }
+          for path, binding in (
+              (sys.argv[1], run_binding),
+              (sys.argv[2], image_binding),
+          ):
+              pathlib.Path(path).write_text(
+                  json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n",
+                  encoding="utf-8",
+              )
+          PY
+
+          assets=(
+            "$image_binding"
+            "$run_binding"
+            release-artifacts/BUILD-TOOLCHAINS.txt
+            release-artifacts/executor-aarch64-apple-darwin.tar.gz
+            release-artifacts/executor-aarch64-apple-darwin.tar.gz.sha256
+            release-artifacts/executor-aarch64-unknown-linux-gnu.tar.gz
+            release-artifacts/executor-aarch64-unknown-linux-gnu.tar.gz.sha256
+            release-artifacts/executor-x86_64-apple-darwin.tar.gz
+            release-artifacts/executor-x86_64-apple-darwin.tar.gz.sha256
+            release-artifacts/executor-x86_64-unknown-linux-gnu.tar.gz
+            release-artifacts/executor-x86_64-unknown-linux-gnu.tar.gz.sha256
+            release-artifacts/SHA256SUMS
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+
+          expected_assets="$(for asset in "${assets[@]}"; do basename "$asset"; done | sort)"
+          remote_assets="$(gh release view "$RELEASE_TAG" --repo "$EXECUTOR_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          if [ "$remote_assets" != "$expected_assets" ]; then
+            echo "Release assets do not match the exact pre-publication bundle" >&2
+            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$remote_assets") || true
+            exit 1
+          fi
+
+          verified_assets="$RUNNER_TEMP/final-verified-release-assets"
+          rm -rf "$verified_assets"
+          mkdir -p "$verified_assets"
+          gh release download "$RELEASE_TAG" \
+            --repo "$EXECUTOR_REPOSITORY" \
+            --dir "$verified_assets"
+          for asset in "${assets[@]}"; do
+            cmp "$asset" "$verified_assets/$(basename "$asset")"
+          done
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          is_draft="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$EXECUTOR_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )"
+          if [ "$is_draft" = true ]; then
+            args=(release edit "$RELEASE_TAG" --repo "$EXECUTOR_REPOSITORY" --draft=false)
+            if [ "$PRERELEASE" = true ]; then
+              args+=(--prerelease)
+            else
+              args+=(--latest)
+            fi
+            gh "${args[@]}"
+          else
+            actual_prerelease="$(
+              gh release view "$RELEASE_TAG" \
+                --repo "$EXECUTOR_REPOSITORY" \
+                --json isPrerelease \
+                --jq .isPrerelease
+            )"
+            if [ "$actual_prerelease" != "$PRERELEASE" ]; then
+              echo "Published release $RELEASE_TAG has unexpected prerelease state" >&2
+              exit 1
+            fi
+            echo "GitHub release $RELEASE_TAG is already published"
+          fi
+
+      - name: Verify published GitHub release is immutable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_SHA: ${{ needs.validate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          release_state="$RUNNER_TEMP/published-release.json"
+          gh api "repos/$EXECUTOR_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_state"
+          release_title="$RELEASE_TAG [executor-run:$RUN_ID]"
+          python3 - \
+            "$release_state" \
+            "$RELEASE_TAG" \
+            "$RELEASE_SHA" \
+            "$PRERELEASE" \
+            "$release_title" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              release.get("tag_name") != sys.argv[2]
+              or release.get("target_commitish") != sys.argv[3]
+              or release.get("draft") is not False
+              or release.get("prerelease") is not (sys.argv[4] == "true")
+              or release.get("name") != sys.argv[5]
+              or release.get("immutable") is not True
+          ):
+              raise SystemExit("published GitHub release is not the expected immutable release")
+          PY
+
+          verified=false
+          verification_error="$RUNNER_TEMP/release-attestation-error"
+          verification_output="$RUNNER_TEMP/release-attestation.json"
+          for attempt in {1..24}; do
+            if gh release verify "$RELEASE_TAG" \
+              --repo "$EXECUTOR_REPOSITORY" \
+              --format json \
+              > "$verification_output" \
+              2> "$verification_error"; then
+                cat "$verification_output"
+                verified=true
+                break
+            fi
+            if [ "$attempt" -lt 24 ]; then
+              sleep 5
+            fi
+          done
+          if [ "$verified" != true ]; then
+            cat "$verification_error" >&2
+            echo "GitHub release attestation was not available after bounded retries" >&2
+            exit 1
+          fi
+
+      - name: Move mutable channel after GitHub release publication
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.validate.outputs.channel }}
+          GH_TOKEN: ${{ secrets.NATIVE_RELEASE_TOKEN }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.assemble-container.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$EXECUTOR_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )" = false
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid container digest: $IMAGE_DIGEST" >&2
+            exit 1
+          fi
+
+          inspect_digest() {
+            local reference="$1"
+            local error_file="$RUNNER_TEMP/imagetools-inspect-error"
+            local output digest
+            : > "$error_file"
+            if output="$(docker buildx imagetools inspect "$reference" 2>"$error_file")"; then
+              digest="$(awk '$1 == "Digest:" { print $2; exit }' <<< "$output")"
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "Could not resolve a valid digest for $reference" >&2
+                return 2
+              fi
+              printf '%s\n' "$digest"
+              return 0
+            fi
+            if grep -Eqi 'manifest unknown|not found|404' "$error_file"; then
+              return 1
+            fi
+            cat "$error_file" >&2
+            return 2
+          }
+
+          release_history="$RUNNER_TEMP/published-releases-after-promotion.json"
+          gh api --paginate --slurp \
+            "repos/$EXECUTOR_REPOSITORY/releases?per_page=100" \
+            > "$release_history"
+          python3 scripts/check-release-channel-order.py \
+            --channel "$CHANNEL" \
+            --history-file "$release_history" \
+            --candidate "$VERSION"
+
+          channel_reference="$IMAGE:$CHANNEL"
+          move_channel=true
+          if current_channel_digest="$(inspect_digest "$channel_reference")"; then
+            channel_manifest="$(docker buildx imagetools inspect "$channel_reference" --raw)"
+            current_channel_version="$(
+              jq -r '.annotations["org.opencontainers.image.version"] // ""' \
+                <<< "$channel_manifest"
+            )"
+            if [ -z "$current_channel_version" ]; then
+              echo "Existing channel $channel_reference has no release version annotation" >&2
+              exit 1
+            fi
+            relation="$(
+              python3 scripts/check-release-channel-order.py \
+                --channel "$CHANNEL" \
+                --current "$current_channel_version" \
+                --candidate "$VERSION"
+            )"
+            if [ "$relation" = equal ]; then
+              if [ "$current_channel_digest" != "$IMAGE_DIGEST" ]; then
+                echo "Channel $channel_reference already has version $VERSION at a different digest" >&2
+                exit 1
+              fi
+              move_channel=false
+            fi
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+          fi
+
+          if [ "$move_channel" = true ]; then
+            docker buildx imagetools create \
+              --tag "$channel_reference" \
+              "$IMAGE@$IMAGE_DIGEST"
+          fi
+          channel_digest="$(inspect_digest "$channel_reference")"
+          if [ "$channel_digest" != "$IMAGE_DIGEST" ]; then
+            echo "Channel tag $channel_reference resolved to $channel_digest" >&2
+            exit 1
+          fi

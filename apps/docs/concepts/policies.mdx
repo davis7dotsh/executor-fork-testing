@@ -1,14 +1,13 @@
 ---
-title: Policies
-description: "Policies control whether each tool is always allowed, requires approval, or is blocked."
+title: "Legacy concept: policies"
+description: "The supported product controls tools with explicit tool modes."
 ---
 
-A **policy** controls what an agent can do with each tool:
+<Warning>
+  This page preserves an old term for incoming links. The active self-hosted product uses
+  **Inherit**, **Enabled**, **Ask**, and **Disabled** tool modes.
+</Warning>
 
-- **Allow**: the tool runs without interruption.
-- **Require approval**: the call pauses until a human approves it.
-- **Block**: the tool can't be called.
-
-Policies start from a sensible default derived from the integration's spec. For example,
-read-only `GET` operations on an OpenAPI spec are allowed by default, while writes can be
-set to require approval. You can tune the policy for any tool at any time.
+<Card title="Read about Tool modes" href="/concepts/tool-modes" horizontal>
+  Review the global tool set and choose when calls run, wait for approval, or remain unavailable.
+</Card>

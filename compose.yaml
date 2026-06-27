@@ -1,0 +1,65 @@
+name: executor
+
+services:
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "${EXECUTOR_IMAGE:-executor:local}"
+    command:
+      - server
+      - --bind
+      - 0.0.0.0:4788
+      - --allow-unsafe-http-non-loopback
+    restart: unless-stopped
+    init: true
+    read_only: true
+    mem_limit: "${EXECUTOR_MEMORY_LIMIT:-2g}"
+    pids_limit: "${EXECUTOR_PIDS_LIMIT:-512}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:4788:4788"
+    environment:
+      EXECUTOR_DATA_DIR: /var/lib/executor
+      # When changing the published port, also set EXECUTOR_PUBLIC_ORIGIN to
+      # the exact URL used in the browser. Keep plain HTTP on host loopback.
+      EXECUTOR_PUBLIC_ORIGIN: "${EXECUTOR_PUBLIC_ORIGIN:-http://127.0.0.1:4788}"
+      EXECUTOR_MCP_STDIO_TEMPLATES_FILE: /etc/executor/mcp-stdio.json
+      # Null means pass through only when the host variable is set.
+      EXECUTOR_TRUSTED_PROXIES:
+      RUST_LOG: "${RUST_LOG:-executor=info}"
+    volumes:
+      - executor-data:/var/lib/executor
+      - ./docker/mcp-stdio-templates.example.json:/etc/executor/mcp-stdio.json:ro
+      # By default, Executor creates master.key with mode 0600 in the data
+      # volume. To supply an external exact 32-byte key instead, make it
+      # readable by container UID 10001, mount it read-only, and add
+      # EXECUTOR_MASTER_KEY_FILE=/run/secrets/executor-master.key above.
+      # - ./secrets/executor-master.key:/run/secrets/executor-master.key:ro
+      # Mount only fully trusted, self-contained Linux stdio MCP executables.
+      # They run as Executor's UID and can read the data volume and master key.
+      # Use the absolute container paths from mcp-stdio.json. The base image
+      # does not include Node or Bun. Writeable state must remain under a
+      # mounted volume or /tmp.
+      # - /absolute/host/mcp:/opt/executor/mcp:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:4788/healthz
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 2m
+
+volumes:
+  executor-data:

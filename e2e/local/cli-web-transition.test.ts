@@ -25,7 +25,7 @@ scenario(
     const root = mkdtempSync(join(tmpdir(), "executor-web-transition-"));
     const dataDir = join(root, "data");
     try {
-      const { stdout, stderr } = await execFileAsync("bun", ["run", "dev:cli", "web"], {
+      const { stdout, stderr } = await execFileAsync("bun", ["run", "legacy:dev:cli", "web"], {
         cwd: repoRoot,
         env: { ...process.env, EXECUTOR_DATA_DIR: dataDir },
       });

@@ -1,0 +1,40 @@
+{
+  "name": "executor",
+  "version": "1.5.20",
+  "private": true,
+  "bin": {
+    "executor": "./bin/executor.ts"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/main.ts"
+  },
+  "scripts": {
+    "build": "bun run src/build.ts binary --single",
+    "build:all": "bun run src/build.ts binary",
+    "build:preview": "bun run src/build.ts preview",
+    "build:preview:tarball": "bun run src/build.ts preview-tarball",
+    "build:preview:wrapper": "bun run src/build.ts preview-wrapper",
+    "test": "bun --bun vitest run",
+    "typecheck": "tsgo --noEmit",
+    "typecheck:slow": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "catalog:",
+    "@executor-js/api": "workspace:*",
+    "@executor-js/integrations-registry": "workspace:*",
+    "@executor-js/local": "workspace:*",
+    "@executor-js/runtime-quickjs": "workspace:*",
+    "@executor-js/sdk": "workspace:*",
+    "@jitl/quickjs-wasmfile-release-sync": "catalog:",
+    "@sentry/bun": "^10.57.0",
+    "effect": "catalog:",
+    "quickjs-emscripten": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "bun-types": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

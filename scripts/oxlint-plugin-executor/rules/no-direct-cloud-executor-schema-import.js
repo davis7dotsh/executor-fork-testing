@@ -3,9 +3,12 @@ import { getPropertyName, isIdentifier, toRepoRelative, unwrapExpression } from 
 const message =
   "Do not access cloud executor tables directly outside DB schema wiring. Executor-domain table access must go through the scoped SDK adapter so scope_id filtering cannot be skipped.";
 
-const allowedFiles = new Set(["apps/cloud/src/db/db.ts", "apps/cloud/src/db/db.schema.test.ts"]);
+const allowedFiles = new Set([
+  "legacy/cloud/src/db/db.ts",
+  "legacy/cloud/src/db/db.schema.test.ts",
+]);
 
-const isCloudSource = (filename) => toRepoRelative(filename).startsWith("apps/cloud/src/");
+const isCloudSource = (filename) => toRepoRelative(filename).startsWith("legacy/cloud/src/");
 
 const isDirectExecutorSchemaImport = (specifier) =>
   specifier === "./executor-schema" ||

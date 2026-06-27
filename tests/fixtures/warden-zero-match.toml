@@ -1,0 +1,8 @@
+version = 1
+
+[defaults]
+ignorePaths = []
+
+[[skills]]
+name = "zero-match-fixture"
+paths = ["tests/fixtures/does-not-exist/**/*.ts"]

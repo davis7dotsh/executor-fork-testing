@@ -26,6 +26,15 @@ export interface BrowserSurface {
     identity: Identity,
     drive: (session: BrowserSession) => Promise<void>,
   ) => Effect.Effect<void>;
+  /**
+   * Drive credential entry without persisting network bodies, DOM snapshots,
+   * or video. Step screenshots are still written after each action, so callers
+   * must leave the page in a secret-free state before a step returns.
+   */
+  readonly privateSession: (
+    identity: Identity,
+    drive: (session: BrowserSession) => Promise<void>,
+  ) => Effect.Effect<void>;
 }
 
 const slug = (text: string): string =>
@@ -37,8 +46,12 @@ const slug = (text: string): string =>
 
 // acquireUseRelease so a vitest timeout (fiber interruption) still closes the
 // browser and flushes video + trace — a bare promise would leak Chromium.
-export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface => ({
-  session: (identity, drive) =>
+export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface => {
+  const session = (
+    identity: Identity,
+    drive: (session: BrowserSession) => Promise<void>,
+    record: boolean,
+  ) =>
     Effect.acquireUseRelease(
       Effect.promise(async () => {
         const videoTmp = join(dir, ".video-tmp");
@@ -66,14 +79,16 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
         const context = await browser.newContext({
           colorScheme: "dark",
           viewport: { width: 1280, height: 800 },
-          recordVideo: { dir: videoTmp, size: { width: 1280, height: 800 } },
+          ...(record ? { recordVideo: { dir: videoTmp, size: { width: 1280, height: 800 } } } : {}),
           baseURL: target.baseUrl,
         });
-        await context.tracing.start({
-          screenshots: true,
-          snapshots: true,
-          sources: true,
-        });
+        if (record) {
+          await context.tracing.start({
+            screenshots: true,
+            snapshots: true,
+            sources: true,
+          });
+        }
         if (identity.cookies?.length) {
           await context.addCookies(
             identity.cookies.map((cookie) => ({
@@ -85,13 +100,15 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
         const page = await context.newPage();
         // The session video's clock starts with the page; anchor it for the
         // run's focus timeline (scripts/film.ts cuts on these).
-        markRecordingStart(dir, "browser");
+        if (record) markRecordingStart(dir, "browser");
         // Main-frame navigations feed the viewer's synthetic URL bar — the
         // recording itself is chromeless, so this is the only place the
         // address the developer "typed" survives.
-        page.on("framenavigated", (frame) => {
-          if (frame === page.mainFrame()) markNavigation(dir, frame.url());
-        });
+        if (record) {
+          page.on("framenavigated", (frame) => {
+            if (frame === page.mainFrame()) markNavigation(dir, frame.url());
+          });
+        }
         // Harvest distributed-trace ids: every app API request carries a W3C
         // traceparent (Effect's HttpClient), and each id names one
         // click→server→DB trace in whatever OTLP store the run exported to
@@ -145,11 +162,11 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
             // filming, enterFocus lingers a beat on whatever the developer was
             // looking at before tabbing here.
             await enterFocus(dir, "browser");
-            await context.tracing.group(label);
+            if (record) await context.tracing.group(label);
             try {
               await action(page);
             } finally {
-              await context.tracing.groupEnd();
+              if (record) await context.tracing.groupEnd();
             }
             await page.screenshot({
               path: join(dir, `${String(shots.count++).padStart(2, "0")}-${slug(label)}.png`),
@@ -162,14 +179,18 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
             await drive({ page, step });
           } catch (error) {
             // Freeze the scene: the artifact dir shows the screen at failure.
-            await page.screenshot({ path: join(dir, "failure.png") }).catch(() => {});
+            if (record) {
+              await page.screenshot({ path: join(dir, "failure.png") }).catch(() => {});
+            }
             throw error;
           }
         }),
       ({ browser, context, page, videoTmp, traceIds }) =>
         Effect.promise(async () => {
           appendTraces(dir, traceIds);
-          await context.tracing.stop({ path: join(dir, "trace.zip") }).catch(() => {});
+          if (record) {
+            await context.tracing.stop({ path: join(dir, "trace.zip") }).catch(() => {});
+          }
           const video = page.video();
           await context.close(); // flushes the recording
           await browser.close();
@@ -199,5 +220,10 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
           }
           rmSync(videoTmp, { recursive: true, force: true });
         }),
-    ),
-});
+    );
+
+  return {
+    session: (identity, drive) => session(identity, drive, true),
+    privateSession: (identity, drive) => session(identity, drive, false),
+  };
+};

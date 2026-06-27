@@ -8,7 +8,7 @@ import {
   chooseDaemonPort,
   isDevCliEntrypoint,
   parseDaemonBaseUrl,
-} from "../apps/cli/src/daemon";
+} from "../legacy/cli/src/daemon";
 
 describe("daemon bootstrap helpers", () => {
   it("parses default port when none is provided", () => {
@@ -35,8 +35,8 @@ describe("daemon bootstrap helpers", () => {
   });
 
   it("treats source entrypoints as dev mode but excludes bun embedded paths", () => {
-    expect(isDevCliEntrypoint("/repo/apps/cli/src/main.ts")).toBe(true);
-    expect(isDevCliEntrypoint("/repo/apps/cli/src/main.js")).toBe(true);
+    expect(isDevCliEntrypoint("/repo/legacy/cli/src/main.ts")).toBe(true);
+    expect(isDevCliEntrypoint("/repo/legacy/cli/src/main.js")).toBe(true);
     expect(isDevCliEntrypoint("/$bunfs/root/main.js")).toBe(false);
     expect(isDevCliEntrypoint("/usr/local/bin/executor")).toBe(false);
     expect(isDevCliEntrypoint(undefined)).toBe(false);
@@ -47,14 +47,14 @@ describe("daemon bootstrap helpers", () => {
       port: 4788,
       hostname: "localhost",
       isDevMode: true,
-      scriptPath: "/repo/apps/cli/src/main.ts",
+      scriptPath: "/repo/legacy/cli/src/main.ts",
       executablePath: "/ignored",
     });
 
     expect(spec.command).toBe("bun");
     expect(spec.args).toEqual([
       "run",
-      "/repo/apps/cli/src/main.ts",
+      "/repo/legacy/cli/src/main.ts",
       "daemon",
       "run",
       "--port",

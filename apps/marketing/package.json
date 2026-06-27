@@ -1,6 +1,7 @@
 {
   "name": "@executor-js/marketing",
   "version": "0.0.5",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "bun run dev:proxy && bun run dev:vite",

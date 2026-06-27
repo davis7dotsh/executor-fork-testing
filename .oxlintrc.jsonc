@@ -59,10 +59,11 @@
   "overrides": [
     {
       "files": [
-        "apps/cli/src/**/*.{ts,tsx}",
-        "apps/desktop/src/main.ts",
+        "legacy/cli/src/**/*.{ts,tsx}",
+        "legacy/desktop/src/main/**/*.{ts,tsx}",
         "scripts/**/*.{ts,js}",
         "apps/*/scripts/**/*.{ts,js}",
+        "legacy/*/scripts/**/*.{ts,js}",
         "packages/kernel/runtime-*/src/**/*.{ts,tsx,js,mjs}",
       ],
       "rules": {
@@ -153,6 +154,7 @@
     "vendor/",
     "emulators/",
     "e2e/runs/",
+    "legacy/",
     "node_modules/",
     "packages/core/fumadb/",
     "packages/core/sdk/src/vendor/json-schema-to-typescript/",

@@ -5,7 +5,7 @@
 // `http` side channel), so persisted schemas must describe the payload
 // only — otherwise describe previews show an envelope invocations no
 // longer return. Mirrors the cloud drizzle migration
-// (apps/cloud/drizzle/0002_unwrap_openapi_output_envelope.sql) for the
+// (legacy/cloud/drizzle/0002_unwrap_openapi_output_envelope.sql) for the
 // libSQL-backed apps, where it runs once through the data-migration ledger.
 //
 // Idempotent: payload-shaped rows don't match the envelope signature, so

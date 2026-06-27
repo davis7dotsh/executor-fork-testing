@@ -29,7 +29,6 @@ const IGNORE_DIRS = new Set([
   "dist",
   "build",
   ".local",
-  ".changeset",
 ]);
 
 // Files we intentionally leave alone — they contain `Schema.Class` strings as

@@ -5,7 +5,7 @@
 // whether the catalog row can be refreshed at all: a spec registered from a
 // URL can be re-fetched, a pasted blob cannot.
 //
-// Ported from apps/cloud/src/api/sources-refresh.node.test.ts. The upstream
+// Ported from legacy/cloud/src/api/sources-refresh.node.test.ts. The upstream
 // MCP server is a real HTTP server started inside the scenario on 127.0.0.1.
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";

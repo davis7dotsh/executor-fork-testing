@@ -187,7 +187,7 @@ export default function executorVitePlugin(options: ExecutorVitePluginOptions = 
       const ident = `__executor_plugin_${exportExpressions.length}`;
       // Emit the absolute file path rather than `${pkg}/client`. Vite
       // resolves bare specifiers from its `root`, which for hosts like
-      // apps/local is `packages/app/` — a location that doesn't see
+      // legacy/local is `packages/app/`, a location that doesn't see
       // plugin packages installed under the consumer's node_modules.
       // Resolving here (from the consumer's executor.config dir) and
       // emitting the absolute path bypasses Vite's node_modules walk

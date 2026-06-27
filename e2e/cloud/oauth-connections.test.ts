@@ -5,7 +5,7 @@
 // product API while a real OAuth authorization server runs inside the scenario
 // on 127.0.0.1 (the dev server exchanges the code against it directly).
 //
-// Ported from apps/cloud/src/mcp/mcp-oauth.node.test.ts, extended to cover
+// Ported from legacy/cloud/src/mcp/mcp-oauth.node.test.ts, extended to cover
 // `complete` (the original stopped at the redirect).
 import { randomBytes } from "node:crypto";
 

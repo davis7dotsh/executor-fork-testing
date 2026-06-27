@@ -208,9 +208,21 @@ const missingServices = (cause: Cause.Cause<unknown>): ReadonlyArray<string> => 
 };
 
 const failureMessage = (cause: Cause.Cause<unknown>): string => {
-  const rendered = String(Cause.squash(cause));
+  const rendered = redactFailureText(String(Cause.squash(cause)));
   return rendered.length > 2_000 ? `${rendered.slice(0, 2_000)}…` : rendered;
 };
+
+export const redactFailureText = (text: string): string =>
+  text
+    .replace(/(#token=)[^\s"'<>]+/giu, "$1[REDACTED]")
+    .replace(/([?&](?:code|state|code_verifier|code_challenge)=)[^&#\s"'<>]+/giu, "$1[REDACTED]")
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/giu, "$1[REDACTED]")
+    .replace(/\bex[er]_[A-Za-z0-9._~-]+\b/gu, "exr_[REDACTED]")
+    .replace(
+      /("(?:password|setupToken|csrfToken|token|apiToken|access_token|refresh_token|clientSecret|client_secret|code_verifier|code_challenge)"\s*:\s*")[^"]*(")/giu,
+      "$1[REDACTED]$2",
+    )
+    .replace(/\b(cookie|set-cookie|x-executor-csrf):\s*[^\r\n]+/giu, "$1: [REDACTED]");
 
 /** The *.test.ts file that called scenario(), from the registration stack. */
 const captureTestFile = (): string | undefined => {

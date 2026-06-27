@@ -106,13 +106,19 @@ expect(span.span.tags["executor.tool.outcome"]).toBe("fail");
 
 ```sh
 cd e2e
-bun run test               # boots both dev servers, runs everything
-bun run test:cloud         # one target
+bun run test               # runs the prepared Rust local-selfhost binary
+bun run test:legacy:cloud  # archived cloud target, explicit opt-in
 bun run ports              # print THIS checkout's derived ports
 # attach to an already-running server while iterating (use `bun run ports` URLs):
-E2E_CLOUD_URL=http://127.0.0.1:<port> ../node_modules/.bin/vitest run --project cloud <file>
-E2E_SELFHOST_URL=http://localhost:<port> ../node_modules/.bin/vitest run --project selfhost <file>
+E2E_CLOUD_URL=http://127.0.0.1:<port> ../node_modules/.bin/vitest run --config vitest.legacy.config.ts --project cloud <file>
+E2E_SELFHOST_URL=http://localhost:<port> ../node_modules/.bin/vitest run --config vitest.legacy.config.ts --project selfhost <file>
 ```
+
+From the repository root, `bun run test:e2e` is the complete active command:
+it builds the Svelte assets, compiles the Rust binary with those assets, and
+runs only the `local-selfhost` project. Do not use bare `vitest` for the active
+suite. Archived projects live in `vitest.legacy.config.ts` and are reachable
+only through the explicit legacy scripts.
 
 Ports are claimed at boot (see `src/ports.ts`): each checkout hashes its repo
 root to a preferred block, atomically locks it (a held lock port makes races

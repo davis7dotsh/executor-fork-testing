@@ -3,8 +3,7 @@
 @custom-variant dark (&:is(.dark *));
 
 @source "../**/*.{ts,tsx}";
-@source "../../../../apps/local/src/**/*.{ts,tsx}";
-@source "../../../../apps/cloud/src/**/*.{ts,tsx}";
+@source "../../../../legacy/local/src/**/*.{ts,tsx}";
 @source "../../../plugins/*/src/react/**/*.{ts,tsx}";
 
 @theme inline {
@@ -151,7 +150,7 @@
 
 /* The sidebar header sits at the top-left of the desktop window, under the
    native macOS traffic-light controls (trafficLightPosition {x:16,y:17} in
-   apps/desktop/src/main/index.ts). Offset its content past the lights and make
+   legacy/desktop/src/main/index.ts). Offset its content past the lights and make
    the freed strip draggable like a native title bar. The desktop window stays
    at or above the mobile breakpoint (minWidth 768), so the sidebar header is
    the only header the lights ever overlap. */

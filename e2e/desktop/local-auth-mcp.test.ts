@@ -33,7 +33,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { scenario } from "../src/scenario";
 import { RunDir } from "../src/services";
 
-const appDir = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appDir = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 const electronBinary = createRequire(join(appDir, "package.json"))("electron") as string;
 
 const APPROVAL_TARGET_TOOL = "executor.coreTools.policies.list";

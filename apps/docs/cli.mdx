@@ -1,0 +1,44 @@
+---
+title: Rust CLI
+description: "Use the supported executor binary as a client for an already-running self-hosted server."
+---
+
+The `executor` binary contains both the self-hosted server and its command-line
+client. Client commands connect to a running server. They do not open the SQLite
+database or start another server.
+
+## Connect
+
+The default server is `http://127.0.0.1:4788`. Create an API token in the
+dashboard, then provide it through the environment:
+
+```bash
+export EXECUTOR_API_TOKEN='token-shown-by-the-dashboard'
+executor tools sources
+executor tools search 'create issue'
+```
+
+Use `--base-url` or `EXECUTOR_BASE_URL` for another instance. Remote instances
+must use HTTPS unless a separately authenticated and encrypted tunnel protects
+the complete path and you explicitly pass `--allow-insecure-http`.
+
+## Inspect and call tools
+
+```bash
+executor tools describe github.issues_create
+executor call github.issues_create '{"owner":"acme","repo":"app","title":"Bug"}'
+```
+
+Use `--json` for machine-readable output. An Ask-mode call prints and opens the
+dashboard approval URL, then waits for the administrator's decision.
+
+## MCP stdio bridge
+
+For an MCP client that launches only stdio servers, configure it to run:
+
+```bash
+executor mcp
+```
+
+The bridge forwards MCP JSON-RPC to the running authenticated `/mcp` endpoint.
+It requires `EXECUTOR_API_TOKEN` and honors `EXECUTOR_BASE_URL`.

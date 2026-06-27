@@ -12,14 +12,8 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 
-import {
-  AuthTemplateSlug,
-  ConnectionName,
-  IntegrationSlug,
-  ToolAddress,
-  createExecutor,
-} from "@executor-js/sdk";
-import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
+import { AuthTemplateSlug, ConnectionName, IntegrationSlug, ToolAddress } from "@executor-js/sdk";
+import { makeTestExecutor, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
 
 import { mcpPlugin } from "./plugin";
 import { variable } from "@executor-js/sdk/http-auth";
@@ -39,9 +33,9 @@ describe("MCP multi-placement auth", () => {
   it.effect("one method renders a bearer header AND a team-id query param", () =>
     Effect.gen(function* () {
       const server = yield* serveRecordingServer;
-      const executor = yield* createExecutor(
-        makeTestConfig({ plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const }),
-      );
+      const executor = yield* makeTestExecutor({
+        plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const,
+      });
 
       yield* executor.mcp.addServer({
         name: "Mixed MCP",
@@ -76,7 +70,9 @@ describe("MCP multi-placement auth", () => {
         data: { content: [{ type: "text", text: "ok:mixed" }] },
       });
 
-      const requests = (yield* server.requests).slice(before);
+      const requests = (yield* server.requests)
+        .slice(before)
+        .filter((request) => request.method === "POST");
       expect(requests.length).toBeGreaterThan(0);
       // BOTH carriers rendered, each from its own credential input.
       expect(requests.every((request) => request.authorization === "Bearer tok_A")).toBe(true);
@@ -87,9 +83,9 @@ describe("MCP multi-placement auth", () => {
   it.effect("a query-only method renders ?token= and no Authorization header (ui.sh)", () =>
     Effect.gen(function* () {
       const server = yield* serveRecordingServer;
-      const executor = yield* createExecutor(
-        makeTestConfig({ plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const }),
-      );
+      const executor = yield* makeTestExecutor({
+        plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const,
+      });
 
       yield* executor.mcp.addServer({
         name: "Query MCP",
@@ -115,7 +111,9 @@ describe("MCP multi-placement auth", () => {
       );
       expect(result).toMatchObject({ ok: true });
 
-      const requests = (yield* server.requests).slice(before);
+      const requests = (yield* server.requests)
+        .slice(before)
+        .filter((request) => request.method === "POST");
       expect(requests.length).toBeGreaterThan(0);
       expect(requests.every((request) => request.url.includes("token=tok_secret_123"))).toBe(true);
       expect(requests.every((request) => request.authorization === undefined)).toBe(true);
@@ -125,9 +123,9 @@ describe("MCP multi-placement auth", () => {
   it.effect("a connection binding one method does not leak into another method's shape", () =>
     Effect.gen(function* () {
       const server = yield* serveRecordingServer;
-      const executor = yield* createExecutor(
-        makeTestConfig({ plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const }),
-      );
+      const executor = yield* makeTestExecutor({
+        plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const,
+      });
 
       // Two declared methods; each connection picks one by template slug.
       yield* executor.mcp.addServer({
@@ -169,7 +167,9 @@ describe("MCP multi-placement auth", () => {
         { marker: "h" },
         { onElicitation: "accept-all" },
       );
-      const headerRequests = (yield* server.requests).slice(beforeHeader);
+      const headerRequests = (yield* server.requests)
+        .slice(beforeHeader)
+        .filter((request) => request.method === "POST");
       expect(headerRequests.every((r) => r.authorization === "Bearer header-secret")).toBe(true);
       expect(headerRequests.every((r) => !r.url.includes("auth_token="))).toBe(true);
 
@@ -179,7 +179,9 @@ describe("MCP multi-placement auth", () => {
         { marker: "q" },
         { onElicitation: "accept-all" },
       );
-      const queryRequests = (yield* server.requests).slice(beforeQuery);
+      const queryRequests = (yield* server.requests)
+        .slice(beforeQuery)
+        .filter((request) => request.method === "POST");
       expect(queryRequests.every((r) => r.url.includes("auth_token=query-secret"))).toBe(true);
       expect(queryRequests.every((r) => r.authorization === undefined)).toBe(true);
     }),
@@ -188,9 +190,9 @@ describe("MCP multi-placement auth", () => {
   it.effect("invoking with a missing credential input fails explicitly, not silently", () =>
     Effect.gen(function* () {
       const server = yield* serveRecordingServer;
-      const executor = yield* createExecutor(
-        makeTestConfig({ plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const }),
-      );
+      const executor = yield* makeTestExecutor({
+        plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const,
+      });
 
       yield* executor.mcp.addServer({
         name: "Strict MCP",

@@ -19,7 +19,7 @@ import { _electron } from "playwright";
 import { scenario } from "../src/scenario";
 import { RunDir } from "../src/services";
 
-const appDir = fileURLToPath(new URL("../../apps/desktop/", import.meta.url));
+const appDir = fileURLToPath(new URL("../../legacy/desktop/", import.meta.url));
 const electronBinary = createRequire(join(appDir, "package.json"))("electron") as string;
 
 const CORRUPT_MARKER = "executor-e2e-corrupted-db";

@@ -5,9 +5,9 @@
  * A single page mounted at `/plugins/desktop-settings/` that lets the user
  * inspect and configure the Electron sidecar's server connection. Talks to
  * the main process via `window.executor.*` (exposed by
- * `apps/desktop/src/preload`).
+ * `legacy/desktop/src/preload`).
  *
- * The plugin is bundled into apps/local's renderer too (because executor
+ * The plugin is bundled into legacy/local's renderer too (because executor
  * web + desktop share the same client bundle pipeline), but the page
  * only registers a nav entry when `window.executor` is present at
  * module-init time — so the web UI doesn't show a non-functional link.

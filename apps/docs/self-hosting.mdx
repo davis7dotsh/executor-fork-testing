@@ -1,0 +1,68 @@
+---
+title: Native self-hosting
+description: "Install and run the supported Executor Rust binary on Linux or macOS."
+---
+
+Executor ships as one native binary with the Svelte dashboard embedded. Native
+releases support Linux and macOS on x86-64 and ARM64. Windows is not a native
+release target.
+
+## Install a release
+
+The installer downloads the matching archive, verifies its checksum, and places
+`executor` under `$HOME/.executor/bin` by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/davis7dotsh/executor-fork-testing/main/scripts/install.sh | bash
+```
+
+To install a release published by another fork, set the same repository
+override used by the installer:
+
+```bash
+export EXECUTOR_REPOSITORY=owner/repository
+curl -fsSL "https://raw.githubusercontent.com/$EXECUTOR_REPOSITORY/main/scripts/install.sh" | bash
+```
+
+Start a new shell, source its configuration file, or invoke
+`$HOME/.executor/bin/executor` directly until the updated `PATH` is active.
+The installer serializes install, recovery, and uninstall under a private lock,
+and uses stock `sync` durability barriers before publishing or retiring its
+ownership state. Custom install paths cannot contain symbolic-link or writable
+ancestor components. PATH edits use the same portable shell implementation on
+Linux and macOS, with no Python runtime dependency.
+
+## First boot
+
+Choose a private data directory and start the server:
+
+```bash
+mkdir -p "$HOME/.executor-data"
+chmod 0700 "$HOME/.executor-data"
+executor server --data-dir "$HOME/.executor-data"
+```
+
+Executor binds to `127.0.0.1:4788` by default. Open the one-time setup URL
+printed by the server, create the administrator, then create an API token under
+**API tokens**. Token secrets are shown once.
+
+The data directory contains the SQLite database, WAL files when present, and
+`master.key`. Stop Executor before backing up the complete directory, and keep
+the database and key together.
+
+## Expose another origin
+
+Keep plain HTTP on loopback. When a reverse proxy exposes Executor through
+HTTPS, set the exact browser-facing origin before starting the server:
+
+```bash
+executor server \
+  --data-dir "$HOME/.executor-data" \
+  --public-origin https://executor.example.com
+```
+
+The public origin does not secure Executor's own listener. Keep that listener on
+loopback or otherwise isolate it so clients reach it only through the TLS proxy.
+
+Next, use the [Rust CLI](/cli) or connect an agent through the
+[MCP endpoint](/mcp-proxy).

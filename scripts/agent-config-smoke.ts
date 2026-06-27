@@ -23,7 +23,7 @@ import {
 import { Effect } from "effect";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const cliEntrypoint = join(repoRoot, "apps/cli/src/main.ts");
+const cliEntrypoint = join(repoRoot, "legacy/cli/src/main.ts");
 
 type CliContext = {
   readonly dataDir: string;

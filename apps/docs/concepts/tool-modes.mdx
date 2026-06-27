@@ -1,0 +1,23 @@
+---
+title: Tool modes
+description: "Use Inherit, Enabled, Ask, and Disabled to control the one global tool catalog."
+---
+
+Every imported tool has one effective mode:
+
+- **Inherit**: follow the source default, then the tool's built-in default.
+- **Enabled**: advertise the tool and run calls immediately.
+- **Ask**: advertise the tool, but pause each call for one administrator decision.
+- **Disabled**: hide the tool from gateway clients and reject calls.
+
+Source defaults let you change a group of tools together. A tool override takes
+priority over the source default, while **Inherit** returns that tool to the
+source and built-in behavior. Broad Enabled or Disabled changes require an
+explicit confirmation in the dashboard.
+
+Ask approvals are exact and single-use. Executor shows a structural, redacted
+argument preview, and a stale tool, source, credential, or mode revision cannot
+reuse an earlier decision.
+
+All dashboard-issued API tokens use the same global tool set. Per-token tool
+catalogs are not part of the current single-user product.

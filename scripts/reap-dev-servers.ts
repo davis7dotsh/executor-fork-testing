@@ -31,7 +31,7 @@ for (const line of ps.split("\n")) {
   if (Number(pidText) === process.pid) continue;
   // The checkout root is whatever absolute path prefixes node_modules/ or a
   // workspace dir in the command line.
-  const pathMatch = command!.match(/(\/[^ ]*?)\/(?:node_modules|apps|packages|e2e)\//);
+  const pathMatch = command!.match(/(\/[^ ]*?)\/(?:node_modules|apps|legacy|packages|e2e)\//);
   const checkout = pathMatch?.[1];
   const orphan = checkout !== undefined && !existsSync(checkout);
   candidates.push({ pid: Number(pidText), command: command!.slice(0, 160), checkout, orphan });

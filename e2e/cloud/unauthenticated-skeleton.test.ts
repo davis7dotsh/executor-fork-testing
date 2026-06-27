@@ -4,7 +4,7 @@
 // AuthGate used to SSR the AUTHENTICATED app-shell skeleton (sidebar + card
 // grid) for every visitor and only swap to a login page after a client-side
 // `/account/me` 401 — signed-out users were shown an app they'd never reach.
-// Now the SSR auth gate (apps/cloud/src/auth/ssr-gate.ts) verifies the sealed
+// Now the SSR auth gate (legacy/cloud/src/auth/ssr-gate.ts) verifies the sealed
 // session cookie in the worker and 302s signed-out document requests to
 // /login (carrying ?returnTo=), so the app shell never exists for them.
 import { expect } from "@effect/vitest";

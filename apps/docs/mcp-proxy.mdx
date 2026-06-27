@@ -1,58 +1,71 @@
 ---
-title: MCP Proxy
-description: "Executor is one MCP endpoint in front of all your integrations: connect once, and every agent gets the same catalog with shared auth and policies."
+title: MCP endpoint
+description: "Connect an MCP client to the supported self-hosted Executor server over Streamable HTTP or the local stdio bridge."
 ---
 
-Executor sits between your agents and your tools as a single MCP endpoint. Your
-agents connect to Executor; Executor connects out to your integrations and
-re-exposes them as one catalog. Every tool call passes through the proxy, which is
-where auth and policy live.
+Executor sits between your agents and your tools as one authenticated MCP
+endpoint. Agents connect to Executor, while Executor connects to OpenAPI,
+GraphQL, and upstream MCP sources. Tool modes, approval, credentials, and
+invocation logs stay under the self-hosted instance's control.
 
-## Why proxy through Executor
+## Streamable HTTP
 
-- **One endpoint, every agent.** Point Claude Code, Cursor, ChatGPT, or your own
-  SDK at the same Executor endpoint instead of configuring each tool in each client.
-- **Credentials stay out of the agent.** A [connection](/concepts/connections)'s
-  credentials are stored by Executor and attached to the upstream call. The agent
-  runs in a sandbox and never sees them.
-- **Per-tool policies.** Every call is governed by a [policy](/concepts/policies):
-  allow, require approval, or block.
-- **Mix [integration types](/concepts/integrations).** Upstream MCP servers, OpenAPI
-  specs, and GraphQL endpoints all show up in the same catalog.
+The endpoint is the instance origin plus `/mcp`, such as
+`http://127.0.0.1:4788/mcp`. Create an API token in the dashboard and send it as
+a Bearer token on every MCP request:
 
-## How it works
-
-```mermaid
-flowchart LR
-  A[Your agents] -->|MCP| E[Executor]
-  E -->|MCP| M[Upstream MCP servers]
-  E -->|HTTP| O[OpenAPI APIs]
-  E -->|HTTP| G[GraphQL endpoints]
+```text
+Authorization: Bearer <EXECUTOR_API_TOKEN>
 ```
 
-Agents speak MCP to Executor. For each tool call, Executor picks the right
-integration, attaches that connection's credentials to the upstream request,
-enforces the tool's policy, and returns the result. The agent only ever talks to
-Executor, and the credentials never reach it.
+MCP client configuration schemas differ, but the common shape is:
 
-## Proxy an upstream MCP server
+```json
+{
+  "mcpServers": {
+    "executor": {
+      "type": "http",
+      "url": "http://127.0.0.1:4788/mcp",
+      "headers": {
+        "Authorization": "Bearer <EXECUTOR_API_TOKEN>"
+      }
+    }
+  }
+}
+```
 
-Add an MCP server as an [integration](/concepts/integrations) and its tools join
-your catalog alongside everything else. Create a [connection](/concepts/connections)
-to it (with credentials if it needs them), and it becomes reachable through your one
-Executor endpoint, governed by the same policies as the rest of your tools.
+Use HTTPS for a remote origin. A private LAN alone does not protect a reusable
+Bearer token.
 
-This is the core of the proxy: your agents keep talking to a single endpoint while
-you add, swap, or remove upstream servers behind it, with no client-side change.
+## Local stdio bridge
 
-## Connect your agents
+If a client launches only stdio MCP servers, configure it to run the same
+supported binary in bridge mode:
 
-Agents connect to Executor's MCP endpoint. The exact command depends on how you run
-Executor:
+```json
+{
+  "mcpServers": {
+    "executor": {
+      "command": "/absolute/path/to/executor",
+      "args": ["mcp"],
+      "env": {
+        "EXECUTOR_API_TOKEN": "<EXECUTOR_API_TOKEN>"
+      }
+    }
+  }
+}
+```
 
-- **Local:** see [CLI](/local/cli) for `executor mcp` and the `add-mcp` command.
-- **Hosted:** see [Executor Cloud](/hosted/cloud), or self-host on
-  [Docker](/hosted/docker) or [Cloudflare](/hosted/cloudflare).
+The bridge connects to `http://127.0.0.1:4788` by default. Set
+`EXECUTOR_BASE_URL` when the server uses another origin. The server must already
+be running.
 
-Once a client is connected, every integration you add to Executor appears in that
-agent automatically.
+## What clients see
+
+Enabled and Ask tools from every configured source appear in the instance's
+global catalog. Disabled tools are not advertised. Ask calls pause for the
+administrator's decision, and credentials are resolved by Executor instead of
+being exposed to the MCP client.
+
+Start with [native self-hosting](/self-hosting), [Docker](/hosted/docker), or the
+[Rust CLI](/cli).

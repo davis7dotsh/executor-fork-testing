@@ -1,0 +1,57 @@
+[Unit]
+Description=Executor self-hosted gateway
+Documentation=https://github.com/davis7dotsh/executor-fork-testing/blob/main/docs/systemd.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=executor
+Group=executor
+WorkingDirectory=/var/lib/executor
+EnvironmentFile=-/etc/executor/executor.env
+ExecStart=/usr/local/bin/executor server \
+    --bind 127.0.0.1:4788 \
+    --data-dir /var/lib/executor \
+    --mcp-stdio-templates /etc/executor/mcp-stdio-templates.json
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStartSec=30s
+TimeoutStopSec=90s
+UMask=0077
+
+# systemd creates these paths before dropping privileges.
+StateDirectory=executor
+StateDirectoryMode=0700
+ConfigurationDirectory=executor
+ConfigurationDirectoryMode=0750
+
+# The server and any approved MCP stdio children inherit this sandbox. Add
+# narrowly scoped ReadOnlyPaths= or ReadWritePaths= entries in a drop-in when a
+# template needs access outside the Executor state directory.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/executor
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+KeyringMode=private
+
+[Install]
+WantedBy=multi-user.target

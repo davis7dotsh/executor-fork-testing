@@ -11,9 +11,11 @@ import { promisify } from "node:util";
 
 import { bootProcesses, waitForHttp, type BootedProcesses } from "./boot";
 
-export const cloudflareDir = fileURLToPath(new URL("../../apps/host-cloudflare/", import.meta.url));
+export const cloudflareDir = fileURLToPath(
+  new URL("../../legacy/host-cloudflare/", import.meta.url),
+);
 const wranglerBin = fileURLToPath(
-  new URL("../../apps/host-cloudflare/node_modules/.bin/wrangler", import.meta.url),
+  new URL("../../legacy/host-cloudflare/node_modules/.bin/wrangler", import.meta.url),
 );
 
 export interface CloudflareBootOptions {

@@ -1,0 +1,24 @@
+---
+title: Sources
+description: "A source connects one MCP server, OpenAPI specification, or GraphQL API to Executor's global tool catalog."
+---
+
+A **source** is one configured upstream that contributes tools to Executor's
+global catalog:
+
+- an MCP server over Streamable HTTP
+- a trusted local MCP stdio template approved by the machine administrator
+- an OpenAPI 3.0 or 3.1 specification
+- an introspection-enabled GraphQL API
+
+The source owns its endpoint or process template, imported tool identities,
+refresh history, default tool mode, and at most one encrypted static credential
+profile. Eligible sources can also use Managed OAuth. Add a second source when
+you intentionally need a second upstream.
+
+After adding or refreshing a source, open **Tools** to review every imported
+tool before giving an agent access.
+
+<Card title="Run Executor and add your first source" href="/self-hosting" horizontal>
+  Install the supported self-hosted server, then add a source from its dashboard.
+</Card>

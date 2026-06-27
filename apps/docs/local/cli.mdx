@@ -1,111 +1,41 @@
 ---
-title: CLI
-description: "Run Executor as a local background service and drive it from the command line."
+title: "Legacy: npm CLI"
+description: "Archived reference for the previous TypeScript npm CLI. It is not the supported Executor product."
 ---
 
-The CLI runs a small HTTP runtime on your machine: a durable background service
-that any MCP-compatible agent can connect to. Your integrations, credentials, and
-policies stay local.
+<Warning>
+  The TypeScript npm CLI is retired and unsupported. Historical registry artifacts may still
+  resolve, but they are no longer updated. Do not use them for a new installation. Install the
+  current Rust binary through [native self-hosting](/self-hosting), then use its [Rust CLI](/cli).
+</Warning>
 
-## Install
+This page preserves context for repositories and old configuration files that
+mention the previous npm-distributed CLI. It is an archive, not an installation
+or operations guide.
 
-Requires Node.js 20 or newer.
+## What the archived CLI did
 
-<CodeGroup>
+The TypeScript CLI previously installed a local daemon, opened a React web UI,
+configured MCP clients with a helper package, and auto-started the daemon for
+some commands. It used the earlier integrations, connections, and policies
+model. Those commands, package releases, and background-service workflows are
+not part of the supported product.
 
-```bash npm
-npm install -g executor
-```
+Existing references to the old package should be treated as migration clues
+only. Do not install a cached package or reuse its daemon and web commands for a
+new Executor instance.
 
-```bash pnpm
-pnpm add -g executor
-```
+## Use the supported product
 
-```bash bun
-bun add -g executor
-```
+1. Install and start the current single-user Rust server through [native
+   self-hosting](/self-hosting), or use the supported [Docker image](/hosted/docker).
+2. Open the one-time setup URL, create the administrator, and issue an API token
+   from the dashboard.
+3. Use the current [Rust CLI](/cli) to search and call tools, or connect an agent
+   through the authenticated [MCP endpoint](/mcp-proxy).
+4. Recreate old upstream configuration as OpenAPI, GraphQL, MCP HTTP, or trusted
+   MCP stdio [sources](/concepts/sources). Configure credentials on each source
+   and review its [tool modes](/concepts/tool-modes).
 
-```bash yarn
-yarn global add executor
-```
-
-</CodeGroup>
-
-## Start the service
-
-Install the durable background service, then open the web UI:
-
-```bash
-executor install   # install/start the durable background service
-executor web        # open the web UI at http://127.0.0.1:17888
-```
-
-`executor install` registers Executor so it keeps running across restarts. For a
-throwaway foreground runtime instead, run `executor web --foreground`.
-
-## Connect an agent
-
-Add Executor to any MCP client (Claude Code, Cursor, OpenCode) with `npx add-mcp`.
-It detects the client and writes its config for you. Connect over HTTP or through
-the CLI:
-
-<Tabs>
-  <Tab title="HTTP">
-    Executor serves a streamable-HTTP MCP endpoint at `http://127.0.0.1:17888/mcp`:
-
-    ```bash
-    npx add-mcp http://127.0.0.1:17888/mcp --transport http --name executor
-    ```
-
-    The **Connect** card in the web UI shows this command with your exact URL
-    (and port, if it differs) already filled in.
-
-  </Tab>
-  <Tab title="CLI (stdio)">
-    With the `executor` CLI on your PATH, the client launches `executor mcp`
-    directly (no URL needed):
-
-    ```bash
-    npx add-mcp "executor mcp" --name executor
-    ```
-
-  </Tab>
-</Tabs>
-
-## Add an integration
-
-From the web UI, click **Add Source** and paste an OpenAPI, GraphQL, or MCP URL.
-Executor detects the type, indexes the tools, and handles auth. Or add one from the
-CLI:
-
-```bash
-executor call executor openapi addSource '{
-  "spec": "https://petstore3.swagger.io/api/v3/openapi.json",
-  "namespace": "petstore",
-  "baseUrl": "https://petstore3.swagger.io/api/v3"
-}'
-```
-
-Use `baseUrl` when the OpenAPI document has relative `servers` entries (e.g. `"/api/v3"`).
-
-Confirm it's live:
-
-```bash
-executor tools sources   # lists configured integrations + tool counts
-```
-
-## Call tools
-
-```bash
-executor tools search "send email"      # find tools by intent
-executor call github issues --help      # browse a namespace
-executor call github issues create '{"owner":"octocat","repo":"Hello-World","title":"Hi"}'
-```
-
-`executor call`, `executor resume`, and `executor tools …` auto-start the local
-daemon if it isn't already running. If an execution pauses for auth or approval,
-resume it:
-
-```bash
-executor resume --execution-id exec_123
-```
+The current Rust CLI does not auto-start the server or reuse the archived local
+daemon. Follow the linked supported guides for exact commands and ports.

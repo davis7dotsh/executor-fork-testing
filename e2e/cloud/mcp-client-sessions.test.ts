@@ -4,7 +4,7 @@
 // session continuity here is real Durable Object state surviving across
 // client connections, not a stub.
 //
-// Ported from apps/cloud/src/mcp-miniflare.e2e.node.test.ts (unstable_dev +
+// Ported from legacy/cloud/src/mcp-miniflare.e2e.node.test.ts (unstable_dev +
 // test-seam bearers) onto the e2e dev server with real OAuth bearers.
 // Telemetry-span assertions from that file required injecting an OTLP
 // receiver into the worker env and were NOT carried (not black-box).

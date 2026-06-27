@@ -228,7 +228,7 @@ export const openOAuthPopup = <TAuth>(input: OpenOAuthPopupInput<TAuth>): (() =>
 // URL in the user's real browser. There's no shared origin, so the
 // renderer polls `/api/oauth/await/:sessionId` for the result. The local
 // server publishes there via `setOAuthCompletionListener` (see
-// apps/local/src/serve.ts).
+// legacy/local/src/serve.ts).
 // ---------------------------------------------------------------------------
 
 export type OpenOAuthSystemBrowserInput<TAuth> = {

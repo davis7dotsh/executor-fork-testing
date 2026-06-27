@@ -7,6 +7,7 @@ import { cloudTarget } from "./cloud";
 import { cloudflareTarget } from "./cloudflare";
 import { desktopTarget } from "./desktop";
 import { localTarget } from "./local";
+import { localSelfhostTarget } from "./local-selfhost";
 import { selfhostTarget } from "./selfhost";
 import { selfhostDockerTarget } from "./selfhost-docker";
 
@@ -20,6 +21,7 @@ const factories: Record<string, () => Target> = {
   // `desktop` — no standard surfaces to carry. See desktop-packaged.globalsetup.
   "desktop-packaged": desktopTarget,
   local: localTarget,
+  "local-selfhost": localSelfhostTarget,
   // The supervised CLI daemon inside a VM, one project per guest OS — restart()
   // is a real reboot. See setup/cli.globalsetup.ts.
   "cli-macos": cliTarget,

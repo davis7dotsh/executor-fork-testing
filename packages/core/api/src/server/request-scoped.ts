@@ -25,7 +25,7 @@
 // shared across two request handlers, which the runtime forbids). A
 // per-request MemoMap scopes memoization to a single request fiber.
 //
-// See `apps/cloud/src/api.request-scope.node.test.ts` for the regression
+// See `legacy/cloud/src/api.request-scope.node.test.ts` for the regression
 // coverage that pins this rule down (sequential AND concurrent cases).
 // ---------------------------------------------------------------------------
 
