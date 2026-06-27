@@ -826,10 +826,10 @@ impl OAuthService {
                     (Some(issuer), Some(metadata)) => {
                         validate_url_length(&issuer)?;
                         if !metadata.authorization_servers.is_empty()
-                            && !metadata
-                                .authorization_servers
-                                .iter()
-                                .any(|candidate| candidate.as_str() == issuer)
+                            && !authorization_server_is_advertised(
+                                &issuer,
+                                &metadata.authorization_servers,
+                            )?
                         {
                             return Err(validation(
                                 "oauth_authorization_server_mismatch",
@@ -1319,6 +1319,15 @@ fn confidential_identity_changed(
         || current.client_authentication != replacement.client_authentication
 }
 
+fn authorization_server_is_advertised(
+    selected: &str,
+    advertised: &[Url],
+) -> Result<bool, OAuthError> {
+    let selected = Url::parse(selected)
+        .map_err(|_| validation("invalid_oauth_url", "The OAuth issuer URL is invalid."))?;
+    Ok(advertised.iter().any(|candidate| candidate == &selected))
+}
+
 fn token_auth_method(authentication: ClientAuthentication) -> TokenEndpointAuthMethod {
     match authentication {
         ClientAuthentication::None => TokenEndpointAuthMethod::None,
@@ -1481,6 +1490,23 @@ mod tests {
         .expect("public client is valid");
         assert_eq!(authentication, ClientAuthentication::None);
         assert!(matches!(update, OAuthClientSecretUpdate::Replace(None)));
+    }
+
+    #[test]
+    fn authorization_server_membership_normalizes_the_root_path() {
+        let advertised = [Url::parse("https://identity.example.test").unwrap()];
+
+        assert!(
+            authorization_server_is_advertised("https://identity.example.test", &advertised)
+                .unwrap()
+        );
+        assert!(
+            authorization_server_is_advertised("https://identity.example.test/", &advertised)
+                .unwrap()
+        );
+        assert!(
+            !authorization_server_is_advertised("https://other.example.test", &advertised).unwrap()
+        );
     }
 
     #[test]
