@@ -816,7 +816,20 @@ scenario(
               await page.getByLabel("Allow private network addresses for this source").check();
               await page.getByLabel("Method").selectOption("oauth_access_token");
               await page.getByLabel("OAuth access token", { exact: true }).fill(mcpToken);
+              const sourceCreation = page.waitForResponse((response) => {
+                const request = response.request();
+                return (
+                  request.method() === "POST" &&
+                  new URL(response.url()).pathname === "/api/v1/sources"
+                );
+              });
               await page.getByRole("button", { name: "Connect source" }).click();
+              const sourceResponse = await sourceCreation;
+              const sourceBody = await sourceResponse.text();
+              expect(
+                sourceResponse.ok(),
+                `MCP HTTP source creation failed (${sourceResponse.status()}): ${sourceBody}`,
+              ).toBe(true);
               await expectLocatorVisible(page.getByRole("heading", { name: names.mcpHttp }));
             });
 
