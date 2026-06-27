@@ -722,6 +722,7 @@ scenario(
           createEmulator({
             service: "mcp",
             port: emulatorPortB,
+            baseUrl: `http://127.0.0.1:${emulatorPortB}`,
             seed: {
               tokens: { [mcpToken]: { login: "admin", scopes: ["repo", "read:user"] } },
             },
