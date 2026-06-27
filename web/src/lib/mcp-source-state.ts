@@ -91,7 +91,7 @@ export function buildMcpHttpCredential(draft: McpHttpAuthDraft) {
   }
   if (draft.type === "oauth_access_token") {
     return {
-      credential: { type: "oauth_access_token", access_token: draft.secret },
+      credential: { type: "oauth_access_token", accessToken: draft.secret },
     } as const;
   }
   const name = draft.headerName.trim();

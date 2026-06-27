@@ -61,10 +61,21 @@ const WATCHER_RECONCILIATION_RETRY_DELAY: Duration = Duration::from_millis(25);
     deny_unknown_fields
 )]
 pub enum McpHttpCredential {
-    Bearer { token: String },
-    Basic { username: String, password: String },
-    ApiKeyHeader { name: String, value: String },
-    OAuthAccessToken { access_token: String },
+    Bearer {
+        token: String,
+    },
+    Basic {
+        username: String,
+        password: String,
+    },
+    ApiKeyHeader {
+        name: String,
+        value: String,
+    },
+    #[serde(rename = "oauth_access_token")]
+    OAuthAccessToken {
+        access_token: String,
+    },
 }
 
 impl McpHttpCredential {
@@ -3870,6 +3881,32 @@ mod tests {
         },
         outbound::OutboundPolicy,
     };
+
+    #[test]
+    fn manual_oauth_credential_uses_the_public_wire_shape() {
+        let credential: McpHttpCredential = serde_json::from_value(json!({
+            "type": "oauth_access_token",
+            "accessToken": "secret-token"
+        }))
+        .expect("public manual OAuth credential decodes");
+
+        assert!(matches!(
+            credential,
+            McpHttpCredential::OAuthAccessToken { ref access_token }
+                if access_token == "secret-token"
+        ));
+        assert_eq!(
+            serde_json::to_value(credential).expect("manual OAuth credential encodes"),
+            json!({ "type": "oauth_access_token", "accessToken": "secret-token" })
+        );
+        assert!(
+            serde_json::from_value::<McpHttpCredential>(json!({
+                "type": "o_auth_access_token",
+                "accessToken": "secret-token"
+            }))
+            .is_err()
+        );
+    }
 
     struct ReconciliationFetcher {
         pages: VecDeque<ToolPage>,

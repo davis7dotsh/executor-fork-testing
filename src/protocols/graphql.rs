@@ -62,10 +62,21 @@ pub struct CreateGraphqlSource {
     deny_unknown_fields
 )]
 pub enum GraphqlCredential {
-    Bearer { token: String },
-    Basic { username: String, password: String },
-    ApiKeyHeader { name: String, value: String },
-    OAuthAccessToken { access_token: String },
+    Bearer {
+        token: String,
+    },
+    Basic {
+        username: String,
+        password: String,
+    },
+    ApiKeyHeader {
+        name: String,
+        value: String,
+    },
+    #[serde(rename = "oauth_access_token")]
+    OAuthAccessToken {
+        access_token: String,
+    },
 }
 
 impl GraphqlCredential {
@@ -1306,6 +1317,32 @@ mod tests {
         outbound::{OutboundError, OutboundPolicy},
         protocols::ProtocolErrorCategory,
     };
+
+    #[test]
+    fn manual_oauth_credential_uses_the_public_wire_shape() {
+        let credential: GraphqlCredential = serde_json::from_value(json!({
+            "type": "oauth_access_token",
+            "accessToken": "secret-token"
+        }))
+        .expect("public manual OAuth credential decodes");
+
+        assert!(matches!(
+            credential,
+            GraphqlCredential::OAuthAccessToken { ref access_token }
+                if access_token == "secret-token"
+        ));
+        assert_eq!(
+            serde_json::to_value(credential).expect("manual OAuth credential encodes"),
+            json!({ "type": "oauth_access_token", "accessToken": "secret-token" })
+        );
+        assert!(
+            serde_json::from_value::<GraphqlCredential>(json!({
+                "type": "o_auth_access_token",
+                "accessToken": "secret-token"
+            }))
+            .is_err()
+        );
+    }
 
     fn query_binding() -> GraphqlBindingV1 {
         let mut binding = GraphqlBindingV1 {
