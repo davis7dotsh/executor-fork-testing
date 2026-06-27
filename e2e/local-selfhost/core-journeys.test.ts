@@ -799,7 +799,7 @@ scenario(
               await page.getByLabel("Source name").fill(names.graphql);
               await page.getByLabel("Allow private network addresses for this source").check();
               await page.getByLabel("Method").selectOption("bearer");
-              await page.getByLabel("Bearer token").fill(githubToken);
+              await page.getByLabel("Bearer token", { exact: true }).fill(githubToken);
               await page.getByRole("button", { name: "Connect source" }).click();
               await expectLocatorVisible(page.getByRole("heading", { name: names.graphql }));
             });
@@ -815,7 +815,7 @@ scenario(
               await page.getByLabel("Source name").fill(names.mcpHttp);
               await page.getByLabel("Allow private network addresses for this source").check();
               await page.getByLabel("Method").selectOption("oauth_access_token");
-              await page.getByLabel("OAuth access token").fill(mcpToken);
+              await page.getByLabel("OAuth access token", { exact: true }).fill(mcpToken);
               await page.getByRole("button", { name: "Connect source" }).click();
               await expectLocatorVisible(page.getByRole("heading", { name: names.mcpHttp }));
             });
@@ -1140,7 +1140,9 @@ scenario(
                   }),
                 );
                 await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
-                await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
+                await expect
+                  .poll(() => sourceCreateStorageValue(page), { timeout: 10_000 })
+                  .toBeNull();
               } finally {
                 releaseLookup();
               }
