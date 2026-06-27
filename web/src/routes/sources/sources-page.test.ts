@@ -139,6 +139,70 @@ afterEach(() => {
 });
 
 describe("Sources page coordination", () => {
+  it("keeps a user-opened connector visible while switching every source type", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const path = String(input);
+        if (path === "/api/v1/sources") {
+          return Promise.resolve(Response.json({ sources: [sourceFixture()], catalogRevision: 1 }));
+        }
+        if (path === "/api/v1/sources/graphql-source/oauth") {
+          return Promise.resolve(emptyOAuthConnections());
+        }
+        if (path === "/api/v1/mcp/stdio/templates") {
+          return Promise.resolve(
+            Response.json({ templates: [{ name: "local", secretFields: [] }] }),
+          );
+        }
+        return Promise.resolve(Response.json({}, { status: 500 }));
+      }),
+    );
+    render(SourcesPageHarness);
+
+    await screen.findByRole("article", { name: /^Product API$/ });
+    const summary = screen.getByText("Connect a source", { exact: true });
+    const panel = summary.closest<HTMLDetailsElement>("details");
+    expect(panel?.open).toBe(false);
+    await fireEvent.click(summary);
+    expect(panel?.open).toBe(true);
+
+    for (const sourceType of [
+      "GraphQL API",
+      "MCP over HTTP",
+      "Trusted local MCP template",
+      "OpenAPI service",
+    ]) {
+      await fireEvent.click(screen.getByLabelText(sourceType));
+      await waitFor(() => expect(panel?.open).toBe(true));
+    }
+  });
+
+  it("does not close a user-opened connector when the first source list arrives late", async () => {
+    const sourceList = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const path = String(input);
+        if (path === "/api/v1/sources") return sourceList.promise;
+        if (path === "/api/v1/sources/graphql-source/oauth") {
+          return Promise.resolve(emptyOAuthConnections());
+        }
+        return Promise.resolve(Response.json({}, { status: 500 }));
+      }),
+    );
+    render(SourcesPageHarness);
+
+    const summary = screen.getByText("Connect a source", { exact: true });
+    const panel = summary.closest<HTMLDetailsElement>("details");
+    await fireEvent.click(summary);
+    expect(panel?.open).toBe(true);
+
+    sourceList.resolve(Response.json({ sources: [sourceFixture()], catalogRevision: 1 }));
+    await screen.findByRole("article", { name: /^Product API$/ });
+    expect(panel?.open).toBe(true);
+  });
+
   it("guards dispatch and retries the exact OpenAPI payload with one retained key", async () => {
     const firstCreation = deferred<Response>();
     let listCalls = 0;

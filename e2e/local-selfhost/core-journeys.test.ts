@@ -122,14 +122,9 @@ const acquireToken = (client: LocalAdminClient, baseUrl: string, name: string) =
       }),
   );
 
-const prepareInlineOpenApiSource = async (
-  page: Page,
-  document: string,
-  displayName: string,
-  options: { readonly waitForCatalog?: boolean } = {},
-) => {
+const prepareInlineOpenApiSource = async (page: Page, document: string, displayName: string) => {
   await page.goto("/sources");
-  await openConnectSourcePanel(page, options);
+  await openConnectSourcePanel(page);
   await page.getByRole("group", { name: "Source type" }).getByLabel("OpenAPI service").check();
   await page.getByLabel("Paste document").check();
   await page.getByLabel("OpenAPI JSON or YAML").fill(document);
@@ -666,13 +661,20 @@ scenario(
           yield* browser.session(identity, async ({ page, step }) => {
             await step("Open Sources and see every supported protocol", async () => {
               await page.goto("/sources");
-              for (const source of created) {
-                const heading = page.getByText(source.displayName, { exact: true });
-                await heading.scrollIntoViewIfNeeded();
-                await expectLocatorVisible(heading);
-              }
-              for (const protocol of ["OpenAPI", "GraphQL", "MCP HTTP"]) {
-                const label = page.getByText(protocol, { exact: true }).last();
+              const sourceProtocols = [
+                [created[0], /^OpenAPI · /],
+                [created[1], /^GraphQL · /],
+                [created[2], /^MCP HTTP · /],
+              ] as const;
+              for (const [source, protocol] of sourceProtocols) {
+                if (source === undefined) {
+                  throw new Error("the protocol source fixture was not created");
+                }
+                const card = page.getByRole("article", {
+                  name: source.displayName,
+                  exact: true,
+                });
+                const label = card.getByText(protocol);
                 await label.scrollIntoViewIfNeeded();
                 await expectLocatorVisible(label);
               }
@@ -1804,7 +1806,6 @@ scenario(
                   page,
                   minimalOpenApiDocument(github.url, sourceName),
                   sourceName,
-                  { waitForCatalog: false },
                 );
                 await staleListCaptured;
                 await page.getByRole("button", { name: "Import source" }).click();
@@ -1947,7 +1948,10 @@ scenario(
                 expect(persisted).not.toContain(credential);
                 expect(persisted).not.toContain(submittedPayload);
 
-                await page.getByRole("link", { name: "Tools", exact: true }).click();
+                const toolsLink = page
+                  .getByRole("navigation", { name: "Dashboard" })
+                  .getByRole("link", { name: "Tools", exact: true });
+                await toolsLink.click();
                 expect(new URL(page.url()).pathname).toBe("/sources");
                 const warning = page.locator("#source-navigation-status");
                 await expectLocatorText(warning, "still being submitted");
@@ -1988,7 +1992,10 @@ scenario(
 
               await expectLocatorVisible(page.getByRole("heading", { name: sourceName }));
               await expect.poll(() => sourceCreateStorageValue(page)).toBeNull();
-              await page.getByRole("link", { name: "Tools", exact: true }).click();
+              await page
+                .getByRole("navigation", { name: "Dashboard" })
+                .getByRole("link", { name: "Tools", exact: true })
+                .click();
               await page.waitForURL((url) => url.pathname === "/tools");
               expect(
                 sessionDeletes,

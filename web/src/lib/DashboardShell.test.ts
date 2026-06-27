@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { createRawSnippet } from "svelte";
 
 const mocks = {
@@ -22,6 +22,18 @@ afterEach(() => {
 });
 
 describe("dashboard sign out", () => {
+  it("exposes navigation labels without their visual ordinals", () => {
+    render(DashboardShell, {
+      title: "Sources",
+      description: "Manage sources.",
+      children,
+    });
+
+    const navigation = within(screen.getByRole("navigation", { name: "Dashboard" }));
+    expect(navigation.getByRole("link", { name: /^Tools$/ })).toBeDefined();
+    expect(navigation.queryByRole("link", { name: /^02 Tools$/ })).toBeNull();
+  });
+
   it("consults a page guard before destroying the session", async () => {
     let allowSignOut = false;
     const beforeSignOut = vi.fn(() => allowSignOut);

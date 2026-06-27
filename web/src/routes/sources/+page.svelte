@@ -91,6 +91,8 @@
   const credentialRequest = createLatestRequest();
   let resource = $state(emptyResource<SourceList>());
   let refreshKey = $state(0);
+  let connectSourceOpen = $state(false);
+  let connectSourceOpenOwnedByUser = $state(false);
   let pending = $state<string[]>([]);
   let mutationErrors = $state<Record<string, ApiError>>({});
   let conflictNotice = $state<string | null>(null);
@@ -223,6 +225,12 @@
     const currentRefreshKey = refreshKey;
     const request = untrack(() => startSourceListLoad(currentRefreshKey));
     return request.cancel;
+  });
+
+  $effect(() => {
+    const sources = resource.data?.sources;
+    if (sources === undefined || connectSourceOpenOwnedByUser) return;
+    connectSourceOpen = sources.length === 0;
   });
 
   $effect(() => {
@@ -1049,8 +1057,8 @@
       {importNotice}
     </div>{/if}
 
-  <details class="surface import-panel" open={resource.data?.sources.length === 0}>
-    <summary>Connect a source</summary>
+  <details class="surface import-panel" bind:open={connectSourceOpen}>
+    <summary onclick={() => (connectSourceOpenOwnedByUser = true)}>Connect a source</summary>
     <fieldset class="mode-control source-type-picker" disabled={sourceCreateLocked}>
       <legend>Source type</legend>
       <label>
@@ -1321,11 +1329,11 @@
   {:else if resource.data !== null}
     <div class="source-grid" aria-busy={resource.loading}>
       {#each resource.data.sources as source (source.id)}
-        <article class="surface source-card">
+        <article class="surface source-card" aria-labelledby={`source-heading-${source.id}`}>
           <header class="source-card-heading">
             <div>
               <p class="eyebrow">{kindLabel(source.kind)} · {source.slug}</p>
-              <h2>{source.displayName}</h2>
+              <h2 id={`source-heading-${source.id}`}>{source.displayName}</h2>
               {#if source.description !== null}<p>{source.description}</p>{/if}
             </div>
             <span

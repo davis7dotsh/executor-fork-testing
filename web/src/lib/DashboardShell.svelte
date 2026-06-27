@@ -75,7 +75,7 @@
           href={item.href}
           aria-current={isActive(item.href) ? "page" : undefined}
         >
-          <span class="nav-marker">{item.marker}</span>
+          <span class="nav-marker" aria-hidden="true">{item.marker}</span>
           <span class="nav-label">{item.label}</span>
         </a>
       {/each}
