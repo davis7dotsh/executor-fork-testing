@@ -121,7 +121,7 @@ describe("MCP source state", () => {
         secret: " exact oauth token ",
       }),
     ).toEqual({
-      credential: { type: "oauth_access_token", accessToken: " exact oauth token " },
+      credential: { type: "oauth_access_token", access_token: " exact oauth token " },
     });
   });
 

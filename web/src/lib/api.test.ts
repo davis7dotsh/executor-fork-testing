@@ -1199,7 +1199,7 @@ describe("dashboard API client", () => {
       { type: "bearer", token: "bearer-secret" },
       { type: "basic", username: "admin", password: "password-secret" },
       { type: "api_key_header", name: "X-Service-Key", value: "header-secret" },
-      { type: "oauth_access_token", accessToken: "oauth-secret" },
+      { type: "oauth_access_token", access_token: "oauth-secret" },
     ] as const;
     const bodies: unknown[] = [];
 

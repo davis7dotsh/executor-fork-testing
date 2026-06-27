@@ -646,7 +646,7 @@ export type McpHttpCredential =
   | {
       readonly credential: {
         readonly type: "oauth_access_token";
-        readonly accessToken: string;
+        readonly access_token: string;
       };
     };
 
