@@ -22,6 +22,9 @@ export const openConnectSourcePanel = async (page: SourcePanelPage) => {
   const panel = page.locator(sourcePanelSelector);
   if ((await panel.getAttribute("open")) === null) {
     await page.getByText("Connect a source", { exact: true }).click();
+    if ((await panel.getAttribute("open")) === null) {
+      await page.getByText("Connect a source", { exact: true }).click();
+    }
   }
   await page.getByRole("group", { name: "Source type" }).waitFor({ state: "visible" });
 };

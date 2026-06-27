@@ -6,9 +6,10 @@ const sourcePanelSelector = "details.import-panel";
 const sourcePickerSelector = 'role:group[name="Source type"]';
 const sourceSummarySelector = 'text:exact="Connect a source"';
 
-const fixture = (initiallyOpen: boolean) => {
+const fixture = (initiallyOpen: boolean, autoOpenBeforeFirstClick = false) => {
   const calls: string[] = [];
   let panelOpen = initiallyOpen;
+  let pendingAutoOpen = autoOpenBeforeFirstClick;
 
   const makeLocator = (selector: string) => ({
     async waitFor(options: { readonly state: "visible" }) {
@@ -20,6 +21,10 @@ const fixture = (initiallyOpen: boolean) => {
     },
     async click() {
       calls.push(`click:${selector}`);
+      if (pendingAutoOpen) {
+        pendingAutoOpen = false;
+        panelOpen = true;
+      }
       panelOpen = !panelOpen;
     },
   });
@@ -50,6 +55,21 @@ it("opens an attached source picker when its panel is closed", async () => {
   await openConnectSourcePanel(page);
 
   expect(calls).toEqual([
+    `attribute:${sourcePanelSelector}:open`,
+    `click:${sourceSummarySelector}`,
+    `attribute:${sourcePanelSelector}:open`,
+    `wait:${sourcePickerSelector}:visible`,
+  ]);
+});
+
+it("reopens a panel that auto-opens between the open-state check and click", async () => {
+  const { calls, page } = fixture(false, true);
+
+  await openConnectSourcePanel(page);
+
+  expect(calls).toEqual([
+    `attribute:${sourcePanelSelector}:open`,
+    `click:${sourceSummarySelector}`,
     `attribute:${sourcePanelSelector}:open`,
     `click:${sourceSummarySelector}`,
     `wait:${sourcePickerSelector}:visible`,
