@@ -287,7 +287,7 @@ function normalizedHttpUrl(value: string) {
   if (!isSecureOAuthUrl(url) || hasUserInfo(url) || url.search !== "" || url.hash !== "") {
     return null;
   }
-  return url.toString();
+  return normalized;
 }
 
 function isSecureOAuthUrl(url: URL) {

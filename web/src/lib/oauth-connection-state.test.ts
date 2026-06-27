@@ -38,7 +38,7 @@ describe("OAuth connection state", () => {
     const draft = draftFromOAuthSummary(summary);
     expect(buildOAuthConnectionInput(draft, summary.revision)).toEqual({
       expectedRevision: 4,
-      discovery: { type: "issuer", issuer: "https://identity.example.test/" },
+      discovery: { type: "issuer", issuer: "https://identity.example.test" },
       client: {
         clientId: "executor",
         authentication: "client_secret_basic",
@@ -52,7 +52,7 @@ describe("OAuth connection state", () => {
     const draft = { ...draftFromOAuthSummary(summary), clientKind: "public" as const };
     expect(buildOAuthConnectionInput(draft, 4)).toEqual({
       expectedRevision: 4,
-      discovery: { type: "issuer", issuer: "https://identity.example.test/" },
+      discovery: { type: "issuer", issuer: "https://identity.example.test" },
       client: { clientId: "executor", authentication: "none" },
       scopes: ["read", "write"],
     });
@@ -88,6 +88,23 @@ describe("OAuth connection state", () => {
     ).toEqual({
       type: "mcp",
       authorizationServer: "https://identity.example.test/issuer",
+    });
+  });
+
+  it("preserves the exact root issuer path after validating the URL", () => {
+    const draft = {
+      ...draftFromOAuthSummary(summary),
+      clientKind: "public" as const,
+    };
+    expect(
+      buildOAuthConnectionInput({ ...draft, issuer: "https://identity.example.test" }, 4),
+    ).toMatchObject({
+      discovery: { type: "issuer", issuer: "https://identity.example.test" },
+    });
+    expect(
+      buildOAuthConnectionInput({ ...draft, issuer: "https://identity.example.test/" }, 4),
+    ).toMatchObject({
+      discovery: { type: "issuer", issuer: "https://identity.example.test/" },
     });
   });
 
