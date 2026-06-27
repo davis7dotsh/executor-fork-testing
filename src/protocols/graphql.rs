@@ -39,6 +39,7 @@ const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 const MAX_HEADER_NAME_BYTES: usize = 256;
 const MAX_INTROSPECTION_BYTES: usize = 16 * 1024 * 1024;
 const GRAPHQL_COMPILE_CONCURRENCY: usize = 2;
+const GRAPHQL_USER_AGENT: &str = "executor";
 static GRAPHQL_COMPILE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Deserialize)]
@@ -377,14 +378,7 @@ impl GraphqlAdapter {
         let policy = graphql_outbound_policy(configuration.allow_private_network);
         let url = parse_url(&credential.endpoint, &policy).map_err(protocol_outbound_error)?;
         let mut request = OutboundRequest::new(Method::POST, url);
-        request.headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        request.headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("application/graphql-response+json, application/json"),
-        );
+        apply_standard_request_headers(&mut request.headers);
         if let Some(credential) = &credential.credential {
             if oauth_binding.is_some() {
                 return Err(ProtocolError::corrupt(
@@ -754,14 +748,7 @@ async fn fetch_and_compile(
     }
     let url = parse_url(&stored.endpoint, policy).map_err(protocol_outbound_error)?;
     let mut request = OutboundRequest::new(Method::POST, url);
-    request.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    request.headers.insert(
-        header::ACCEPT,
-        HeaderValue::from_static("application/graphql-response+json, application/json"),
-    );
+    apply_standard_request_headers(&mut request.headers);
     if let Some(credential) = &stored.credential {
         credential.apply(&mut request.headers)?;
     } else if let Some(access_token) = oauth_access_token {
@@ -980,6 +967,21 @@ fn validate_secret(value: &str) -> Result<(), ProtocolError> {
     }
 }
 
+fn apply_standard_request_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("application/graphql-response+json, application/json"),
+    );
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(GRAPHQL_USER_AGENT),
+    );
+}
+
 fn protected_header(name: &HeaderName) -> bool {
     name == header::AUTHORIZATION
         || name == header::ACCEPT
@@ -995,6 +997,7 @@ fn protected_header(name: &HeaderName) -> bool {
         || name == header::REFERER
         || name == header::COOKIE
         || name == header::ORIGIN
+        || name == header::USER_AGENT
         || name == "keep-alive"
         || name == "forwarded"
         || name == "via"
@@ -1519,6 +1522,7 @@ mod tests {
             "referer",
             "cookie",
             "origin",
+            "user-agent",
             "forwarded",
             "via",
             "x-http-method-override",
@@ -1665,6 +1669,7 @@ mod tests {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = String::from_utf8_lossy(&read_request(&mut stream).await).into_owned();
         assert!(request.contains("authorization: Bearer introspection-redirect-secret\r\n"));
+        assert!(request.contains("user-agent: executor\r\n"));
         stream
             .write_all(&response(
                 "302 Found",
@@ -1791,6 +1796,7 @@ mod tests {
         let request_text = String::from_utf8_lossy(&request);
         assert!(request_text.starts_with("POST /graphql HTTP/1.1"));
         assert!(request_text.contains("authorization: Bearer secret-token\r\n"));
+        assert!(request_text.contains("user-agent: executor\r\n"));
         let body = request_text.split("\r\n\r\n").nth(1).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(body).unwrap(),

@@ -95,3 +95,121 @@ it.effect("reuses one administrator session across API and browser identities", 
       }),
   ),
 );
+
+it.effect("refreshes a tool revision once after an optimistic update conflict", () =>
+  Effect.acquireUseRelease(
+    Effect.promise(async () => {
+      const session = randomBytes(32).toString("hex");
+      const csrf = randomBytes(32).toString("hex");
+      const updateBodies: string[] = [];
+      const server = createServer((request, response) => {
+        if (request.method === "POST" && request.url === "/api/v1/session") {
+          request.resume();
+          response.statusCode = 200;
+          response.setHeader("content-type", "application/json");
+          response.setHeader("set-cookie", [
+            `executor_session=${session}; Path=/; HttpOnly; SameSite=Lax`,
+            `executor_csrf=${csrf}; Path=/; SameSite=Lax`,
+          ]);
+          response.end("{}");
+          return;
+        }
+        if (request.method === "GET" && request.url === "/api/v1/tools/tool-1") {
+          request.resume();
+          response.statusCode = 200;
+          response.setHeader("content-type", "application/json");
+          response.end(
+            JSON.stringify({
+              id: "tool-1",
+              sourceId: "source-1",
+              stableKey: "hello",
+              displayName: "Hello",
+              callablePath: "tools.source_1.hello",
+              sandboxPath: "executor.tools.source_1.hello",
+              revision: 2,
+              effectiveMode: { mode: "disabled" },
+            }),
+          );
+          return;
+        }
+        if (request.method === "PATCH" && request.url === "/api/v1/tools/tool-1/mode") {
+          request.setEncoding("utf8");
+          let body = "";
+          request.on("data", (chunk) => {
+            body += chunk;
+          });
+          request.on("end", () => {
+            updateBodies.push(body);
+            response.setHeader("content-type", "application/json");
+            if (updateBodies.length === 1) {
+              response.statusCode = 409;
+              response.end('{"error":{"code":"revision_conflict","message":"Refresh and retry."}}');
+              return;
+            }
+            response.statusCode = 200;
+            response.end(
+              JSON.stringify({
+                id: "tool-1",
+                sourceId: "source-1",
+                stableKey: "hello",
+                displayName: "Hello",
+                callablePath: "tools.source_1.hello",
+                sandboxPath: "executor.tools.source_1.hello",
+                revision: 3,
+                effectiveMode: { mode: "enabled" },
+              }),
+            );
+          });
+          return;
+        }
+        request.resume();
+        response.statusCode = 404;
+        response.end();
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        throw new Error("administrator test server has no TCP address");
+      }
+      return {
+        origin: `http://127.0.0.1:${address.port}`,
+        server,
+        updateBodies,
+      };
+    }),
+    ({ origin, updateBodies }) =>
+      Effect.gen(function* () {
+        const client = yield* Effect.promise(() =>
+          LocalAdminClient.signIn(origin, "admin", "test-password"),
+        );
+        const updated = yield* Effect.promise(() =>
+          client.setToolMode(
+            {
+              id: "tool-1",
+              sourceId: "source-1",
+              stableKey: "hello",
+              displayName: "Hello",
+              callablePath: "tools.source_1.hello",
+              sandboxPath: "executor.tools.source_1.hello",
+              revision: 1,
+              effectiveMode: { mode: "disabled" },
+            },
+            "enabled",
+          ),
+        );
+
+        expect(updated.revision).toBe(3);
+        expect(updateBodies.map((body) => JSON.parse(body))).toEqual([
+          { mode: "enabled", expectedRevision: 1 },
+          { mode: "enabled", expectedRevision: 2 },
+        ]);
+      }),
+    ({ server }) =>
+      Effect.callback<void, Error>((resume) => {
+        server.close((error) => resume(error ? Effect.fail(error) : Effect.succeed(undefined)));
+      }),
+  ),
+);

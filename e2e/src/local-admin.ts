@@ -111,9 +111,20 @@ export class LocalAdminClient {
   }
 
   async setToolMode(tool: LocalTool, mode: "enabled" | "ask" | "disabled" | null) {
-    return this.#json<LocalTool>(`/api/v1/tools/${encodeURIComponent(tool.id)}/mode`, {
+    const toolPath = `/api/v1/tools/${encodeURIComponent(tool.id)}`;
+    const modePath = `${toolPath}/mode`;
+    const response = await this.#send(modePath, {
       method: "PATCH",
       body: { mode, expectedRevision: tool.revision },
+    });
+    if (response.status !== 409) {
+      return this.#readJson<LocalTool>(modePath, "PATCH", response);
+    }
+
+    const current = await this.#json<LocalTool>(toolPath);
+    return this.#json<LocalTool>(modePath, {
+      method: "PATCH",
+      body: { mode, expectedRevision: current.revision },
     });
   }
 
@@ -154,11 +165,28 @@ export class LocalAdminClient {
       readonly headers?: Readonly<Record<string, string>>;
     } = {},
   ) {
-    const response = await this.#request(path, options);
-    return (await response.json()) as Value;
+    const method = options.method ?? "GET";
+    const response = await this.#send(path, options);
+    return this.#readJson<Value>(path, method, response);
   }
 
   async #request(
+    path: string,
+    options: {
+      readonly method?: string;
+      readonly body?: unknown;
+      readonly headers?: Readonly<Record<string, string>>;
+    } = {},
+  ) {
+    const method = options.method ?? "GET";
+    const response = await this.#send(path, options);
+    if (!response.ok) {
+      throw new Error(`${method} ${path} failed (${response.status}): ${await response.text()}`);
+    }
+    return response;
+  }
+
+  async #send(
     path: string,
     options: {
       readonly method?: string;
@@ -182,9 +210,13 @@ export class LocalAdminClient {
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
     });
+    return response;
+  }
+
+  async #readJson<Value>(path: string, method: string, response: Response) {
     if (!response.ok) {
       throw new Error(`${method} ${path} failed (${response.status}): ${await response.text()}`);
     }
-    return response;
+    return (await response.json()) as Value;
   }
 }
