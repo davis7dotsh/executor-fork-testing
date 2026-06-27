@@ -871,7 +871,19 @@ scenario(
                 .fill(provider.issuer);
               await oauth.getByLabel("Client ID").fill("pending-browser-registration");
               await oauth.getByLabel("Requested scopes").fill("repo read:user");
+              const initialOAuthSave = page.waitForResponse((response) => {
+                const request = response.request();
+                return (
+                  request.method() === "PUT" && new URL(response.url()).pathname.includes("/oauth/")
+                );
+              });
               await oauth.getByRole("button", { name: "Save configuration" }).click();
+              const initialOAuthSaveResponse = await initialOAuthSave;
+              const initialOAuthSaveBody = await initialOAuthSaveResponse.text();
+              expect(
+                initialOAuthSaveResponse.ok(),
+                `Managed OAuth configuration failed (${initialOAuthSaveResponse.status()}): ${initialOAuthSaveBody}`,
+              ).toBe(true);
               const callback = oauth.getByLabel("Exact callback URL");
               await expectLocatorVisible(callback);
               const clientId = await provider.registerClient(await callback.inputValue());
