@@ -57,13 +57,15 @@ export const CloudDbProvider = cloudDbProviderLayer(collectTables());
 // Fresh plugin instances per request, carrying the Worker env's WorkOS Vault
 // credentials. Matches the old `createScopedExecutor`'s `orgPlugins()`.
 export const CloudPluginsProvider: Layer.Layer<PluginsProvider> = Layer.succeed(PluginsProvider)({
-  plugins: () =>
+  plugins: (context) =>
     executorConfig.plugins({
       workosCredentials: {
         apiKey: env.WORKOS_API_KEY,
         clientId: env.WORKOS_CLIENT_ID,
         apiUrl: env.WORKOS_API_URL,
       },
+      activeToolkitSlug:
+        context?.mcpResource?.kind === "toolkit" ? context.mcpResource.slug : undefined,
     }),
 });
 

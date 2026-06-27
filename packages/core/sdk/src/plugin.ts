@@ -48,6 +48,7 @@ import type { CredentialProvider, ProviderEntry } from "./provider";
 import type { PluginStorageConfig, PluginStorageFacade } from "./plugin-storage";
 import type {
   CreateToolPolicyInput,
+  EffectivePolicy,
   RemoveToolPolicyInput,
   ToolPolicy,
   UpdateToolPolicyInput,
@@ -87,6 +88,30 @@ export interface StorageDeps {
 export type Elicit = (
   request: ElicitationRequest,
 ) => Effect.Effect<ElicitationResponse, ElicitationDeclinedError>;
+
+// ---------------------------------------------------------------------------
+// Active tool-policy provider.
+//
+// Normal executors resolve policies from core's owner-scoped `tool_policy`
+// table. A plugin may opt one executor instance into a different rule source
+// (for example, a toolkit-specific policy set). Core still owns enforcement;
+// the plugin owns where those policy-shaped rows are stored.
+// ---------------------------------------------------------------------------
+
+export interface ToolPolicyProviderRule {
+  readonly id: string;
+  readonly pattern: string;
+  readonly action: ToolPolicy["action"];
+  readonly position: string;
+}
+
+export interface ToolPolicyProvider {
+  readonly list: () => Effect.Effect<readonly ToolPolicyProviderRule[], StorageFailure>;
+  readonly resolve?: (input: {
+    readonly toolId: string;
+    readonly defaultRequiresApproval?: boolean;
+  }) => Effect.Effect<EffectivePolicy, StorageFailure>;
+}
 
 // ---------------------------------------------------------------------------
 // IntegrationRecord — the catalog row a plugin reads back (its own opaque
@@ -457,6 +482,13 @@ export interface PluginSpec<
 
   /** Service tag the plugin's `handlers` layer requires. */
   readonly extensionService?: TExtensionService;
+
+  /** Optional active policy source for this executor instance. At most one
+   *  loaded plugin may return a provider. When absent, core uses the normal
+   *  owner-scoped tool policies. */
+  readonly toolPolicyProvider?: (
+    ctx: PluginCtx<TStore>,
+  ) => ToolPolicyProvider | null | Effect.Effect<ToolPolicyProvider | null, StorageFailure>;
 
   /** Produce a connection's tools (and shared $defs). The v2 successor to
    *  registering per-source tools — called by the executor at connection

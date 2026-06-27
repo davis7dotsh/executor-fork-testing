@@ -14,6 +14,9 @@ import { bootProcesses, waitForHttp, type BootedProcesses } from "./boot";
 export const cloudflareDir = fileURLToPath(
   new URL("../../legacy/host-cloudflare/", import.meta.url),
 );
+const wranglerBin = fileURLToPath(
+  new URL("../../legacy/host-cloudflare/node_modules/.bin/wrangler", import.meta.url),
+);
 
 export interface CloudflareBootOptions {
   readonly port: number;
@@ -30,12 +33,13 @@ export const bootCloudflare = async (options: CloudflareBootOptions): Promise<Bo
   const procs = bootProcesses(
     [
       {
-        // bunx resolves host-cloudflare's own wrangler. `--local` is the default;
+        // Run wrangler under Node, not Bun. Wrangler rejects the Bun runtime for
+        // workerd dev server websockets.
         // dev-auth + the secret key arrive as `--var` overrides so the worker
         // needs no Cloudflare account or real Access app.
-        cmd: "bunx",
+        cmd: process.env.E2E_NODE_BIN ?? "node",
         args: [
-          "wrangler",
+          wranglerBin,
           "dev",
           "--port",
           String(options.port),
@@ -45,6 +49,8 @@ export const bootCloudflare = async (options: CloudflareBootOptions): Promise<Bo
           "ENABLE_DEV_AUTH:true",
           "--var",
           "EXECUTOR_SECRET_KEY:e2e-secret-key-0123456789abcdef0123456789abcdef",
+          "--var",
+          "ALLOW_LOCAL_NETWORK:true",
         ],
         cwd: cloudflareDir,
         env: { WRANGLER_SEND_METRICS: "false", CI: "true" },

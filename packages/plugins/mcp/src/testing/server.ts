@@ -398,18 +398,21 @@ export const makeElicitationMcpServer = () => {
       description: "Asks for approval before echoing a value",
       inputSchema: { value: z.string() },
     },
-    async ({ value }: { value: string }) => {
-      const response = await server.server.elicitInput({
-        mode: "form",
-        message: `Approve echo for "${value}"?`,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            approved: { type: "boolean", title: "Approve" },
+    async ({ value }: { value: string }, extra) => {
+      const response = await server.server.elicitInput(
+        {
+          mode: "form",
+          message: `Approve echo for "${value}"?`,
+          requestedSchema: {
+            type: "object",
+            properties: {
+              approved: { type: "boolean", title: "Approve" },
+            },
+            required: ["approved"],
           },
-          required: ["approved"],
         },
-      });
+        { relatedRequestId: extra.requestId },
+      );
 
       if (response.action !== "accept" || !response.content || response.content.approved !== true) {
         return {

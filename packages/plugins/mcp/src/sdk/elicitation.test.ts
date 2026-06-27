@@ -6,7 +6,6 @@ import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation/types"
 import {
   AuthTemplateSlug,
   ConnectionName,
-  createExecutor,
   FormElicitation,
   ElicitationResponse,
   IntegrationSlug,
@@ -16,7 +15,7 @@ import {
   type Tool,
 } from "@executor-js/sdk";
 import {
-  makeTestConfig,
+  makeTestWorkspaceHarness,
   memoryCredentialsPlugin,
   typeCheckOutputTypeScript,
 } from "@executor-js/sdk/testing";
@@ -56,10 +55,10 @@ const TEMPLATE = AuthTemplateSlug.make("none");
 // ---------------------------------------------------------------------------
 
 const makeTestExecutor = (serverUrl: string) =>
-  createExecutor(
-    makeTestConfig({ plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const }),
-  ).pipe(
-    Effect.tap((executor) =>
+  makeTestWorkspaceHarness({
+    plugins: [memoryCredentialsPlugin(), mcpPlugin()] as const,
+  }).pipe(
+    Effect.tap(({ executor }) =>
       Effect.gen(function* () {
         yield* executor.mcp.addServer({
           name: "test-mcp",
@@ -75,6 +74,7 @@ const makeTestExecutor = (serverUrl: string) =>
         });
       }),
     ),
+    Effect.map(({ executor }) => executor),
   );
 
 const findTool = (tools: readonly Tool[], name: string): Tool =>
@@ -304,7 +304,9 @@ describe("MCP elicitation (end-to-end)", () => {
   it.effect("addServer preserves the configured display name as the integration description", () =>
     Effect.gen(function* () {
       const server = yield* serveElicitationTestServer;
-      const executor = yield* createExecutor(makeTestConfig({ plugins: [mcpPlugin()] as const }));
+      const { executor } = yield* makeTestWorkspaceHarness({
+        plugins: [mcpPlugin()] as const,
+      });
 
       yield* executor.mcp.addServer({
         name: "Gmail",

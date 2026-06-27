@@ -90,6 +90,7 @@ import type { OAuthService } from "./oauth-client";
 import {
   comparePolicyRow,
   isValidPattern,
+  matchPattern,
   resolveEffectivePolicy,
   rowToToolPolicy,
   type CreateToolPolicyInput,
@@ -112,6 +113,8 @@ import type {
   StaticSourceDecl,
   StaticToolDecl,
   StorageDeps,
+  ToolPolicyProvider,
+  ToolPolicyProviderRule,
   ToolInvocationCredential,
 } from "./plugin";
 import {
@@ -370,6 +373,8 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    * Hosts serving OAuth derive this from the request origin / web base URL.
    */
   readonly redirectUri?: string;
+  /** Optional URL selected organization slug to carry inside OAuth `state`. */
+  readonly oauthCallbackStateOrgSlug?: string;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
   /**
    * Enable the built-in `core-tools` plugin which contributes agent-facing
@@ -1282,6 +1287,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // Populated once, never mutated after startup.
     const staticTools = new Map<string, StaticTools>();
     const runtimes = new Map<string, PluginRuntime>();
+    let activeToolPolicyProvider: ToolPolicyProvider | null = null;
     // Credential providers keyed by `provider.key`, in registration order.
     const credentialProviders = new Map<string, CredentialProvider>();
     const credentialProviderOrder: string[] = [];
@@ -2299,8 +2305,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       readonly integration?: IntegrationSlug;
       readonly owner?: Owner;
     }): Effect.Effect<readonly Connection[], StorageFailure> =>
-      core
-        .findMany("connection", {
+      Effect.gen(function* () {
+        const rows = yield* core.findMany("connection", {
           where: (b: AnyCb) =>
             b.and(
               filter?.integration === undefined
@@ -2308,8 +2314,22 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 : b("integration", "=", String(filter.integration)),
               filter?.owner === undefined ? true : b("owner", "=", filter.owner),
             ),
-        })
-        .pipe(Effect.map((rows) => rows.map(rowToConnection)));
+        });
+        const connections = rows.map(rowToConnection);
+        if (!activeToolPolicyProvider) return connections;
+
+        const visibleTools = yield* toolsList({ includeAnnotations: false });
+        const visibleConnectionKeys = new Set(
+          visibleTools
+            .filter((tool) => !tool.static)
+            .map((tool) => `${tool.owner}:${tool.integration}:${tool.connection}`),
+        );
+        return connections.filter((connection) =>
+          visibleConnectionKeys.has(
+            `${connection.owner}:${connection.integration}:${connection.name}`,
+          ),
+        );
+      });
 
     const connectionsGet = (ref: ConnectionRef): Effect.Effect<Connection | null, StorageFailure> =>
       findConnectionRow(ref).pipe(Effect.map((row) => (row ? rowToConnection(row) : null)));
@@ -2413,6 +2433,81 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       });
 
     // ------------------------------------------------------------------
+    // Active policy source.
+    // ------------------------------------------------------------------
+
+    type ActivePolicyRuleSet =
+      | { readonly kind: "global"; readonly rows: readonly ToolPolicyRow[] }
+      | {
+          readonly kind: "provider";
+          readonly provider: ToolPolicyProvider;
+          readonly rules: readonly ToolPolicyProviderRule[] | null;
+        };
+
+    const compareProviderPolicyRule = (
+      a: ToolPolicyProviderRule,
+      b: ToolPolicyProviderRule,
+    ): number => {
+      if (a.position < b.position) return -1;
+      if (a.position > b.position) return 1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    };
+
+    const resolveProviderPolicyFromRules = (
+      toolId: string,
+      rules: readonly ToolPolicyProviderRule[],
+    ): EffectivePolicy => {
+      for (const rule of [...rules].sort(compareProviderPolicyRule)) {
+        if (!matchPattern(rule.pattern, toolId)) continue;
+        return {
+          action: rule.action,
+          source: "user",
+          pattern: rule.pattern,
+          policyId: rule.id,
+        };
+      }
+      // Toolkit-style providers are capability allowlists. No matching rule
+      // means the tool is outside the capability boundary.
+      return {
+        action: "block",
+        source: "user",
+        pattern: "*",
+      };
+    };
+
+    const listActivePolicyRuleSet = (): Effect.Effect<ActivePolicyRuleSet, StorageFailure> =>
+      activeToolPolicyProvider
+        ? activeToolPolicyProvider.resolve
+          ? Effect.succeed({
+              kind: "provider" as const,
+              provider: activeToolPolicyProvider,
+              rules: null,
+            })
+          : activeToolPolicyProvider.list().pipe(
+              Effect.map((rules) => ({
+                kind: "provider" as const,
+                provider: activeToolPolicyProvider!,
+                rules,
+              })),
+            )
+        : core
+            .findMany("tool_policy", {})
+            .pipe(Effect.map((rows) => ({ kind: "global" as const, rows })));
+
+    const resolvePolicyFromRuleSet = (
+      toolId: string,
+      ruleSet: ActivePolicyRuleSet,
+      defaultRequiresApproval?: boolean,
+    ): Effect.Effect<EffectivePolicy, StorageFailure> =>
+      ruleSet.kind === "provider"
+        ? ruleSet.provider.resolve
+          ? ruleSet.provider.resolve({ toolId, defaultRequiresApproval })
+          : Effect.succeed(resolveProviderPolicyFromRules(toolId, ruleSet.rules ?? []))
+        : Effect.succeed(
+            resolveEffectivePolicy(toolId, ruleSet.rows, ownerRankForRow, defaultRequiresApproval),
+          );
+
+    // ------------------------------------------------------------------
     // Tools (read surface)
     // ------------------------------------------------------------------
 
@@ -2490,16 +2585,15 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           select: TOOL_INVOCATION_COLUMNS,
         });
         const includeBlocked = filter?.includeBlocked ?? false;
-        const policyRows = yield* core.findMany("tool_policy", {});
+        const policyRules = yield* listActivePolicyRuleSet();
         const tools: Tool[] = [];
         for (const row of rows) {
           const tool = rowToTool(row);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const effective = resolveEffectivePolicy(
+            const effective = yield* resolvePolicyFromRuleSet(
               normalizedPolicyId(tool),
-              policyRows,
-              ownerRankForRow,
+              policyRules,
               tool.annotations?.requiresApproval,
             );
             if (effective.action === "block") continue;
@@ -2510,10 +2604,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tool = staticToolToTool(entry);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const effective = resolveEffectivePolicy(
+            const effective = yield* resolvePolicyFromRuleSet(
               normalizedPolicyId(tool),
-              policyRows,
-              ownerRankForRow,
+              policyRules,
               tool.annotations?.requiresApproval,
             );
             if (effective.action === "block") continue;
@@ -2527,9 +2620,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       address: ToolAddress,
     ): Effect.Effect<ToolSchemaView | null, StorageFailure> =>
       Effect.gen(function* () {
+        const policyRules = yield* listActivePolicyRuleSet();
         const staticEntry = staticTools.get(String(address));
         if (staticEntry) {
           const tool = staticToolToTool(staticEntry);
+          const effective = yield* resolvePolicyFromRuleSet(
+            normalizedPolicyId(tool),
+            policyRules,
+            tool.annotations?.requiresApproval,
+          );
+          if (effective.action === "block") return null;
           const preview = yield* Effect.tryPromise({
             try: () =>
               buildToolTypeScriptPreview({
@@ -2565,6 +2665,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         });
         if (!row) return null;
         const tool = rowToTool(row);
+        const effective = yield* resolvePolicyFromRuleSet(
+          normalizedPolicyId(tool),
+          policyRules,
+          tool.annotations?.requiresApproval,
+        );
+        if (effective.action === "block") return null;
 
         const definitionRows = yield* core.findMany("definition", {
           where: (b: AnyCb) =>
@@ -2904,11 +3010,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // not the 5-segment dynamic form.
         const staticEntry = staticTools.get(String(address));
         if (staticEntry) {
-          const policyRows = yield* core.findMany("tool_policy", {});
-          const policy = resolveEffectivePolicy(
+          const policyRules = yield* listActivePolicyRuleSet();
+          const policy = yield* resolvePolicyFromRuleSet(
             String(address),
-            policyRows,
-            ownerRankForRow,
+            policyRules,
             staticEntry.tool.annotations?.requiresApproval,
           );
           if (policy.action === "block") {
@@ -2957,12 +3062,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         // Resolve policy (owner-ranked).
         const toolForPolicy = rowToTool(row);
-        const policyRows = yield* core.findMany("tool_policy", {});
+        const policyRules = yield* listActivePolicyRuleSet();
         const annotations = decodeJsonColumn(row.annotations) as ToolAnnotations | undefined;
-        const policy = resolveEffectivePolicy(
+        const policy = yield* resolvePolicyFromRuleSet(
           normalizedPolicyId(toolForPolicy),
-          policyRows,
-          ownerRankForRow,
+          policyRules,
           annotations?.requiresApproval,
         );
         if (policy.action === "block") {
@@ -3094,6 +3198,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       // instead of silently using `http://127.0.0.1/callback`. Hosts that serve
       // OAuth (cloud, self-host) derive a real `${webBaseUrl}/oauth/callback`.
       redirectUri: config.redirectUri ?? null,
+      callbackStateOrgSlug: config.oauthCallbackStateOrgSlug ?? null,
     });
 
     // ------------------------------------------------------------------
@@ -3182,6 +3287,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         oauth,
         transaction: <A, E>(effect: Effect.Effect<A, E>) => transaction(effect),
       };
+
+      if (plugin.toolPolicyProvider) {
+        const rawProvider = plugin.toolPolicyProvider(ctx);
+        const provider = Effect.isEffect(rawProvider) ? yield* rawProvider : rawProvider;
+        if (provider) {
+          if (activeToolPolicyProvider) {
+            return yield* new StorageError({
+              message: "Only one plugin can provide the active tool policy source.",
+              cause: undefined,
+            });
+          }
+          activeToolPolicyProvider = provider;
+        }
+      }
 
       // Build extension FIRST so it's available as `self` for staticSources.
       const extension: object = plugin.extension ? plugin.extension(ctx) : {};

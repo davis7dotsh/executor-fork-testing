@@ -1,6 +1,6 @@
 {
   "name": "@executor-js/plugin-graphql",
-  "version": "1.5.18",
+  "version": "1.5.20",
   "private": true,
   "homepage": "https://github.com/RhysSullivan/executor/tree/main/packages/plugins/graphql",
   "bugs": {
